@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings: a CRLF shebang makes Linux report
+# "bad interpreter", which is a confusing way to learn about line endings.
+*.sh text eol=lf
+deploy/* text eol=lf
