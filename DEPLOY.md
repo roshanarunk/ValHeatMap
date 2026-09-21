@@ -172,18 +172,40 @@ https://data.yourdomain.com/analytics.db.gz
 > that as an unsupported access path; the Custom Domains feature above is
 > the supported route.
 
-### Optional: cache for longer
+### Required: a Cache Rule for the snapshot
 
-The default edge cache is short. Since the crawler publishes at most every
-few minutes, a longer TTL cuts origin pulls further:
+**Do not skip this.** Cloudflare's *Browser Cache TTL* zone setting
+defaults to 4 hours and overrides the origin's `Cache-Control` whenever
+the origin value is lower -- which ours always is. Without a rule, a fresh
+publish can sit behind a stale edge copy for four hours, and the site will
+serve old data even though the origin is correct.
 
 1. Your domain → **Caching** → **Cache Rules** → **Create rule**
-2. When: `Hostname equals data.yourdomain.com`
-3. Then: **Eligible for cache**, Edge TTL **Override to** 5 minutes
+2. Name it `ValHeatMap snapshot`
+3. **When incoming requests match**:
+   - Field `Hostname`, Operator `equals`, Value `data.yourdomain.com`
+4. **Then**:
+   - Cache eligibility: **Eligible for cache**
+   - Edge TTL: **Override origin**, `1 minute`
+   - Browser TTL: **Respect origin TTL**
+5. **Deploy**
 
-Publishing overwrites the object, so a stale edge copy can only be a few
-minutes behind — the same freshness the crawler's publish interval gives
-you anyway.
+Edge TTL is what matters: it bounds how long Cloudflare keeps serving an
+old copy after a publish. One minute is comfortably below the crawler's
+publish interval, and the object is fetched about once per cold start, so
+the extra origin reads are negligible against R2's free tier.
+
+Verify it took effect:
+
+```powershell
+cd backend
+python -m app.check_snapshot
+```
+
+A healthy result reports `edge copy matches the origin` and an edge TTL of
+60s. If it reports the edge serving an older copy, purge once (**Caching**
+→ **Configuration** → **Purge Everything**) to clear the entry that was
+cached under the old 4-hour TTL.
 
 ## 2.3 Create API credentials
 
