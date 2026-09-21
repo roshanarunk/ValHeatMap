@@ -34,6 +34,21 @@ CACHED_DB = CACHE_DIR / "valheatmap-analytics.db"
 ETAG_FILE = CACHE_DIR / "valheatmap-analytics.etag"
 
 
+def public_base() -> str:
+    """R2_PUBLIC_URL with a scheme, no trailing slash.
+
+    A bare hostname ("data.example.com") is the natural thing to paste out
+    of the Cloudflare dashboard, so accept it rather than failing with a
+    urllib "unknown url type" traceback.
+    """
+    raw = (os.environ.get("R2_PUBLIC_URL") or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    return raw
+
+
 def snapshot_url() -> str | None:
     """Public URL of the published database, if one is configured."""
     return os.environ.get("VALHEATMAP_SNAPSHOT_URL") or None

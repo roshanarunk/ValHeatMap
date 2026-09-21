@@ -420,3 +420,30 @@ def test_quota_counters_persist_within_a_month(tmp_path: Path):
     reloaded = QuotaState.load(path)
     assert reloaded.writes == 1
     assert reloaded.bytes_uploaded == 37_000_000
+
+
+# --- public URL handling ------------------------------------------------
+def test_public_base_accepts_a_bare_hostname(monkeypatch):
+    """Pasting the hostname out of the Cloudflare dashboard must work.
+
+    Without a scheme urllib raises "unknown url type", which is a useless
+    error for what is really a config typo.
+    """
+    from app.snapshot import public_base
+
+    for raw, expected in [
+        ("data.example.com", "https://data.example.com"),
+        ("https://data.example.com", "https://data.example.com"),
+        ("https://data.example.com/", "https://data.example.com"),
+        ("  data.example.com  ", "https://data.example.com"),
+        ("http://localhost:9000", "http://localhost:9000"),
+    ]:
+        monkeypatch.setenv("R2_PUBLIC_URL", raw)
+        assert public_base() == expected
+
+
+def test_public_base_empty_when_unset(monkeypatch):
+    from app.snapshot import public_base
+
+    monkeypatch.delenv("R2_PUBLIC_URL", raising=False)
+    assert public_base() == ""

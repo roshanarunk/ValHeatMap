@@ -32,7 +32,7 @@ from pathlib import Path
 from .analytics_db import DEFAULT_PATH
 from .config import load_env
 from .quota import QuotaExceeded, check_upload, record_upload
-from .snapshot import compress
+from .snapshot import compress, public_base
 
 OBJECT_KEY = "analytics.db.gz"
 
@@ -145,7 +145,7 @@ def publish(db_path: Path | None = None, verbose: bool = True) -> str:
     gz.unlink(missing_ok=True)
     state = record_upload(size, state)
 
-    public = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
+    public = public_base()
     url = f"{public}/{OBJECT_KEY}" if public else f"(set R2_PUBLIC_URL) /{OBJECT_KEY}"
     if verbose:
         used = state.summary()

@@ -126,22 +126,64 @@ you want for something you interact with.
 R2's free tier is 10 GB with **no egress charges**, which matters because
 the site downloads the database on every cold start.
 
+You need a domain already on Cloudflare for step 2.2. If you do not have
+one yet, the `r2.dev` subdomain works for testing — see the comparison
+there — and switching later is a one-line change to
+`VALHEATMAP_SNAPSHOT_URL`.
+
 ## 2.1 Create the bucket
 
 1. <https://dash.cloudflare.com> → **R2** → **Create bucket**
 2. Name it `valheatmap`, any location, **Create**
 
-## 2.2 Make it publicly readable
+## 2.2 Put the bucket behind a custom domain
 
-The Vercel function fetches the file over plain HTTPS, so the bucket needs
-a public URL.
+The Vercel function fetches the snapshot over plain HTTPS, so the bucket
+has to be reachable publicly. There are two ways, and they are not
+equivalent:
 
-1. Open the bucket → **Settings** → **Public access**
-2. Under *R2.dev subdomain*, click **Allow Access** and confirm
-3. Copy the URL shown, e.g. `https://pub-a1b2c3d4.r2.dev`
+| | `r2.dev` subdomain | Custom domain |
+|---|---|---|
+| Setup | one click | needs a domain on Cloudflare |
+| CDN caching | **none** | yes |
+| Rate limits | throttled, dev-only | normal Cloudflare limits |
+| Cloudflare's stance | "development purposes" only | production |
 
-Only the snapshot is exposed, and it contains no personal data beyond what
-Riot already publishes.
+Without caching, **every cold start pulls the full ~37 MB from the origin
+bucket**. With a custom domain it is served from the edge cache instead,
+which is faster and does not count against the bucket's operations. Use a
+custom domain.
+
+1. Open the bucket → **Settings** → **Custom Domains** → **Connect Domain**
+2. Enter a hostname on a domain already in your Cloudflare account, e.g.
+   `data.yourdomain.com`
+3. **Continue** → **Connect Domain**
+
+Cloudflare creates the DNS record itself and provisions a certificate.
+Status goes *Initializing* → *Active*, usually within a minute or two.
+
+Your snapshot URL is then:
+
+```
+https://data.yourdomain.com/analytics.db.gz
+```
+
+> Do **not** CNAME your own domain at the `r2.dev` URL. Cloudflare treats
+> that as an unsupported access path; the Custom Domains feature above is
+> the supported route.
+
+### Optional: cache for longer
+
+The default edge cache is short. Since the crawler publishes at most every
+few minutes, a longer TTL cuts origin pulls further:
+
+1. Your domain → **Caching** → **Cache Rules** → **Create rule**
+2. When: `Hostname equals data.yourdomain.com`
+3. Then: **Eligible for cache**, Edge TTL **Override to** 5 minutes
+
+Publishing overwrites the object, so a stale edge copy can only be a few
+minutes behind — the same freshness the crawler's publish interval gives
+you anyway.
 
 ## 2.3 Create API credentials
 
@@ -160,8 +202,18 @@ R2_ACCOUNT_ID=your-account-id
 R2_ACCESS_KEY_ID=your-access-key
 R2_SECRET_ACCESS_KEY=your-secret-key
 R2_BUCKET=valheatmap
-R2_PUBLIC_URL=https://pub-a1b2c3d4.r2.dev
+R2_PUBLIC_URL=https://data.yourdomain.com
 ```
+
+An R2 API token page shows three values. Only two are used here:
+
+| Shown on the token page | Used? |
+|---|---|
+| **Access Key ID** | yes → `R2_ACCESS_KEY_ID` |
+| **Secret Access Key** | yes → `R2_SECRET_ACCESS_KEY` |
+| *Token value* | no — that is for Cloudflare's REST API, not the S3 one |
+
+`R2_ACCOUNT_ID` is in the R2 sidebar, not on the token page.
 
 ## 2.5 Staying inside the free tier
 
@@ -220,11 +272,36 @@ python -m app.publish
 compressing analytics.db (103 MB) ...
   -> 35 MB gzipped
 uploading ...
-published: https://pub-a1b2c3d4.r2.dev/analytics.db.gz
+published: https://data.yourdomain.com/analytics.db.gz
 ```
 
-Open that URL in a browser to confirm it downloads. If you get 401, the
-API token is wrong; if 403 or "not found", public access is not enabled.
+Then verify the URL is reachable and actually being cached:
+
+```powershell
+python -m app.check_snapshot
+```
+
+```
+checking https://data.yourdomain.com/analytics.db.gz
+
+  HTTP 200, 37.0 MB
+  looks like gzip, as expected
+
+  cache status: MISS
+  second request: HIT
+  -> edge caching is working
+
+Use this in Vercel:
+  VALHEATMAP_SNAPSHOT_URL = https://data.yourdomain.com/analytics.db.gz
+```
+
+`R2_PUBLIC_URL` may be a bare hostname or a full URL; both work.
+
+| Result | Cause |
+|---|---|
+| 401 on upload | Access Key ID / Secret wrong, or the token lacks Object Read & Write |
+| 404 / "not found" in browser | Custom domain still *Initializing*, or the hostname is wrong |
+| 522 / connection error | DNS record was edited by hand — remove it and reconnect via Custom Domains |
 
 ---
 
@@ -249,7 +326,7 @@ none of that is uploaded.
 
    | Name | Value |
    |---|---|
-   | `VALHEATMAP_SNAPSHOT_URL` | `https://pub-a1b2c3d4.r2.dev/analytics.db.gz` |
+   | `VALHEATMAP_SNAPSHOT_URL` | `https://data.yourdomain.com/analytics.db.gz` |
 
 4. **Deploy**
 
