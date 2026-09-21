@@ -46,6 +46,18 @@ DMG_ID = {
 }
 DMG_NAME = {0: "weapon", 1: "ability", 2: "bomb", 3: "other"}
 
+# Positions are stored as integers scaled by this factor. 10000 keeps
+# precision far below a pixel while costing 2 bytes instead of 8.
+POS_SCALE = 10000
+
+
+def to_pos(value: float) -> int:
+    return int(round(value * POS_SCALE))
+
+
+def from_pos(value: int | None) -> float | None:
+    return None if value is None else value / POS_SCALE
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 
@@ -90,10 +102,15 @@ CREATE TABLE IF NOT EXISTS kills (
     weapon_id    INTEGER,
     ability_id   INTEGER,
     dmg_type     INTEGER NOT NULL,      -- 0 weapon 1 ability 2 bomb 3 other
-    vx           REAL NOT NULL,
-    vy           REAL NOT NULL,
-    kx           REAL,
-    ky           REAL,
+    -- Positions as integers in [0, POS_SCALE], not REAL. SQLite stores a
+    -- REAL in 8 bytes; these fit in 2, which over millions of rows is the
+    -- difference between the published database fitting in a serverless
+    -- function's /tmp and not. The minimap is ~1000px, so 1/10000 is well
+    -- below one pixel of precision.
+    vx           INTEGER NOT NULL,
+    vy           INTEGER NOT NULL,
+    kx           INTEGER,
+    ky           INTEGER,
     flags        INTEGER NOT NULL       -- bitfield, see FLAG_* below
 );
 -- One covering index for the hot path: every heatmap query filters on map
@@ -119,8 +136,8 @@ CREATE TABLE IF NOT EXISTS plants (
     round_num  INTEGER NOT NULL,
     t_ms       INTEGER NOT NULL,
     site       TEXT NOT NULL,
-    x          REAL NOT NULL,
-    y          REAL NOT NULL,
+    x          INTEGER NOT NULL,
+    y          INTEGER NOT NULL,
     won        INTEGER NOT NULL,
     defused    INTEGER NOT NULL
 );
@@ -265,7 +282,7 @@ class AnalyticsDB:
                 if k.killer_location is not None:
                     cx, cy = map_info.to_minimap(k.killer_location.x, k.killer_location.y)
                     if 0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0:
-                        kx, ky = round(cx, 4), round(cy, 4)
+                        kx, ky = cx, cy
                 flags = (
                     (FLAG_TRADED if ek.traded else 0)
                     | (FLAG_TRADE_KILL if ek.trade_kill else 0)
@@ -285,7 +302,10 @@ class AnalyticsDB:
                         DMG_ID.get(k.damage_type, 3),
                         # 4 decimals is ~0.1px on a 1000px minimap: plenty of
                         # precision, and it keeps the stored floats short.
-                        round(vx, 4), round(vy, 4), kx, ky, flags,
+                        to_pos(vx), to_pos(vy),
+                        None if kx is None else to_pos(kx),
+                        None if ky is None else to_pos(ky),
+                        flags,
                     )
                 )
 
@@ -297,7 +317,7 @@ class AnalyticsDB:
                 plant_rows.append(
                     (
                         m, map_id, act_id, avg_tier, p.round_num, p.round_time_ms,
-                        p.site, round(px, 4), round(py, 4), int(p.won), int(p.defused),
+                        p.site, to_pos(px), to_pos(py), int(p.won), int(p.defused),
                     )
                 )
 

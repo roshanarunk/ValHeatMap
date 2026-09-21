@@ -156,13 +156,21 @@ def test_names_are_interned_to_small_ids(db: AnalyticsDB):
     assert all(isinstance(v, int) for v in agents.values())
 
 
-def test_positions_stored_in_minimap_space(db: AnalyticsDB):
+def test_positions_stored_as_scaled_integers(db: AnalyticsDB):
+    """Positions are integers in [0, POS_SCALE], not floats.
+
+    A REAL costs 8 bytes and a scaled int 2, which across millions of rows
+    decides whether the published database fits in a serverless /tmp.
+    """
+    from app.analytics_db import POS_SCALE
+
     with db.connect() as conn:
         rows = conn.execute("SELECT vx, vy FROM kills").fetchall()
     assert rows
     for r in rows:
-        assert 0.0 <= r["vx"] <= 1.0
-        assert 0.0 <= r["vy"] <= 1.0
+        assert isinstance(r["vx"], int)
+        assert 0 <= r["vx"] <= POS_SCALE
+        assert 0 <= r["vy"] <= POS_SCALE
 
 
 def test_flags_pack_kill_context(db: AnalyticsDB):
@@ -352,10 +360,13 @@ def test_zone_constrains_the_anchor_end_only(engine: QueryEngine, db: AnalyticsD
     where killers stood shows where their victims fell, which may be well
     outside the box.
     """
+    from app.analytics_db import from_pos
+
     with db.connect() as conn:
         row = conn.execute("SELECT vx, vy, kx, ky FROM kills LIMIT 1").fetchone()
+    vx, vy = from_pos(row["vx"]), from_pos(row["vy"])
     pad = 0.01
-    around_victim = (row["vx"] - pad, row["vy"] - pad, row["vx"] + pad, row["vy"] + pad)
+    around_victim = (vx - pad, vy - pad, vx + pad, vy + pad)
 
     victim_side = engine.summary(
         Filters(map_name="Ascent", zone=around_victim, zone_anchor="victim")
@@ -371,12 +382,15 @@ def test_zone_constrains_the_anchor_end_only(engine: QueryEngine, db: AnalyticsD
 
 
 def test_zone_returns_points_outside_the_box(engine: QueryEngine, db: AnalyticsDB):
+    from app.analytics_db import from_pos
+
     with db.connect() as conn:
         row = conn.execute(
             "SELECT kx, ky FROM kills WHERE kx IS NOT NULL LIMIT 1"
         ).fetchone()
+    kx, ky = from_pos(row["kx"]), from_pos(row["ky"])
     pad = 0.02
-    zone = (row["kx"] - pad, row["ky"] - pad, row["kx"] + pad, row["ky"] + pad)
+    zone = (kx - pad, ky - pad, kx + pad, ky + pad)
 
     result = engine.kill_points(
         Filters(map_name="Ascent", zone=zone, zone_anchor="killer")

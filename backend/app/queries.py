@@ -13,6 +13,8 @@ from typing import Any
 
 from .analytics_db import (
     DMG_NAME,
+    POS_SCALE,
+    from_pos,
     FLAG_FIRST_BLOOD,
     FLAG_POST_PLANT,
     FLAG_TRADED,
@@ -247,7 +249,7 @@ class QueryEngine:
                 # The box constrains one end of the duel; the caller plots
                 # the other, which is what makes this a cross-filter rather
                 # than a plain crop.
-                lo_x, lo_y, hi_x, hi_y = f.zone
+                lo_x, lo_y, hi_x, hi_y = (v * POS_SCALE for v in f.zone)
                 px, py = ("kx", "ky") if f.zone_anchor == "killer" else ("vx", "vy")
                 clauses.append(
                     f"{px} BETWEEN ? AND ? AND {py} BETWEEN ? AND ? AND {px} IS NOT NULL"
@@ -318,9 +320,11 @@ class QueryEngine:
                 "weapon": weapons.get(r["weapon_id"], ""),
                 "ability": abilities.get(r["ability_id"], ""),
                 "type": DMG_NAME.get(r["dmg_type"], "other"),
-                "victim_pos": {"x": r["vx"], "y": r["vy"]},
+                "victim_pos": {"x": from_pos(r["vx"]), "y": from_pos(r["vy"])},
                 "killer_pos": (
-                    {"x": r["kx"], "y": r["ky"]} if r["kx"] is not None else None
+                    {"x": from_pos(r["kx"]), "y": from_pos(r["ky"])}
+                    if r["kx"] is not None
+                    else None
                 ),
                 "traded": bool(r["flags"] & FLAG_TRADED),
                 "first_blood": bool(r["flags"] & FLAG_FIRST_BLOOD),
@@ -382,7 +386,7 @@ class QueryEngine:
                 "round": r["round_num"],
                 "t": r["t_ms"],
                 "site": r["site"],
-                "position": {"x": r["x"], "y": r["y"]},
+                "position": {"x": from_pos(r["x"]), "y": from_pos(r["y"])},
                 "won": bool(r["won"]),
                 "defused": bool(r["defused"]),
             }

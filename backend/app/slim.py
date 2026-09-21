@@ -37,7 +37,10 @@ from .analytics_db import DEFAULT_PATH, SCHEMA
 
 # Acts to keep in the published copy. Three covers the current act plus
 # enough history to compare against, at roughly a quarter of the size.
-DEFAULT_ACTS = 3
+# All acts. The published size is now governed by the row format, not by
+# how much history is dropped -- integer positions took the full dataset
+# from 525 MB to 155 MB, so there is no longer a reason to truncate it.
+DEFAULT_ACTS = 99
 
 SLIM_PATH = DEFAULT_PATH.with_name("analytics-slim.db")
 
@@ -49,6 +52,11 @@ RUNTIME_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_k_m ON kills(m)",
     "CREATE INDEX IF NOT EXISTS idx_k_util ON kills(map_id, ability_id, avg_tier, act_id)"
     " WHERE dmg_type = 1",
+    # Positional indexes are affordable again now that positions are 2-byte
+    # integers rather than 8-byte floats: they take zone selection from
+    # ~600ms back to single-digit milliseconds.
+    "CREATE INDEX IF NOT EXISTS idx_k_vpos ON kills(map_id, vx, vy)",
+    "CREATE INDEX IF NOT EXISTS idx_k_kpos ON kills(map_id, kx, ky)",
     "CREATE INDEX IF NOT EXISTS idx_p_main ON plants(map_id, avg_tier, act_id)",
     "CREATE INDEX IF NOT EXISTS idx_p_m ON plants(m)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_name ON dim(kind, name)",
