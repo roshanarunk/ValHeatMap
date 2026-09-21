@@ -27,7 +27,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-STATE_PATH = Path(__file__).resolve().parents[2] / "data" / "quota.json"
+from .paths import DATA_DIR
+
+STATE_PATH = DATA_DIR / "quota.json"
 
 # Refuse to upload a snapshot larger than this. The free tier is 10 GB, and
 # a single snapshot this big would mean something has gone very wrong -- the

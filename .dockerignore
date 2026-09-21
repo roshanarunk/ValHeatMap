@@ -1,0 +1,13 @@
+# Keep the build context small: the data directory is 13 GB and belongs
+# on the volume, not in the image.
+data/
+legacy/
+docs/
+.git/
+.venv/
+frontend/node_modules/
+frontend/dist/
+**/__pycache__/
+*.db
+*.db-*
+.env

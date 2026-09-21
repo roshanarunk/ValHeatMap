@@ -22,9 +22,11 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .paths import DATA_DIR
 from typing import Any, Iterator
 
-DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
+DATA_ROOT = DATA_DIR
 RAW_DIR = DATA_ROOT / "raw"
 DB_PATH = DATA_ROOT / "valheatmap.db"
 

@@ -22,12 +22,14 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+
+from .paths import DATA_DIR
 from typing import Any, Iterator, Sequence
 
 from .analytics.kills import EnrichedKill, enrich
 from .models import DamageType, Match, Side
 
-DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "analytics.db"
+DEFAULT_PATH = DATA_DIR / "analytics.db"
 
 # Kill flags packed into one integer column instead of five.
 FLAG_TRADED = 1

@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import Match
+from .paths import DATA_DIR as _DATA_DIR
 from .sources import henrik, riot
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "matches"
+DATA_DIR = _DATA_DIR / "matches"
 
 
 def parse_any(data: dict[str, Any], source: str | None = None) -> Match:
