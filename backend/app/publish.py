@@ -114,11 +114,23 @@ def put_object(
             raise RuntimeError(f"upload failed: HTTP {resp.status}")
 
 
-def publish(db_path: Path | None = None, verbose: bool = True) -> str:
+def publish(
+    db_path: Path | None = None, verbose: bool = True, slim: bool = True
+) -> str:
     load_env()
     source = db_path or DEFAULT_PATH
     if not source.exists():
         raise FileNotFoundError(f"{source} does not exist -- run build_analytics first.")
+
+    if slim and db_path is None:
+        # The full database no longer fits in a serverless function's /tmp,
+        # so publish a reduced copy: recent acts only, and no indexes (the
+        # function rebuilds those in a couple of seconds).
+        from .slim import build_slim
+
+        if verbose:
+            print("building the slim database ...", flush=True)
+        source = build_slim(verbose=verbose)
 
     account = os.environ.get("R2_ACCOUNT_ID")
     access_key = os.environ.get("R2_ACCESS_KEY_ID")

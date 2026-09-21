@@ -85,6 +85,22 @@ def ensure_local_db(force: bool = False) -> Path:
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CACHED_DB.with_suffix(".part")
+    tmp.unlink(missing_ok=True)
+
+    # /tmp is typically 512 MB on a serverless host, and the database is
+    # already most of that. Writing the new copy beside the old one runs
+    # the disk out, and the refresh fails silently every time. Removing the
+    # old copy first is safe because a failed download falls back to
+    # DEFAULT_PATH, and the next request retries.
+    if force and CACHED_DB.exists():
+        needed = CACHED_DB.stat().st_size
+        if _free_space(CACHE_DIR) < needed * 1.15:
+            print(
+                f"[snapshot] freeing {needed / 1e6:.0f} MB before refresh "
+                f"({_free_space(CACHE_DIR) / 1e6:.0f} MB free)"
+            )
+            CACHED_DB.unlink(missing_ok=True)
+            ETAG_FILE.unlink(missing_ok=True)
     # A forced refresh follows an ETag check that bypassed the cache, so the
     # download has to bypass it too. Otherwise the edge can hand back the
     # very copy we just decided was stale, and the instance would keep
@@ -128,9 +144,25 @@ def _download(request: urllib.request.Request, tmp: Path, url: str) -> Path:
             else:
                 shutil.copyfileobj(resp, fh, length=1 << 20)
     tmp.replace(CACHED_DB)
+    # The published copy ships without indexes to stay inside /tmp; build
+    # them now, once, rather than shipping 278 MB of them.
+    try:
+        from .slim import ensure_indexes
+
+        ensure_indexes(CACHED_DB, verbose=True)
+    except Exception as exc:
+        print(f"[snapshot] index build failed, queries will be slow: {exc}")
     if etag:
         ETAG_FILE.write_text(etag, encoding="utf-8")
     return CACHED_DB
+
+
+def _free_space(path: Path) -> int:
+    """Bytes available where the snapshot is cached."""
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return 0
 
 
 def remote_etag() -> str | None:

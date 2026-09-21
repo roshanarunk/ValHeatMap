@@ -29,3 +29,5 @@ data/analytics.db-*
 data/*.db.gz
 frontend/tsconfig.tsbuildinfo
 data/quota.json
+# the published (slim) database and its WAL sidecars
+data/analytics-slim.db*
