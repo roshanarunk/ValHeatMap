@@ -459,6 +459,16 @@ async def run_forever(
         if publish_every and since_publish >= publish_every:
             note("publishing")
             try:
+                # This process can run for days. Without re-importing, it
+                # keeps publishing with whatever publish code it started
+                # with -- which is how a 540 MB database reached the site
+                # after the slim build had already been written.
+                import importlib
+
+                from . import publish as publish_module
+
+                importlib.reload(publish_module)
+                publish = publish_module.publish
                 crawler.analytics.set_meta(
                     "generated_at",
                     datetime.now(timezone.utc).isoformat(timespec="seconds"),

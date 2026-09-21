@@ -128,7 +128,12 @@ def ensure_local_db(force: bool = False) -> Path:
         if CACHED_DB.exists():
             print("[snapshot] falling back to the cached copy")
             return CACHED_DB
-        return DEFAULT_PATH
+        # DEFAULT_PATH is the local database, which does not exist on a
+        # deployed server -- returning it turns a download failure into
+        # "file is not a database" on every route, including /api/health.
+        # An empty database at least starts, answers, and reports zero.
+        print("[snapshot] no cached copy; starting with an empty database")
+        return _empty_db()
 
 
 class _Prefixed:
@@ -199,6 +204,26 @@ def _free_space(path: Path) -> int:
         return shutil.disk_usage(path).free
     except OSError:
         return 0
+
+
+def _empty_db() -> Path:
+    """A valid but empty database, so the app starts and can report why.
+
+    Serving zeros with a working /api/health is far more debuggable than
+    every request failing with a SQLite error.
+    """
+    from .analytics_db import SCHEMA
+
+    path = CACHE_DIR / "valheatmap-empty.db"
+    if not path.exists():
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+        try:
+            conn.executescript(SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
+    return path
 
 
 def remote_etag() -> str | None:

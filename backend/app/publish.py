@@ -42,6 +42,15 @@ OBJECT_KEY = "analytics.db.gz"
 # edge honest while still absorbing repeated cold starts.
 CACHE_CONTROL = "public, max-age=60, must-revalidate"
 
+# The deployed function has a fixed writable disk (measured: 550 MB on
+# Vercel) that must hold the database plus its indexes. Publishing
+# something larger does not fail loudly -- the download runs out of space,
+# ensure_local_db falls back to a path that does not exist on the server,
+# and every route 500s. So the check belongs here, before upload.
+TMP_BUDGET_BYTES = 550_000_000
+# Leave room for the index build and the gzip stream.
+SAFE_FRACTION = 0.75
+
 
 def _sign(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -142,8 +151,18 @@ def publish(
             "R2_SECRET_ACCESS_KEY in .env"
         )
 
+    uncompressed = source.stat().st_size
+    limit = TMP_BUDGET_BYTES * SAFE_FRACTION
+    if uncompressed > limit:
+        raise RuntimeError(
+            f"{source.name} is {uncompressed / 1e6:.0f} MB, over the "
+            f"{limit / 1e6:.0f} MB that safely fits the function's disk. "
+            "Publishing it would break the site. Build the slim copy first "
+            "(python -m app.slim) or reduce what it keeps."
+        )
+
     if verbose:
-        print(f"compressing {source.name} ({source.stat().st_size / 1e6:.0f} MB) ...", flush=True)
+        print(f"compressing {source.name} ({uncompressed / 1e6:.0f} MB) ...", flush=True)
     gz = compress(source)
     size = gz.stat().st_size
     # Cloudflare has no hard spend cap, so refuse anything that would push

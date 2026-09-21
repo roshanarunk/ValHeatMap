@@ -512,8 +512,16 @@ def test_public_url_accepts_bare_host(monkeypatch):
     assert public_base() == "https://data.example.com"
 
 
-def test_failed_download_does_not_crash_the_app(monkeypatch, tmp_path: Path):
-    """An unreachable snapshot must not take every route down with it."""
+def test_failed_download_yields_an_empty_but_valid_database(monkeypatch, tmp_path: Path):
+    """An unreachable snapshot must not take every route down with it.
+
+    Returning DEFAULT_PATH was worse than useless on a server, where that
+    file does not exist: every request then failed with a SQLite error,
+    including /api/health. An empty database lets the app start and report
+    zero, which is diagnosable.
+    """
+    import sqlite3
+
     import app.snapshot as snap
 
     monkeypatch.setattr(snap, "CACHE_DIR", tmp_path)
@@ -521,7 +529,12 @@ def test_failed_download_does_not_crash_the_app(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("VALHEATMAP_SNAPSHOT_URL", "https://nonexistent.invalid/x.db.gz")
 
     path = snap.ensure_local_db()
-    assert path == snap.DEFAULT_PATH  # falls back rather than raising
+    assert path.exists()
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_etag_check_bypasses_the_cdn_cache(monkeypatch):
@@ -579,3 +592,24 @@ def test_forced_download_also_bypasses_the_cache(monkeypatch, tmp_path: Path):
     snap.ensure_local_db(force=True)
     assert "_=" in seen["url"]
     assert seen["cache_control"] == "no-cache"
+
+
+def test_publish_refuses_a_database_too_large_for_the_function(tmp_path: Path):
+    """The failure this prevents is silent and total.
+
+    An oversized upload does not error: the download fills the function's
+    disk, the fallback kicks in, and every route 500s. Checking before the
+    bytes leave is the only place it is cheap to catch.
+    """
+    import app.publish as pub
+
+    big = tmp_path / "big.db"
+    big.write_bytes(b"x" * 1024)
+
+    original = pub.TMP_BUDGET_BYTES
+    try:
+        pub.TMP_BUDGET_BYTES = 1000  # so 1 KB is "too big"
+        with pytest.raises(RuntimeError, match="safely fits"):
+            pub.publish(db_path=big, verbose=False)
+    finally:
+        pub.TMP_BUDGET_BYTES = original
