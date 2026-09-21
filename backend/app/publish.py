@@ -73,12 +73,16 @@ def put_object(
     date_stamp = now.strftime("%Y%m%d")
     payload_hash = hashlib.sha256(body).hexdigest()
 
+    # Cache-Control has to be signed as well as sent: SigV4 rejects the
+    # request if a signed header is missing, and R2 ignores the header if
+    # it is sent unsigned. Canonical headers are sorted by name.
     canonical_headers = (
+        f"cache-control:{cache_control}\n"
         f"host:{host}\n"
         f"x-amz-content-sha256:{payload_hash}\n"
         f"x-amz-date:{amz_date}\n"
     )
-    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    signed_headers = "cache-control;host;x-amz-content-sha256;x-amz-date"
     canonical_request = (
         f"PUT\n/{bucket}/{key}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     )
