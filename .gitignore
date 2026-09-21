@@ -28,3 +28,4 @@ data/analytics.db
 data/analytics.db-*
 data/*.db.gz
 frontend/tsconfig.tsbuildinfo
+data/quota.json

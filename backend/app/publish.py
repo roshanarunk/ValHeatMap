@@ -31,6 +31,7 @@ from pathlib import Path
 
 from .analytics_db import DEFAULT_PATH
 from .config import load_env
+from .quota import QuotaExceeded, check_upload, record_upload
 from .snapshot import compress
 
 OBJECT_KEY = "analytics.db.gz"
@@ -121,6 +122,14 @@ def publish(db_path: Path | None = None, verbose: bool = True) -> str:
         print(f"compressing {source.name} ({source.stat().st_size / 1e6:.0f} MB) ...", flush=True)
     gz = compress(source)
     size = gz.stat().st_size
+    # Cloudflare has no hard spend cap, so refuse anything that would push
+    # us past the free tier before the bytes ever leave.
+    try:
+        state = check_upload(size)
+    except QuotaExceeded:
+        gz.unlink(missing_ok=True)
+        raise
+
     if verbose:
         print(f"  -> {size / 1e6:.0f} MB gzipped", flush=True)
         print("uploading ...", flush=True)
@@ -134,11 +143,18 @@ def publish(db_path: Path | None = None, verbose: bool = True) -> str:
         secret_key=secret_key,
     )
     gz.unlink(missing_ok=True)
+    state = record_upload(size, state)
 
     public = os.environ.get("R2_PUBLIC_URL", "").rstrip("/")
     url = f"{public}/{OBJECT_KEY}" if public else f"(set R2_PUBLIC_URL) /{OBJECT_KEY}"
     if verbose:
+        used = state.summary()
         print(f"published: {url}")
+        print(
+            f"  month-to-date: {used['writes']} uploads "
+            f"({used['writes_pct']}% of self-imposed budget), "
+            f"{used['uploaded_mb']} MB sent"
+        )
     return url
 
 

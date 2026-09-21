@@ -359,3 +359,64 @@ def test_tray_icons_differ_per_status():
     # Paused and running must be visually distinct at a glance.
     assert seen["paused"] != seen["running"]
     assert len(set(seen.values())) >= 4
+
+
+# --- upload quota guard -------------------------------------------------
+def test_quota_allows_a_normal_snapshot():
+    from app.quota import QuotaState, check_upload
+
+    state = QuotaState(month="2026-09")
+    assert check_upload(37_000_000, state) is state
+
+
+def test_quota_blocks_an_implausibly_large_snapshot():
+    """A multi-GB snapshot means the database is broken, not that we grew."""
+    from app.quota import QuotaExceeded, QuotaState, check_upload
+
+    with pytest.raises(QuotaExceeded, match="self-imposed cap"):
+        check_upload(3_000_000_000, QuotaState(month="2026-09"))
+
+
+def test_quota_blocks_rapid_republishing():
+    """Catches a runaway loop, which is the realistic way to burn the tier."""
+    import time
+
+    from app.quota import QuotaExceeded, QuotaState, check_upload
+
+    state = QuotaState(month="2026-09", last_upload_ts=time.time())
+    with pytest.raises(QuotaExceeded, match="minimum gap"):
+        check_upload(37_000_000, state)
+
+
+def test_quota_blocks_when_monthly_budget_is_spent():
+    from app.quota import MAX_WRITES_PER_MONTH, QuotaExceeded, QuotaState, check_upload
+
+    state = QuotaState(month="2026-09", writes=MAX_WRITES_PER_MONTH)
+    with pytest.raises(QuotaExceeded, match="already this month"):
+        check_upload(37_000_000, state)
+
+
+def test_quota_resets_on_a_new_month(tmp_path: Path):
+    """Cloudflare bills per calendar month, so the counters follow."""
+    from datetime import datetime, timezone
+
+    from app.quota import QuotaState
+
+    path = tmp_path / "q.json"
+    QuotaState(month="2000-01", writes=9_999, bytes_uploaded=10**9).save(path)
+
+    loaded = QuotaState.load(path)
+    assert loaded.writes == 0
+    assert loaded.month == datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def test_quota_counters_persist_within_a_month(tmp_path: Path):
+    from app.quota import QuotaState, record_upload
+
+    path = tmp_path / "q.json"
+    state = QuotaState.load(path)
+    record_upload(37_000_000, state).save(path)
+
+    reloaded = QuotaState.load(path)
+    assert reloaded.writes == 1
+    assert reloaded.bytes_uploaded == 37_000_000

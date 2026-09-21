@@ -163,7 +163,53 @@ R2_BUCKET=valheatmap
 R2_PUBLIC_URL=https://pub-a1b2c3d4.r2.dev
 ```
 
-## 2.5 Publish once by hand
+## 2.5 Staying inside the free tier
+
+**Cloudflare has no hard spending cap.** Budget alerts email you after the
+fact; they never stop anything. So the protection is built into the
+publisher instead, which refuses to upload when a self-imposed limit would
+break:
+
+| Guard | Limit | Why |
+|---|---|---|
+| Snapshot size | 2 GB | A snapshot that large means the database is broken, not that you grew |
+| Uploads/month | 10,000 | R2 allows 1M; this catches a runaway loop |
+| Gap between uploads | 60s | Publishing faster does not make the site fresher |
+
+A blocked publish makes no network call at all, and the crawler logs it and
+carries on rather than crashing.
+
+Check usage any time:
+
+```powershell
+cd backend
+python -m app.quota
+```
+
+### Where you actually sit
+
+For context, with ~7,000 matches:
+
+| R2 free tier | Limit | Our usage |
+|---|---|---|
+| Storage | 10 GB | **~37 MB** — publishing overwrites one object, so this stays flat regardless of how often you push |
+| Class A (writes) | 1,000,000/mo | **~720/mo** at hourly publishes (0.07%) |
+| Class B (reads) | 10,000,000/mo | one GET per site cold start — you would need ~5M cold starts to exhaust it |
+
+Storage only becomes a question at roughly **2 million matches**. The
+dataset would have to grow 280x.
+
+### Belt and braces: a budget alert
+
+Worth setting even though you are far from any limit:
+
+1. Cloudflare dashboard → **Manage Account** → **Billing** → **Budget alerts**
+2. Add an alert at **$1** with your email
+
+Since correct operation costs $0, any alert at all means something is
+wrong and is worth investigating.
+
+## 2.6 Publish once by hand
 
 ```powershell
 cd backend
