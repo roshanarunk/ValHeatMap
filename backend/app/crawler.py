@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -100,6 +101,60 @@ class RateLimiter:
             self.reset_in = float(reset)
 
 
+@dataclass
+class CrawlControl:
+    """Shared pause/stop switch and live status for a running crawl.
+
+    The tray app and the crawl loop run in different threads, so state is
+    kept behind `threading` primitives rather than asyncio ones -- an
+    asyncio.Event can only be set safely from its own loop.
+    """
+
+    _paused: "threading.Event" = field(default_factory=lambda: threading.Event())
+    _stopped: "threading.Event" = field(default_factory=lambda: threading.Event())
+    status: str = "starting"
+    cycle: int = 0
+    stored_this_run: int = 0
+    db_matches: int = 0
+    db_kills: int = 0
+    last_publish: str = "never"
+    last_error: str = ""
+
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
+    @property
+    def stopping(self) -> bool:
+        return self._stopped.is_set()
+
+    def pause(self) -> None:
+        self._paused.set()
+        self.status = "paused"
+
+    def resume(self) -> None:
+        self._paused.clear()
+        self.status = "running"
+
+    def toggle(self) -> bool:
+        if self.paused:
+            self.resume()
+        else:
+            self.pause()
+        return self.paused
+
+    def stop(self) -> None:
+        self._stopped.set()
+        self._paused.clear()
+        self.status = "stopping"
+
+    async def wait_while_paused(self) -> None:
+        """Yield until resumed. Checked between requests, so a pause takes
+        effect within a second rather than at the end of a batch."""
+        while self.paused and not self.stopping:
+            await asyncio.sleep(0.25)
+
+
 class Crawler:
     def __init__(
         self,
@@ -110,6 +165,7 @@ class Crawler:
         modes: tuple[str, ...] = DEFAULT_MODES,
         rate_limit: int = 90,
         verbose: bool = True,
+        control: "CrawlControl | None" = None,
     ) -> None:
         self.key = api_key
         self.db = database or default_db
@@ -120,6 +176,7 @@ class Crawler:
         self.modes = modes
         self.limiter = RateLimiter(limit=rate_limit, remaining=rate_limit)
         self.verbose = verbose
+        self.control = control
         self.stored = 0
         self.skipped = 0
         self.errors = 0
@@ -145,6 +202,10 @@ class Crawler:
     ) -> Any | None:
         """One rate-limited GET, retrying once on 429 or a transient error."""
         for attempt in range(2):
+            if self.control is not None:
+                await self.control.wait_while_paused()
+                if self.control.stopping:
+                    return None
             await self.limiter.wait()
             try:
                 resp = await client.get(
@@ -323,33 +384,66 @@ async def run_forever(
     batch: int = 200,
     publish_every: int = 2000,
     pause_s: float = 0.0,
+    control: "CrawlControl | None" = None,
 ) -> None:
     """Crawl continuously, publishing a snapshot as the dataset grows.
 
     Serverless functions cannot host this -- they are killed at 300-800s --
-    so it runs wherever you keep a long-lived process (a local machine, a
-    small VM). Each batch resumes from the stored frontier, so restarting is
-    free and no work is repeated.
+    so it runs wherever you keep a long-lived process. Each batch resumes
+    from the stored frontier, so stopping and restarting repeats no work.
+
+    A `CrawlControl` lets the tray app pause, resume and stop the loop; the
+    pause is also checked between individual requests inside a batch.
     """
+    from datetime import datetime, timezone
+
     from .publish import publish
 
+    control = control or crawler.control
     since_publish = 0
     cycle = 0
+
+    def note(status: str) -> None:
+        if control is not None:
+            control.status = status
+
+    note("running")
     while True:
+        if control is not None:
+            if control.stopping:
+                note("stopped")
+                return
+            await control.wait_while_paused()
+            if control.stopping:
+                note("stopped")
+                return
+
         cycle += 1
+        if control is not None:
+            control.cycle = cycle
         before = crawler.stored
         try:
             await crawler.run(target_matches=before + batch)
         except asyncio.CancelledError:
+            note("stopped")
             raise
         except Exception as exc:
             crawler.log(f"  ! crawl cycle failed: {exc}; retrying in 60s")
+            if control is not None:
+                control.last_error = str(exc)[:120]
+                note("retrying")
             await asyncio.sleep(60)
             continue
 
         gained = crawler.stored - before
         since_publish += gained
         stats = crawler.analytics.stats() if crawler.analytics else {}
+        if control is not None:
+            control.stored_this_run = crawler.stored
+            control.db_matches = stats.get("matches", 0)
+            control.db_kills = stats.get("kills", 0)
+            if not control.paused:
+                note("running")
         crawler.log(
             f"[cycle {cycle}] +{gained} this batch, {crawler.stored} this run, "
             f"db {stats.get('matches', '?')} matches / {stats.get('kills', '?')} kills"
@@ -358,22 +452,27 @@ async def run_forever(
         if gained == 0:
             # Frontier exhausted or upstream unhappy; back off rather than spin.
             crawler.log("  · nothing new, pausing 120s")
+            note("idle")
             await asyncio.sleep(120)
             continue
 
         if publish_every and since_publish >= publish_every:
+            note("publishing")
             try:
                 crawler.analytics.set_meta(
                     "generated_at",
-                    __import__("datetime").datetime.now(
-                        __import__("datetime").timezone.utc
-                    ).isoformat(timespec="seconds"),
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 )
                 url = publish(verbose=True)
                 crawler.log(f"  · published snapshot -> {url}")
                 since_publish = 0
+                if control is not None:
+                    control.last_publish = datetime.now().strftime("%H:%M")
             except Exception as exc:
                 crawler.log(f"  ! publish failed: {exc}")
+                if control is not None:
+                    control.last_error = f"publish: {str(exc)[:100]}"
+            note("paused" if (control and control.paused) else "running")
 
         if pause_s:
             await asyncio.sleep(pause_s)

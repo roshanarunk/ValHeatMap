@@ -295,3 +295,67 @@ def test_log_survives_names_the_console_cannot_encode(tmp_db: Database, capsys, 
 
     monkeypatch.setattr("sys.stdout", Cp1252Stream())
     crawler.log("crawling Ъ / ツ")  # must not raise
+
+
+# --- crawl control (tray pause/resume) ----------------------------------
+def test_control_pause_resume_and_toggle():
+    from app.crawler import CrawlControl
+
+    c = CrawlControl()
+    assert c.paused is False and c.stopping is False
+
+    c.pause()
+    assert c.paused is True and c.status == "paused"
+    c.resume()
+    assert c.paused is False and c.status == "running"
+
+    assert c.toggle() is True    # now paused
+    assert c.toggle() is False   # back to running
+
+
+def test_control_stop_clears_pause():
+    """Stopping while paused must not leave the loop waiting forever."""
+    from app.crawler import CrawlControl
+
+    c = CrawlControl()
+    c.pause()
+    c.stop()
+    assert c.stopping is True
+    assert c.paused is False
+
+
+def test_paused_crawler_makes_no_requests(tmp_db: Database):
+    """A pause has to take effect inside a batch, not just between them."""
+    import asyncio
+
+    from app.crawler import CrawlControl, Crawler
+
+    control = CrawlControl()
+    control.pause()
+    crawler = Crawler(api_key="test", database=tmp_db, verbose=False, control=control)
+
+    async def attempt() -> str:
+        # _get should sit in wait_while_paused rather than issuing a request.
+        task = asyncio.ensure_future(crawler._get(None, "https://example.invalid"))
+        await asyncio.sleep(0.1)
+        assert not task.done(), "request proceeded while paused"
+        assert crawler.requests == 0
+        control.stop()
+        return "stopped" if await task is None else "ran"
+
+    assert asyncio.run(attempt()) == "stopped"
+
+
+def test_tray_icons_differ_per_status():
+    """Each status needs its own glyph; a shared icon tells you nothing."""
+    pytest.importorskip("pystray")
+    from app.tray import make_icon
+
+    seen = {}
+    for status in ("running", "paused", "publishing", "idle", "retrying", "stopped"):
+        img = make_icon(status)
+        assert img.size == (64, 64)
+        seen[status] = img.tobytes()
+    # Paused and running must be visually distinct at a glance.
+    assert seen["paused"] != seen["running"]
+    assert len(set(seen.values())) >= 4
