@@ -658,3 +658,50 @@ input:focus, select:focus { outline: none; border-color: rgba(255, 70, 85, 0.55)
   border-color: var(--line);
   border-style: dashed;
 }
+
+/* --- multi-select ----------------------------------------------------- */
+.multiselect { position: relative; }
+.multiselect__button {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 9px; min-width: 130px;
+  background: var(--bg-input); border: 1px solid var(--line);
+  border-radius: 8px; color: var(--text); font-size: 12px;
+  justify-content: space-between;
+}
+.multiselect__button.is-active {
+  border-color: rgba(255, 70, 85, 0.55);
+  background: rgba(255, 70, 85, 0.1);
+}
+.multiselect__button i { font-style: normal; color: var(--text-faint); font-size: 10px; }
+
+.multiselect__menu {
+  position: absolute; z-index: 30; top: calc(100% + 4px); left: 0;
+  min-width: 210px; max-height: 320px; overflow: hidden;
+  display: flex; flex-direction: column;
+  background: var(--bg-panel); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); box-shadow: var(--shadow);
+}
+.multiselect__groups {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 8px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.multiselect__groups button {
+  padding: 3px 8px; border-radius: 6px; font-size: 11px;
+  background: var(--bg-input); border: 1px solid var(--line); color: var(--text-dim);
+}
+.multiselect__groups button:hover { color: #fff; border-color: #2c3852; }
+.multiselect__groups .is-clear { color: var(--accent-soft); margin-left: auto; }
+
+.multiselect__list { overflow-y: auto; padding: 5px; }
+.multiselect__list label {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 7px; border-radius: 6px; cursor: pointer;
+  font-size: 12px; color: var(--text-dim);
+}
+.multiselect__list label:hover { background: var(--bg-input); color: var(--text); }
+.multiselect__list label.is-on { color: #fff; }
+.multiselect__list input { width: 13px; height: 13px; accent-color: var(--accent); }
+.multiselect__list em {
+  margin-left: auto; font-style: normal; font-size: 10.5px;
+  color: var(--text-faint); font-variant-numeric: tabular-nums;
+}

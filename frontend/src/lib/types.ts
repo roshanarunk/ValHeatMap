@@ -283,6 +283,7 @@ export interface Facets {
   acts: { act: string; matches: number }[]
   agents: FacetAgent[]
   abilities: FacetAbility[]
+  weapons: { weapon: string; kills: number }[]
   ranks: RankBand[]
   tier_range: [number, number]
   stats: { matches: number; kills: number; plants: number; generated_at: string | null }

@@ -6,6 +6,7 @@ import {
   DuelLegend,
   RotateControl,
   SegmentedControl,
+  MultiSelect,
   Select,
 } from './components/MapControls'
 import { TimeSlider } from './components/TimeSlider'
@@ -32,6 +33,17 @@ const VIEWS: { id: View; label: string }[] = [
   { id: 'insights', label: 'Breakdown' },
 ]
 
+// Valorant's own shop categories, so "Rifles" selects what a player means
+// by it rather than an arbitrary grouping.
+const WEAPON_GROUPS: { label: string; values: string[] }[] = [
+  { label: 'Rifles', values: ['Vandal', 'Phantom', 'Bulldog', 'Guardian'] },
+  { label: 'Snipers', values: ['Operator', 'Marshal', 'Outlaw'] },
+  { label: 'SMGs', values: ['Spectre', 'Stinger'] },
+  { label: 'Pistols', values: ['Classic', 'Shorty', 'Frenzy', 'Ghost', 'Sheriff'] },
+  { label: 'Shotguns', values: ['Bucky', 'Judge'] },
+  { label: 'Heavy', values: ['Ares', 'Odin'] },
+]
+
 const pct = (v: number) => `${Math.round(v * 100)}%`
 const num = (v: number) => v.toLocaleString()
 
@@ -45,6 +57,7 @@ export default function App() {
   const [rank, setRank] = useState('')
   const [agent, setAgent] = useState('')
   const [ability, setAbility] = useState('')
+  const [weapons, setWeapons] = useState<string[]>([])
   // Zone cross-filter: the box constrains one end of each duel and the map
   // plots the other, so "kills by people here" and "deaths caused from
   // here" are two views of the same selection.
@@ -94,6 +107,7 @@ export default function App() {
       ranks: rank ? [rank] : [],
       agents: agent ? [agent] : [],
       abilities: ability ? [ability] : [],
+      weapons,
       sides,
       zone: zone ? `${zone.x0},${zone.y0},${zone.x1},${zone.y1}` : undefined,
       // The zone constrains the opposite end from the one being plotted:
@@ -107,7 +121,7 @@ export default function App() {
       post_plant_only: postPlantOnly,
     }),
     [
-      mapName, act, rank, agent, ability, sides, timeRange, zone, anchor,
+      mapName, act, rank, agent, ability, weapons, sides, timeRange, zone, anchor,
       tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly,
     ],
   )
@@ -180,6 +194,7 @@ export default function App() {
     setRank('')
     setAgent('')
     setAbility('')
+    setWeapons([])
     setSides([])
     setZone(null)
     setTimeRange([0, ROUND_MAX_MS])
@@ -190,7 +205,7 @@ export default function App() {
   }, [])
 
   const activeFilters =
-    (act ? 1 : 0) + (rank ? 1 : 0) + (agent ? 1 : 0) + (ability ? 1 : 0) +
+    (act ? 1 : 0) + (rank ? 1 : 0) + (agent ? 1 : 0) + (ability ? 1 : 0) + (weapons.length ? 1 : 0) +
     (zone ? 1 : 0) + sides.length +
     (timeRange[0] > 0 || timeRange[1] < ROUND_MAX_MS ? 1 : 0) +
     [tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly].filter(Boolean).length
@@ -302,6 +317,22 @@ export default function App() {
                     label: `${a.ability} · ${a.agent}`,
                   }))}
                   onChange={setAbility}
+                />
+              </ControlGroup>
+            )}
+
+            {!isPlants && !isInsights && (
+              <ControlGroup label="Weapon">
+                <MultiSelect
+                  values={weapons}
+                  placeholder="All weapons"
+                  groups={WEAPON_GROUPS}
+                  options={(facets?.weapons ?? []).map((w) => ({
+                    value: w.weapon,
+                    label: w.weapon,
+                    hint: w.kills.toLocaleString(),
+                  }))}
+                  onChange={setWeapons}
                 />
               </ControlGroup>
             )}

@@ -353,6 +353,7 @@ class AnalyticsDB:
         acts = self.dim_names("act")
         agents = self.dim_names("agent")
         abilities = self.dim_names("ability")
+        weapons = self.dim_names("weapon")
         with self.connect() as conn:
             map_rows = conn.execute(
                 "SELECT map_id, COUNT(*) matches FROM matches GROUP BY map_id"
@@ -367,6 +368,10 @@ class AnalyticsDB:
             agent_rows = conn.execute(
                 "SELECT ka_id, COUNT(*) kills FROM kills "
                 "WHERE ka_id IS NOT NULL GROUP BY ka_id ORDER BY kills DESC"
+            ).fetchall()
+            weapon_rows = conn.execute(
+                "SELECT weapon_id, COUNT(*) kills FROM kills "
+                "WHERE weapon_id IS NOT NULL GROUP BY weapon_id ORDER BY kills DESC"
             ).fetchall()
             ability_rows = conn.execute(
                 "SELECT ability_id, ka_id, COUNT(*) kills FROM kills "
@@ -398,6 +403,10 @@ class AnalyticsDB:
             ),
             "agents": [
                 {"agent": agents.get(r["ka_id"], "?"), "kills": r["kills"]} for r in agent_rows
+            ],
+            "weapons": [
+                {"weapon": weapons.get(r["weapon_id"], "?"), "kills": r["kills"]}
+                for r in weapon_rows
             ],
             "abilities": [
                 {

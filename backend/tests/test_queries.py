@@ -385,3 +385,40 @@ def test_zone_returns_points_outside_the_box(engine: QueryEngine, db: AnalyticsD
     # Plotted positions are victims, which need not be inside the box.
     for point in result["points"]:
         assert 0.0 <= point["victim_pos"]["x"] <= 1.0
+
+
+# --- weapon filter ------------------------------------------------------
+def test_weapon_filter_narrows_the_selection(engine: QueryEngine):
+    total = engine.summary(Filters(map_name="Ascent"))["total"]
+    vandal = engine.summary(Filters(map_name="Ascent", weapons=["Vandal"]))["total"]
+    assert 0 < vandal < total
+
+
+def test_multiple_weapons_are_a_union(engine: QueryEngine, db: AnalyticsDB):
+    """Selecting two weapons shows kills by either, not by both."""
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO dim (kind, id, name) VALUES ('weapon', 99, 'Operator')"
+        )
+        conn.execute("UPDATE kills SET weapon_id = 99 WHERE rowid = (SELECT MIN(rowid) FROM kills)")
+    engine.invalidate()
+
+    vandal = engine.summary(Filters(map_name="Ascent", weapons=["Vandal"]))["total"]
+    operator = engine.summary(Filters(map_name="Ascent", weapons=["Operator"]))["total"]
+    both = engine.summary(Filters(map_name="Ascent", weapons=["Vandal", "Operator"]))["total"]
+    assert operator > 0
+    assert both == vandal + operator
+
+
+def test_unknown_weapon_matches_nothing(engine: QueryEngine):
+    assert engine.summary(Filters(map_name="Ascent", weapons=["Trombone"]))["total"] == 0
+
+
+def test_weapons_appear_in_facets(db: AnalyticsDB):
+    facets = db.facets()
+    assert facets["weapons"]
+    assert facets["weapons"][0]["weapon"] == "Vandal"
+    assert facets["weapons"][0]["kills"] > 0
+    # Sorted by usage, so the UI can show the common ones first.
+    counts = [w["kills"] for w in facets["weapons"]]
+    assert counts == sorted(counts, reverse=True)
