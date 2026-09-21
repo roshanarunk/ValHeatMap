@@ -51,7 +51,7 @@ def test_tracked_player_is_crawled_on_their_own_region(tmp_path: Path):
     db = AnalyticsDB(tmp_path / "a.db")
     db.track_player("puuid-ap", "Someone", "AP1", region="ap")
 
-    crawler = Crawler(api_key="k", analytics=db, region="na")
+    crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
     client = _RecordingClient(correct_region="ap")
     asyncio.run(crawler.crawl_tracked_players(client, limit=1, per_player=3))
 
@@ -70,7 +70,7 @@ def test_tracked_player_failure_does_not_wedge_the_queue(tmp_path: Path):
         async def get(self, *a, **k):
             raise RuntimeError("upstream on fire")
 
-    crawler = Crawler(api_key="k", analytics=db, region="na")
+    crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
     asyncio.run(crawler.crawl_tracked_players(_Boom(), limit=1))
 
     record = db.tracked_by_puuid("puuid-bad")
@@ -88,3 +88,131 @@ def test_players_needing_crawl_puts_new_registrations_first(tmp_path: Path):
 
     queue = db.players_needing_crawl(limit=5)
     assert queue[0]["puuid"] == "new", "never-crawled players come first"
+
+
+class _HistoryClient:
+    """Serves a stored-matches listing, then one payload per match.
+
+    Mirrors the two-step shape of the real deep-history fetch: a listing
+    of summaries, then a full payload per match id we do not already have.
+    """
+
+    def __init__(self, ids: list[str], mode: str = "Competitive") -> None:
+        self.ids = ids
+        self.mode = mode
+        self.listing_calls = 0
+        self.match_calls: list[str] = []
+
+    async def get(self, url: str, headers=None, params=None):
+        if "stored-matches" in url:
+            self.listing_calls += 1
+            return _FakeResponse(
+                200,
+                {
+                    "data": [
+                        {"meta": {"id": i, "mode": self.mode, "map": {"name": "Ascent"}}}
+                        for i in self.ids
+                    ]
+                },
+            )
+        match_id = url.rsplit("/", 1)[-1]
+        self.match_calls.append(match_id)
+        return _FakeResponse(200, {"data": {"match_id": match_id}})
+
+
+def test_history_fetches_every_match_in_the_listing(tmp_path: Path):
+    """The v4 matchlist caps at 10 however large `size` is.
+
+    That ceiling is fine for discovery, which only needs a few games per
+    player to keep snowballing, but it was the whole history for someone
+    looking at their own stats -- measured at 11 matches for a real
+    account. stored-matches goes back ~100.
+    """
+    db = AnalyticsDB(tmp_path / "a.db")
+    crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
+    stored: list[str] = []
+    crawler._store = lambda raw: (stored.append(raw["match_id"]), True)[1]
+
+    client = _HistoryClient([f"m{i}" for i in range(40)])
+    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na"))
+
+    assert client.listing_calls == 1, "one listing request, then one per match"
+    assert got == 40
+    assert len(stored) == 40
+
+
+def test_history_skips_matches_already_stored(tmp_path: Path):
+    """Re-crawling a tracked player must not re-fetch their whole history.
+
+    Skipping before the per-match request is what keeps a repeat crawl
+    cheap -- otherwise every top-up costs ~100 requests.
+    """
+    db = AnalyticsDB(tmp_path / "b.db")
+    crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
+    crawler._store = lambda raw: True
+    # Pretend the first three are already in the index.
+    known = {"m0", "m1", "m2"}
+    crawler.db.has_match = lambda mid: mid in known
+
+    client = _HistoryClient(["m0", "m1", "m2", "m3", "m4"])
+    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na"))
+
+    assert client.match_calls == ["m3", "m4"], "known matches must not be fetched"
+    assert got == 2
+
+
+def test_history_filters_by_mode(tmp_path: Path):
+    """stored-matches returns every queue, including ones we do not want.
+
+    Its mode names are display-cased ("Competitive"), unlike the lowercase
+    slugs the v4 endpoint takes, so the comparison has to normalise.
+    """
+    db = AnalyticsDB(tmp_path / "c.db")
+    crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
+    crawler._store = lambda raw: True
+
+    client = _HistoryClient(["dm1", "dm2"], mode="Deathmatch")
+    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na"))
+
+    assert got == 0
+    assert client.match_calls == [], "deathmatch should not be fetched"
+
+
+def test_first_crawl_goes_deep_then_tops_up(tmp_path: Path):
+    """A backfill is worth ~100 requests once; a top-up is not."""
+    db = AnalyticsDB(tmp_path / "d.db")
+    db.track_player("p1", "Someone", "NA1", region="na")
+    crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
+
+    calls: list[str] = []
+
+    async def _history(client, puuid, region=None, size=100):
+        calls.append("history")
+        return 40
+
+    async def _recent(client, puuid, size=5, region=None):
+        calls.append("recent")
+        return 2
+
+    crawler.crawl_player_history = _history
+    crawler.crawl_player = _recent
+
+    asyncio.run(crawler.crawl_tracked_players(object(), limit=1))
+    assert calls == ["history"], "a never-crawled player gets the deep fetch"
+
+    # They are now fresh, so the queue correctly leaves them alone. Age
+    # the record past the freshness window to get the next crawl.
+    with db.connect() as conn:
+        conn.execute("UPDATE tracked_players SET crawled_at = 1 WHERE puuid = 'p1'")
+
+    asyncio.run(crawler.crawl_tracked_players(object(), limit=1))
+    assert calls == ["history", "recent"], "an already-crawled player only tops up"
+
+
+def test_match_count_accumulates_across_crawls(tmp_path: Path):
+    """A top-up of two must not make an 80-match player look like two."""
+    db = AnalyticsDB(tmp_path / "e.db")
+    db.track_player("p2", "Someone", "NA1", region="na")
+    db.mark_player_crawled("p2", 80)
+    db.mark_player_crawled("p2", 2)
+    assert db.tracked_by_puuid("p2")["match_count"] == 82

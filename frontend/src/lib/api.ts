@@ -105,12 +105,21 @@ export interface QueryFilters {
   trade_radius?: number
 }
 
+export interface PlayerMapRow {
+  map_name: string
+  kills: number
+  deaths: number
+  matches: number
+}
+
 export interface PlayerSummary {
   puuid: string
   name: string
   tag: string
   riot_id: string
   region: string | null
+  /** Maps they have played, most-played first. */
+  maps: PlayerMapRow[]
   /** Unix seconds; null until the crawler has fetched their history. */
   crawled_at: number | null
   requested_at: number | null

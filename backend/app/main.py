@@ -337,6 +337,9 @@ def _player_payload(puuid: str) -> dict[str, Any]:
         "riot_id": f"{record.get('name', '')}#{record.get('tag', '')}",
         "crawled_at": record.get("crawled_at"),
         "requested_at": record.get("requested_at"),
+        # Which maps they actually play, so the tab can open on one that
+        # has data rather than making them guess.
+        "maps": _engine.player_maps(puuid),
         **summary,
     }
 

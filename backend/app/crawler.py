@@ -365,6 +365,57 @@ class Crawler:
         self.db.mark_player_crawled(puuid, stored)
         return stored
 
+    async def crawl_player_history(
+        self,
+        client: httpx.AsyncClient,
+        puuid: str,
+        region: str | None = None,
+        size: int = 100,
+    ) -> int:
+        """Fetch a tracked player's deeper history. Returns matches stored.
+
+        The v4 matchlist that `crawl_player` uses returns **at most 10**
+        whatever `size` says, which is fine for discovery -- it only needs
+        a few games per player to keep snowballing -- but it is the whole
+        history for someone looking at their own stats.
+
+        `stored-matches` goes back ~100. It returns summaries rather than
+        full payloads, so each match we do not already have costs one more
+        request to fetch; matches already stored cost nothing, which is
+        what makes repeat crawls of the same player cheap.
+        """
+        region = (region or self.region).lower()
+        listing = await self._get(
+            client,
+            f"{HENRIK_BASE}/v1/by-puuid/stored-matches/{region}/{puuid}",
+            {"size": size},
+        )
+        rows = (listing or {}).get("data") or []
+        if not rows:
+            return 0
+
+        wanted = {m.lower() for m in self.modes}
+        stored = 0
+        for row in rows:
+            meta = row.get("meta") or {}
+            match_id = meta.get("id")
+            if not match_id:
+                continue
+            # Mode names here are display-cased ("Competitive"), unlike the
+            # lowercase slugs the v4 endpoint takes.
+            if wanted and str(meta.get("mode", "")).lower() not in wanted:
+                continue
+            if self.db.has_match(match_id):
+                self.skipped += 1
+                continue
+            payload = await self._get(
+                client, f"{HENRIK_BASE}/v4/match/{region}/{match_id}"
+            )
+            data = (payload or {}).get("data")
+            if data and self._store(data):
+                stored += 1
+        return stored
+
     async def crawl_tracked_players(
         self, client: httpx.AsyncClient, limit: int = 5, per_player: int = 10
     ) -> int:
@@ -387,12 +438,23 @@ class Crawler:
         stored = 0
         for player in pending:
             try:
-                got = await self.crawl_player(
-                    client, player["puuid"], per_player, region=player.get("region")
-                )
+                # First crawl goes deep, later ones only need the new games.
+                # A backfill is up to ~100 requests, which is a minute of
+                # budget spent once; after that the player's history is
+                # there and a top-up costs a handful.
+                first_time = not player.get("crawled_at")
+                if first_time:
+                    got = await self.crawl_player_history(
+                        client, player["puuid"], region=player.get("region")
+                    )
+                else:
+                    got = await self.crawl_player(
+                        client, player["puuid"], per_player, region=player.get("region")
+                    )
                 stored += got
                 self.analytics.mark_player_crawled(player["puuid"], got)
-                self.log(f"  · tracked {player['name']}#{player['tag']} +{got}")
+                depth = "history" if first_time else "recent"
+                self.log(f"  · tracked {player['name']}#{player['tag']} +{got} ({depth})")
             except Exception as exc:
                 # Mark it crawled anyway: a player whose fetch always fails
                 # would otherwise be retried forever at the front of the

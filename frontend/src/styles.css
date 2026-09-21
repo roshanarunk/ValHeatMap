@@ -825,3 +825,30 @@ input:focus, select:focus { outline: none; border-color: rgba(255, 70, 85, 0.55)
   .matchrow { grid-template-columns: 1.2fr 1fr 66px 50px; }
   .matchrow__when { display: none; }
 }
+
+/* The player tab reuses the map chips but without the page-wide bar
+   chrome: it sits inside a section rather than under the header. */
+.mapselect--player {
+  padding: 0 0 12px;
+  border-bottom: none;
+  background: none;
+  flex-wrap: wrap;
+}
+.mapselect--player .mapchip { padding: 6px 11px; }
+.mapchip__count {
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.mapchip.is-active .mapchip__count { color: rgba(255, 255, 255, 0.72); }
+
+.aggmap { display: flex; flex-direction: column; gap: 10px; }
+.aggmap__canvas {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  /* The canvas is square; cap it so a wide window does not stretch the
+     map taller than the viewport. */
+  max-width: 720px;
+}

@@ -16,7 +16,7 @@ import {
   type PlayerMatch,
   type PlayerSummary,
 } from '../lib/api'
-import type { KillPoint } from '../lib/types'
+import type { KillPoint, KillsResponseV2 } from '../lib/types'
 
 const ROUND_MAX_MS = 120_000
 const STORAGE_KEY = 'valheatmap.riot_id'
@@ -75,6 +75,14 @@ export function PlayerView() {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
+  // Aggregate view: every kill/death across their whole history on one map.
+  const [aggMap, setAggMap] = useState('')
+  const [aggRole, setAggRole] = useState<Role>('either')
+  const [aggMode, setAggMode] = useState<RenderMode>('heatmap')
+  const [agg, setAgg] = useState<KillsResponseV2 | null>(null)
+  const [aggBusy, setAggBusy] = useState(false)
+  const [aggTime, setAggTime] = useState<[number, number]>([0, ROUND_MAX_MS])
+
   // Review state: one selected match, loaded on demand.
   const [selected, setSelected] = useState<string | null>(null)
   const [detail, setDetail] = useState<MatchDetail | null>(null)
@@ -119,6 +127,31 @@ export function PlayerView() {
     if (riotId) void load(riotId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Default to the map they play most, so the tab opens on real data.
+  useEffect(() => {
+    if (!aggMap && player?.maps?.length) setAggMap(player.maps[0].map_name)
+  }, [player, aggMap])
+
+  useEffect(() => {
+    if (!player || !aggMap) return
+    let cancelled = false
+    setAggBusy(true)
+    api
+      .killsV2({
+        map_name: aggMap,
+        player: player.puuid,
+        player_role: aggRole,
+        time_start: aggTime[0],
+        time_end: aggTime[1],
+      })
+      .then((res) => !cancelled && setAgg(res))
+      .catch((err) => !cancelled && setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => !cancelled && setAggBusy(false))
+    return () => {
+      cancelled = true
+    }
+  }, [player, aggMap, aggRole, aggTime])
 
   useEffect(() => {
     if (!selected) {
@@ -216,6 +249,87 @@ export function PlayerView() {
                   sub="a team-mate answered"
                 />
               </div>
+
+              {/* Career heatmap: every duel across their whole history on
+                  one map, which is the view the match list cannot give. */}
+              <section className="aggmap">
+                <h3 className="matchlist__title">Your heatmap</h3>
+                <p className="matchlist__hint">
+                  Every duel you have played on this map, not just one game.
+                </p>
+
+                <div className="mapselect mapselect--player">
+                  {player.maps.map((m) => (
+                    <button
+                      key={m.map_name}
+                      type="button"
+                      className={`mapchip${m.map_name === aggMap ? ' is-active' : ''}`}
+                      onClick={() => setAggMap(m.map_name)}
+                      title={`${num(m.kills)} kills · ${num(m.deaths)} deaths · ${num(
+                        m.matches,
+                      )} matches`}
+                    >
+                      <span>{m.map_name}</span>
+                      <em className="mapchip__count">
+                        {num(m.kills)}/{num(m.deaths)}
+                      </em>
+                    </button>
+                  ))}
+                </div>
+
+                <ControlBar>
+                  <ControlGroup label="Show">
+                    <SegmentedControl
+                      value={aggRole}
+                      options={ROLES.map((r) => ({ value: r.id, label: r.label }))}
+                      onChange={(v) => setAggRole(v as Role)}
+                    />
+                  </ControlGroup>
+                  <ControlGroup label="Draw">
+                    <SegmentedControl
+                      value={aggMode}
+                      options={[
+                        { value: 'heatmap', label: 'Heat' },
+                        { value: 'points', label: 'Points' },
+                        { value: 'lines', label: 'Duels' },
+                      ]}
+                      onChange={(v) => setAggMode(v as RenderMode)}
+                    />
+                  </ControlGroup>
+                  <ControlGroup label="Orient">
+                    <RotateControl rotation={rotation} onChange={setRotation} />
+                  </ControlGroup>
+                </ControlBar>
+
+                <div className="aggmap__canvas">
+                  <MapCanvas
+                    map={agg?.map ?? null}
+                    kills={agg?.points ?? []}
+                    mode={aggMode}
+                    ramp="inferno"
+                    radius={30}
+                    intensity={1}
+                    // Plot where the player was: their own position is the
+                    // kill end when they got the kill, the death end when
+                    // they died.
+                    anchor={aggRole === 'killer' ? 'killer' : 'victim'}
+                    rotation={rotation}
+                    loading={aggBusy}
+                  />
+                  <TimeSlider
+                    value={aggTime}
+                    max={ROUND_MAX_MS}
+                    histogram={agg?.histogram}
+                    onChange={setAggTime}
+                  />
+                  {agg && (
+                    <p className="review__count">
+                      {num(agg.total)} duels
+                      {agg.sampled ? ` · showing ${num(agg.points.length)}` : ''}
+                    </p>
+                  )}
+                </div>
+              </section>
 
               <section className="matchlist">
                 <h3 className="matchlist__title">Recent matches</h3>

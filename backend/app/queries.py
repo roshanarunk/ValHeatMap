@@ -541,6 +541,39 @@ class QueryEngine:
             "tracked": True,
         }
 
+    def player_maps(self, puuid: str) -> list[dict[str, Any]]:
+        """Per-map kills and deaths, for the player's map picker.
+
+        Ordered by involvement, so the map they actually play is the one
+        the tab opens on rather than whichever sorts first alphabetically.
+        """
+        pid = self._ids("player").get(puuid)
+        if pid is None:
+            return []
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """SELECT map_id,
+                          SUM(killer_pid = ?) kills,
+                          SUM(victim_pid = ?) deaths,
+                          COUNT(DISTINCT m) matches
+                   FROM kills
+                   WHERE killer_pid = ? OR victim_pid = ?
+                   GROUP BY map_id""",
+                [pid] * 4,
+            ).fetchall()
+        maps = self._names("map")
+        out = [
+            {
+                "map_name": maps.get(r["map_id"], "?"),
+                "kills": r["kills"] or 0,
+                "deaths": r["deaths"] or 0,
+                "matches": r["matches"] or 0,
+            }
+            for r in rows
+        ]
+        out.sort(key=lambda r: (-(r["kills"] + r["deaths"]), r["map_name"]))
+        return out
+
     def player_matches(self, puuid: str, limit: int = 20) -> list[dict[str, Any]]:
         """A player's matches, newest first, with their line in each."""
         pid = self._ids("player").get(puuid)

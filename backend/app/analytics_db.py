@@ -515,8 +515,12 @@ class AnalyticsDB:
                     (int(time.time()), puuid),
                 )
             else:
+                # Accumulates rather than overwrites: a later top-up that
+                # adds two matches must not make it look as though the
+                # player only has two.
                 conn.execute(
-                    "UPDATE tracked_players SET crawled_at = ?, match_count = ? "
+                    "UPDATE tracked_players "
+                    "SET crawled_at = ?, match_count = match_count + ? "
                     "WHERE puuid = ?",
                     (int(time.time()), match_count, puuid),
                 )
