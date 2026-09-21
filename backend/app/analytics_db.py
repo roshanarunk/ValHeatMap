@@ -17,6 +17,7 @@ to object storage and read from a read-only filesystem.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -147,6 +148,16 @@ CREATE INDEX IF NOT EXISTS idx_p_m    ON plants(m);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- Facet counts, precomputed. Deriving them means grouping over every kill
+-- row: ~2.3s locally and over 7s on a serverless function's slower disk,
+-- on a request the UI makes before it can render anything. They only
+-- change when the database does, so they are computed once at build time
+-- and read back as a single row.
+CREATE TABLE IF NOT EXISTS facet_cache (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 """
 
@@ -367,7 +378,54 @@ class AnalyticsDB:
             "generated_at": self.get_meta("generated_at"),
         }
 
+    def rebuild_facet_cache(self) -> dict[str, Any]:
+        """Compute the facet payload and store it for instant reads."""
+        data = self._compute_facets()
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO facet_cache (key, value) VALUES ('facets', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (json.dumps(data),),
+            )
+        return data
+
     def facets(self) -> dict[str, Any]:
+        """Distinct filter values present in the data, for the UI.
+
+        Served from the precomputed cache when present; falls back to
+        computing on demand so an older database still works.
+        """
+        try:
+            with self.connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM facet_cache WHERE key = 'facets'"
+                ).fetchone()
+            if row:
+                cached = json.loads(row["value"])
+                # On a server the crawler writes to this same file, so the
+                # cache goes stale as matches arrive. Recompute when the
+                # match count has moved enough to matter; the counts are
+                # only used to populate filter lists, so being a little
+                # behind is fine but being thousands behind is not.
+                if not self._facets_are_stale(cached):
+                    return cached
+        except (sqlite3.Error, json.JSONDecodeError):
+            pass  # missing or corrupt cache: fall through and compute
+        return self._compute_facets()
+
+    def _facets_are_stale(self, cached: dict[str, Any], tolerance: int = 500) -> bool:
+        """Has the dataset moved far enough to be worth recomputing?"""
+        try:
+            cached_total = sum(m.get("matches", 0) for m in cached.get("maps", []))
+            if cached_total == 0:
+                return True
+            with self.connect() as conn:
+                actual = conn.execute("SELECT COUNT(*) n FROM matches").fetchone()["n"]
+            return abs(actual - cached_total) > tolerance
+        except sqlite3.Error:
+            return False
+
+    def _compute_facets(self) -> dict[str, Any]:
         """Distinct filter values present in the data, for populating the UI."""
         maps = self.dim_names("map")
         acts = self.dim_names("act")

@@ -1,11 +1,5 @@
-# Runtime for the API and the crawler.
+# Runtime for the API and the crawler. Everything here works headless,
+# so this is what a server installs.
 fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27
-
-# Tray icon for the local crawler. Not needed on the deployed site --
-# api/requirements.txt deliberately omits them to keep the bundle small.
-pystray>=0.19
-pillow>=10.0
-
-pytest>=8.0

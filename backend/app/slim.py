@@ -136,6 +136,16 @@ def build_slim(
         )
         conn.commit()
         conn.execute("DETACH full")
+        conn.commit()
+
+        # Precompute the facet payload into the file, so the deployed site
+        # answers /api/facets from one row instead of grouping over every
+        # kill -- which took over 7s on the function.
+        conn.close()
+        from .analytics_db import AnalyticsDB
+
+        AnalyticsDB(target).rebuild_facet_cache()
+        conn = sqlite3.connect(target)
         conn.execute("VACUUM")
         conn.commit()
 

@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Tray icon for running the crawler on a desktop. Needs a display, so it
+# is deliberately not in the server requirements.
+pystray>=0.19
+pillow>=10.0
+
+pytest>=8.0
