@@ -98,15 +98,48 @@ cd backend
 python -m app.crawler --matches 2000
 ```
 
-The crawler snowballs. It seeds from the ranked leaderboard, fetches each
-player's recent matches, and adds all ten players from every match to the
-frontier — so the pool of players to crawl grows faster than it drains. One
-matchlist request returns several complete matches, which is why ~8 requests
-can yield 18 matches.
+### How it finds matches it hasn't seen
+
+The crawler snowballs, and never asks the API "what's new?" -- it walks
+players:
+
+1. **Seed.** The ranked leaderboard gives ~8,000 active NA players, stored
+   as a *frontier* of puuids with `crawled_at = NULL`.
+2. **Visit.** Take the highest-tier uncrawled player and fetch their recent
+   matchlist. Their last few games are, by definition, games we have not
+   seen unless another crawled player was in them.
+3. **Discover.** Every match names all ten players; each is inserted into
+   the frontier. Since one player yields several matches and each match
+   yields up to ten players, **the frontier grows much faster than it
+   drains** -- measured at 49 players crawled producing 1,385 known.
+4. **Dedup.** Before storing, `match_id` is checked against the index, so
+   a match seen from two different players is stored once.
+
+The player is then marked crawled so a later run moves on rather than
+re-fetching them. To pick up *new* games from players already crawled,
+clear their `crawled_at` (or just let the ever-growing frontier find them
+through their teammates).
 
 Pacing comes from the API's own `x-ratelimit-*` response headers rather than
 a hardcoded rate, so it adapts to your key's tier and backs off before a 429
 rather than after one.
+
+**Throughput.** One request is one *player's* matchlist, not one match, and
+each returns several complete matches -- measured at **~2 matches per
+request** over 45 requests. Requests are paced at the rate-limit ceiling
+(90/min means one every 0.67s), but wall time is dominated by upstream
+latency and writing the payloads, so real throughput settles around
+**~2.4s per match**:
+
+| matches | approx time |
+|--------:|------------:|
+|     200 |      ~4 min |
+|     500 |     ~10 min |
+|    2000 |     ~40 min |
+
+Re-running is cheap: matches already stored are recognised and skipped
+before anything is written (a typical run skips 30-50% as duplicates once
+the dataset has some depth).
 
 Useful flags:
 

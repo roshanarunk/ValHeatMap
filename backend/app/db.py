@@ -13,8 +13,11 @@ have already paid for in rate limit.
 
 from __future__ import annotations
 
+import itertools
 import json
+import os
 import sqlite3
+import time
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -24,6 +27,9 @@ from typing import Any, Iterator
 DATA_ROOT = Path(__file__).resolve().parents[2] / "data"
 RAW_DIR = DATA_ROOT / "raw"
 DB_PATH = DATA_ROOT / "valheatmap.db"
+
+# Makes temp filenames unique within a process; the pid separates processes.
+_tmp_counter = itertools.count()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS matches (
@@ -117,12 +123,34 @@ class Database:
     def save_match(self, match_id: str, payload: dict[str, Any], summary: dict[str, Any]) -> Path:
         """Write the raw payload and index it. Safe to call repeatedly."""
         path = self.raw_dir / f"{match_id}.json"
-        tmp = path.with_suffix(".json.tmp")
         # Write via a temp file so an interrupted crawl never leaves a
         # half-written payload that would fail to parse on the next load.
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, separators=(",", ":"))
-        tmp.replace(path)
+        # The temp name carries the pid and a counter: two crawlers running
+        # at once would otherwise collide on the same path, and on Windows
+        # the rename fails outright rather than silently winning.
+        tmp = path.with_suffix(f".json.{os.getpid()}.{next(_tmp_counter)}.tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, separators=(",", ":"))
+            # On Windows the rename fails if anything else has the
+            # destination open, which happens when two crawlers reach the
+            # same match at once. Retry briefly; the content is identical
+            # either way, so losing the race is harmless.
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        if path.exists():
+                            # Someone else wrote it; that is good enough.
+                            tmp.unlink(missing_ok=True)
+                            break
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
 
         with self.connect() as conn:
             conn.execute(

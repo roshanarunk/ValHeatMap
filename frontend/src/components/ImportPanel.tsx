@@ -150,6 +150,7 @@ export function ImportPanel({
                     <option value={50}>50 matches (~1m)</option>
                     <option value={200}>200 matches (~4m)</option>
                     <option value={500}>500 matches (~10m)</option>
+                    <option value={2000}>2000 matches (~40m)</option>
                   </select>
                   <button type="button" onClick={startCrawl} disabled={status.kind === 'busy'}>
                     Crawl

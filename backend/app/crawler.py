@@ -119,8 +119,19 @@ class Crawler:
         self.requests = 0
 
     def log(self, message: str) -> None:
-        if self.verbose:
+        """Print progress without ever killing the crawl.
+
+        Player names are arbitrary unicode, and a Windows console defaults
+        to cp1252 -- a Cyrillic or Japanese name would otherwise raise
+        UnicodeEncodeError and abort a long-running crawl over a log line.
+        """
+        if not self.verbose:
+            return
+        try:
             print(message, flush=True)
+        except UnicodeEncodeError:
+            encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(message.encode(encoding, errors="replace").decode(encoding), flush=True)
 
     async def _get(
         self, client: httpx.AsyncClient, url: str, params: dict[str, Any] | None = None

@@ -245,3 +245,53 @@ def test_store_loads_crawled_matches_alongside_bundled(tmp_db: Database, tmp_pat
     ids = {m.meta.match_id for m in store.all()}
     assert ids == {"bundled-1", "crawled-1"}
     assert {m.meta.map_name for m in store.all()} == {"Split", "Haven"}
+
+
+def test_concurrent_writers_do_not_collide(tmp_db: Database):
+    """Two crawlers saving the same match must not fight over a temp file.
+
+    A shared temp filename makes the rename fail outright on Windows, which
+    is how this surfaced: a second crawler crashed mid-run.
+    """
+    import threading
+
+    payload = _match_payload("m-race")
+    errors: list[Exception] = []
+
+    def save() -> None:
+        try:
+            for _ in range(5):
+                tmp_db.save_match("m-race", payload, {"map_name": "Ascent"})
+        except Exception as exc:  # pragma: no cover - only on regression
+            errors.append(exc)
+
+    threads = [threading.Thread(target=save) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent save failed: {errors[0]!r}"
+    assert tmp_db.match_count() == 1
+    # No temp files left behind.
+    assert not list(tmp_db.raw_dir.glob("*.tmp"))
+    # And the payload is intact, not truncated by an interleaved write.
+    stored = json.loads((tmp_db.raw_dir / "m-race.json").read_text(encoding="utf-8"))
+    assert stored == payload
+
+
+def test_log_survives_names_the_console_cannot_encode(tmp_db: Database, capsys, monkeypatch):
+    """A Cyrillic player name must not abort a long crawl on a cp1252 console."""
+    import io
+
+    crawler = Crawler(api_key="test", database=tmp_db, verbose=True)
+
+    class Cp1252Stream(io.StringIO):
+        encoding = "cp1252"
+
+        def write(self, s: str) -> int:
+            s.encode("cp1252")  # raises UnicodeEncodeError, like a real console
+            return super().write(s)
+
+    monkeypatch.setattr("sys.stdout", Cp1252Stream())
+    crawler.log("crawling Ъ / ツ")  # must not raise
