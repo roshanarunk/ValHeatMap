@@ -36,6 +36,12 @@ from .snapshot import compress, public_base
 
 OBJECT_KEY = "analytics.db.gz"
 
+# Cloudflare defaults to caching this for 4 hours, which would leave the
+# site serving a stale -- and during the WAL bug, corrupt -- database long
+# after a fresh publish. A short max-age plus must-revalidate keeps the
+# edge honest while still absorbing repeated cold starts.
+CACHE_CONTROL = "public, max-age=60, must-revalidate"
+
 
 def _sign(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -57,6 +63,7 @@ def put_object(
     secret_key: str,
     region: str = "auto",
     content_type: str = "application/gzip",
+    cache_control: str = CACHE_CONTROL,
 ) -> None:
     """Minimal SigV4 PUT. Raises on any non-2xx response."""
     host = endpoint.replace("https://", "").replace("http://", "").rstrip("/")
@@ -92,6 +99,7 @@ def put_object(
     request.add_header("x-amz-date", amz_date)
     request.add_header("x-amz-content-sha256", payload_hash)
     request.add_header("Content-Type", content_type)
+    request.add_header("Cache-Control", cache_control)
     request.add_header(
         "Authorization",
         f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "

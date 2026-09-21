@@ -19,6 +19,7 @@ import gzip
 import hashlib
 import os
 import shutil
+import sqlite3
 import tempfile
 import urllib.request
 from pathlib import Path
@@ -27,11 +28,23 @@ from .analytics_db import DEFAULT_PATH
 
 # Where a downloaded snapshot lands. /tmp is the only writable path on most
 # serverless runtimes, and it survives between warm invocations.
+# Cloudflare's bot protection rejects urllib's default "Python-urllib/3.x"
+# user-agent with a 403, even on a public bucket. Identify ourselves
+# properly so the deployed site can actually fetch its own database.
+USER_AGENT = "ValHeatMap/2.0 (+https://github.com/valheatmap)"
+
 CACHE_DIR = Path(os.environ.get("VALHEATMAP_CACHE_DIR") or tempfile.gettempdir())
 CACHED_DB = CACHE_DIR / "valheatmap-analytics.db"
 # Written next to the cache so a warm start can tell whether the remote
 # copy has changed without re-downloading it.
 ETAG_FILE = CACHE_DIR / "valheatmap-analytics.etag"
+
+
+def _request(url: str, **kwargs) -> urllib.request.Request:
+    """A Request that always carries our user-agent."""
+    headers = dict(kwargs.pop("headers", {}))
+    headers.setdefault("User-Agent", USER_AGENT)
+    return urllib.request.Request(url, headers=headers, **kwargs)
 
 
 def public_base() -> str:
@@ -70,7 +83,7 @@ def ensure_local_db(force: bool = False) -> Path:
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CACHED_DB.with_suffix(".part")
-    request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
+    request = _request(url, headers={"Accept-Encoding": "identity"})
     with urllib.request.urlopen(request, timeout=120) as resp:
         etag = resp.headers.get("ETag", "")
         compressed = url.endswith(".gz") or resp.headers.get("Content-Encoding") == "gzip"
@@ -93,7 +106,7 @@ def remote_etag() -> str | None:
     url = snapshot_url()
     if not url:
         return None
-    request = urllib.request.Request(url, method="HEAD")
+    request = _request(url, method="HEAD")
     try:
         with urllib.request.urlopen(request, timeout=15) as resp:
             return resp.headers.get("ETag")
@@ -122,11 +135,44 @@ def refresh_if_stale() -> bool:
 
 
 # --- publishing ---------------------------------------------------------
+def consistent_copy(source: Path, target: Path) -> Path:
+    """Copy a live SQLite database safely.
+
+    Copying the file byte-for-byte is wrong while anything is writing to
+    it. In WAL mode recent commits live in `-wal` until a checkpoint, so a
+    plain copy captures main-file pages that reference WAL content the copy
+    does not include -- the result opens fine and then fails with "database
+    disk image is malformed" on the first real query.
+
+    sqlite3's backup API takes a transactionally consistent snapshot
+    instead, including anything still in the WAL, without stopping the
+    writer. That matters here because the crawler publishes while it runs.
+    """
+    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        dst = sqlite3.connect(target)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    return target
+
+
 def compress(source: Path, target: Path | None = None) -> Path:
-    """gzip the database for upload. SQLite compresses well (~3x)."""
+    """Snapshot the database consistently, then gzip it for upload.
+
+    SQLite compresses about 3x.
+    """
     target = target or source.with_suffix(".db.gz")
-    with source.open("rb") as src, gzip.open(target, "wb", compresslevel=6) as dst:
-        shutil.copyfileobj(src, dst, length=1 << 20)
+    staging = source.with_suffix(".snapshot.tmp")
+    try:
+        consistent_copy(source, staging)
+        with staging.open("rb") as src, gzip.open(target, "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst, length=1 << 20)
+    finally:
+        staging.unlink(missing_ok=True)
     return target
 
 
