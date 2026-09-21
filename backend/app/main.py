@@ -337,7 +337,30 @@ async def debug_snapshot() -> dict[str, Any]:
         "refresh_interval_s": REFRESH_INTERVAL_S,
         "seconds_since_check": round(time.monotonic() - _last_refresh_check, 1),
         "read_only": _READ_ONLY,
+        "tmp": _tmp_space(),
     }
+
+
+def _tmp_space() -> dict[str, Any]:
+    """How much room the cache directory actually has.
+
+    The published size is bounded by this, and the real figure is worth
+    measuring rather than assuming -- providers differ, and the limit is
+    what decides how much of the dataset can be served.
+    """
+    import shutil
+
+    from . import snapshot as snap
+
+    try:
+        usage = shutil.disk_usage(snap.CACHE_DIR)
+        return {
+            "total_mb": round(usage.total / 1e6),
+            "used_mb": round(usage.used / 1e6),
+            "free_mb": round(usage.free / 1e6),
+        }
+    except OSError as exc:
+        return {"error": str(exc)}
 
 
 @app.post("/api/debug/refresh")
