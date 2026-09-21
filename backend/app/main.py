@@ -363,6 +363,44 @@ def _tmp_space() -> dict[str, Any]:
         return {"error": str(exc)}
 
 
+@app.post("/api/debug/reindex")
+async def debug_reindex() -> dict[str, Any]:
+    """Build any missing indexes on the cached database.
+
+    A deploy can land while an instance already holds a correctly-sized
+    snapshot. The ETag still matches, so no refresh is triggered, and the
+    file keeps whatever index set the previous code built -- leaving, for
+    example, zone queries scanning. This repairs it without re-downloading.
+    """
+    global _db, _engine
+    import sqlite3
+
+    from .slim import ensure_indexes
+
+    before = Path(_DB_PATH).stat().st_size if Path(_DB_PATH).exists() else 0
+    elapsed = ensure_indexes(Path(_DB_PATH))
+    after = Path(_DB_PATH).stat().st_size
+
+    with sqlite3.connect(f"file:{_DB_PATH}?immutable=1", uri=True) as conn:
+        names = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+            )
+        ]
+
+    # Rebind so the engine picks up the new query plans.
+    fresh = AnalyticsDB(_DB_PATH, read_only=_READ_ONLY)
+    _db = fresh
+    _engine = QueryEngine(fresh)
+    return {
+        "before_mb": round(before / 1e6),
+        "after_mb": round(after / 1e6),
+        "seconds": round(elapsed, 1),
+        "indexes": names,
+    }
+
+
 @app.post("/api/debug/refresh")
 async def debug_refresh() -> dict[str, Any]:
     """Force a refresh check immediately, ignoring the interval."""
