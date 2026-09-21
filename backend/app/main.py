@@ -309,6 +309,49 @@ async def dataset_stats() -> dict[str, Any]:
     return {**_db.stats(), "read_only": _READ_ONLY}
 
 
+@app.get("/api/debug/snapshot")
+async def debug_snapshot() -> dict[str, Any]:
+    """Why the served snapshot is (or is not) current.
+
+    Staleness has several possible causes -- the origin, the CDN edge, the
+    instance's cached copy, or the refresh timer -- and they are hard to
+    tell apart from outside. This reports all of them at once.
+    """
+    from . import snapshot as snap
+
+    cached = snap.cached_etag()
+    remote = snap.remote_etag()
+    return {
+        "serving": _db.stats(),
+        "db_path": str(_DB_PATH),
+        "db_exists": Path(_DB_PATH).exists(),
+        "db_size": Path(_DB_PATH).stat().st_size if Path(_DB_PATH).exists() else 0,
+        "cache_dir": str(snap.CACHE_DIR),
+        "cached_db": str(snap.CACHED_DB),
+        "cached_db_exists": snap.CACHED_DB.exists(),
+        "etag_file": str(snap.ETAG_FILE),
+        "etag_cached": cached,
+        "etag_remote": remote,
+        "is_stale": bool(remote and remote != cached),
+        "snapshot_url": snap.snapshot_url(),
+        "refresh_interval_s": REFRESH_INTERVAL_S,
+        "seconds_since_check": round(time.monotonic() - _last_refresh_check, 1),
+        "read_only": _READ_ONLY,
+    }
+
+
+@app.post("/api/debug/refresh")
+async def debug_refresh() -> dict[str, Any]:
+    """Force a refresh check immediately, ignoring the interval."""
+    global _last_refresh_check
+
+    before = _db.stats().get("matches", 0)
+    _last_refresh_check = time.monotonic() - REFRESH_INTERVAL_S - 1
+    _maybe_refresh()
+    after = _db.stats().get("matches", 0)
+    return {"before": before, "after": after, "changed": after != before}
+
+
 # --- static frontend ----------------------------------------------------
 _DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 if _DIST.is_dir():
