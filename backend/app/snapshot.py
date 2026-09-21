@@ -131,18 +131,54 @@ def ensure_local_db(force: bool = False) -> Path:
         return DEFAULT_PATH
 
 
+class _Prefixed:
+    """A reader that replays bytes already consumed for sniffing."""
+
+    def __init__(self, prefix: bytes, stream) -> None:
+        self._prefix = prefix
+        self._stream = stream
+
+    def read(self, size: int = -1) -> bytes:
+        if not self._prefix:
+            return self._stream.read(size)
+        if size is None or size < 0:
+            out = self._prefix + self._stream.read()
+            self._prefix = b""
+            return out
+        if size <= len(self._prefix):
+            out, self._prefix = self._prefix[:size], self._prefix[size:]
+            return out
+        out = self._prefix + self._stream.read(size - len(self._prefix))
+        self._prefix = b""
+        return out
+
+
 def _download(request: urllib.request.Request, tmp: Path, url: str) -> Path:
     with urllib.request.urlopen(request, timeout=120) as resp:
         etag = resp.headers.get("ETag", "")
-        compressed = url.endswith(".gz") or resp.headers.get("Content-Encoding") == "gzip"
+        # Sniff the magic bytes rather than trusting the URL or headers.
+        # The path carries a cache-busting query string, so an endswith
+        # check on ".gz" silently stopped matching and the database was
+        # written still compressed -- it then failed to open, the refresh
+        # was swallowed, and the site kept serving the previous copy.
+        head = resp.read(2)
+        compressed = head[:2] == bytes((0x1F, 0x8B))
+        body = _Prefixed(head, resp)
         with tmp.open("wb") as fh:
             if compressed:
-                # Stream through gzip so a 100 MB database never has to be
-                # held in memory in full.
-                with gzip.GzipFile(fileobj=resp) as gz:
+                # Stream through gzip so the database never has to be held
+                # in memory in full.
+                with gzip.GzipFile(fileobj=body) as gz:
                     shutil.copyfileobj(gz, fh, length=1 << 20)
             else:
-                shutil.copyfileobj(resp, fh, length=1 << 20)
+                shutil.copyfileobj(body, fh, length=1 << 20)
+    # Confirm we actually wrote a database. A decompression mix-up leaves
+    # a gzip stream on disk, which opens fine and only fails on the first
+    # query -- by which point the refresh has already been swallowed.
+    with tmp.open("rb") as fh:
+        if not fh.read(15).startswith(b"SQLite format 3"):
+            tmp.unlink(missing_ok=True)
+            raise OSError("downloaded snapshot is not a SQLite database")
     tmp.replace(CACHED_DB)
     # The published copy ships without indexes to stay inside /tmp; build
     # them now, once, rather than shipping 278 MB of them.
