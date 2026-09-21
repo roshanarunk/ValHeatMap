@@ -4,7 +4,6 @@
   "outputDirectory": "frontend/dist",
   "functions": {
     "api/index.py": {
-      "runtime": "python3.12",
       "memory": 1024,
       "maxDuration": 60,
       "excludeFiles": "{data/raw/**,data/matches/**,data/*.db,data/*.db-*,legacy/**,backend/tests/**,docs/**,frontend/node_modules/**,frontend/src/**}"
