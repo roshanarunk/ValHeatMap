@@ -359,12 +359,41 @@ that the instance is warm.
 # How updates reach the site
 
 ```
-crawler stores matches  →  every 2,000 new matches it publishes to R2
-                        →  the site notices a new ETag and re-downloads
+crawler stores matches
+   -> publishes to R2 every 2,000 new matches (or via the tray menu)
+   -> the deployed function re-checks the snapshot's ETag every 2 minutes
+   -> a changed ETag triggers a re-download, and the next request sees it
 ```
 
-So the site is as fresh as your last publish — roughly hourly at full
-crawl rate. **Publish snapshot now** in the tray menu forces it immediately.
+The re-check is a conditional HEAD, so the usual case costs nothing.
+`VALHEATMAP_REFRESH_SECONDS` tunes the interval if you want it tighter.
+
+## If the site looks stale
+
+Work outward from the origin:
+
+```powershell
+cd backend
+python -m app.check_snapshot
+```
+
+That reports the three things that go wrong, in order:
+
+1. **The origin is old** — the crawler has not published. Use *Publish
+   snapshot now* in the tray menu.
+2. **The edge is serving an older copy than the origin** — Cloudflare
+   defaults large objects to a 4-hour TTL, so a fresh publish can sit
+   behind a stale cache. Purge it (Caching → Configuration → Purge
+   Everything) and add the Cache Rule in 2.2 so it stops recurring.
+3. **Both are current but the site is not** — the function has not
+   re-checked yet. Wait out `VALHEATMAP_REFRESH_SECONDS`, or redeploy to
+   force a cold start.
+
+`/api/health` shows `generated_at`, the timestamp of the snapshot that
+instance is actually serving. Comparing it against your last publish tells
+you immediately which of the three you are looking at.
+
+
 
 Nothing is scheduled on Vercel, which is why none of this needs Vercel Pro.
 

@@ -21,6 +21,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -84,6 +85,22 @@ def ensure_local_db(force: bool = False) -> Path:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CACHED_DB.with_suffix(".part")
     request = _request(url, headers={"Accept-Encoding": "identity"})
+    try:
+        return _download(request, tmp, url)
+    except (OSError, urllib.error.URLError, gzip.BadGzipFile) as exc:
+        tmp.unlink(missing_ok=True)
+        # A download failure at import time must not take the whole app
+        # down: an instance with a previously cached copy should keep
+        # serving it, and a cold one should start and report the problem
+        # through /api/health rather than 500 on every route.
+        print(f"[snapshot] could not fetch {url}: {exc}")
+        if CACHED_DB.exists():
+            print("[snapshot] falling back to the cached copy")
+            return CACHED_DB
+        return DEFAULT_PATH
+
+
+def _download(request: urllib.request.Request, tmp: Path, url: str) -> Path:
     with urllib.request.urlopen(request, timeout=120) as resp:
         etag = resp.headers.get("ETag", "")
         compressed = url.endswith(".gz") or resp.headers.get("Content-Encoding") == "gzip"

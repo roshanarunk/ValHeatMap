@@ -13,6 +13,8 @@ is what makes cold starts viable on a serverless host, where re-reading the
 from __future__ import annotations
 
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +29,7 @@ from .config import load_env
 from .models import Plant, Point
 from .queries import Filters, QueryEngine
 from .reference import agents_by_id, get_map, weapons_by_id
-from .snapshot import ensure_local_db
+from .snapshot import ensure_local_db, refresh_if_stale
 from .sources import clients
 
 load_env()
@@ -48,6 +50,50 @@ _DB_PATH = ensure_local_db()
 _READ_ONLY = os.environ.get("VALHEATMAP_READ_ONLY", "").lower() in {"1", "true", "yes"}
 _db = AnalyticsDB(_DB_PATH, read_only=_READ_ONLY)
 _engine = QueryEngine(_db)
+
+# How often a warm instance re-checks the published snapshot. A Vercel
+# instance can live for hours, so without this it would serve whatever it
+# downloaded at cold start forever -- the site would only pick up new data
+# when Vercel happened to spin up a new instance.
+REFRESH_INTERVAL_S = int(os.environ.get("VALHEATMAP_REFRESH_SECONDS", "120"))
+_last_refresh_check = time.monotonic()
+_refresh_lock = threading.Lock()
+
+
+def _maybe_refresh() -> None:
+    """Re-download the snapshot when a newer one has been published.
+
+    Cheap in the common case: a conditional HEAD against the ETag, at most
+    once per REFRESH_INTERVAL_S. When the ETag has changed, the database is
+    re-downloaded and the connection and cached dimension ids are rebound --
+    keeping the old AnalyticsDB would go on serving the previous file even
+    after a successful download.
+    """
+    global _db, _engine, _last_refresh_check
+
+    if not _READ_ONLY:
+        return  # local runs read the live file directly
+    now = time.monotonic()
+    if now - _last_refresh_check < REFRESH_INTERVAL_S:
+        return
+    if not _refresh_lock.acquire(blocking=False):
+        return  # another request is already checking
+    try:
+        _last_refresh_check = now
+        if refresh_if_stale():
+            fresh = AnalyticsDB(_DB_PATH, read_only=True)
+            _db = fresh
+            _engine = QueryEngine(fresh)
+    except Exception as exc:  # never fail a request over a refresh
+        print(f"[snapshot] refresh failed: {exc}")
+    finally:
+        _refresh_lock.release()
+
+
+@app.middleware("http")
+async def _refresh_middleware(request: Request, call_next):
+    _maybe_refresh()
+    return await call_next(request)
 
 
 def _filters(request: Request) -> Filters:

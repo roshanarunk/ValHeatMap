@@ -447,3 +447,78 @@ def test_public_base_empty_when_unset(monkeypatch):
 
     monkeypatch.delenv("R2_PUBLIC_URL", raising=False)
     assert public_base() == ""
+
+
+# --- snapshot robustness ------------------------------------------------
+def test_consistent_copy_captures_uncommitted_wal(tmp_path: Path):
+    """A byte copy of a live WAL database is corrupt; this must not be.
+
+    Writes sit in the -wal file until a checkpoint, so copying only the
+    main file yields pages referencing WAL content the copy lacks. The
+    result opens, then fails with "database disk image is malformed" on the
+    first real query -- which is exactly what shipped to production.
+    """
+    import shutil
+    import sqlite3
+
+    from app.analytics_db import AnalyticsDB
+    from app.snapshot import consistent_copy
+
+    source = tmp_path / "live.db"
+    db = AnalyticsDB(source)
+    with db.connect() as conn:
+        conn.execute("INSERT INTO dim (kind, id, name) VALUES ('map', 1, 'Ascent')")
+        for i in range(500):
+            conn.execute(
+                "INSERT INTO matches (match_id, map_id, mode, rounds) VALUES (?,?,?,?)",
+                (f"m{i}", 1, "standard", 24),
+            )
+    assert (tmp_path / "live.db-wal").exists(), "expected WAL mode"
+
+    good = tmp_path / "good.db"
+    consistent_copy(source, good)
+    conn = sqlite3.connect(good)
+    assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0] == 500
+    conn.close()
+
+    # The naive copy misses the WAL entirely: here the schema itself is
+    # still only in the WAL, so the table does not even exist.
+    naive = tmp_path / "naive.db"
+    shutil.copy(source, naive)
+    conn = sqlite3.connect(f"file:{naive}?immutable=1", uri=True)
+    try:
+        rows = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+        assert rows < 500, "naive copy unexpectedly complete"
+    except sqlite3.DatabaseError:
+        pass  # equally valid: the copy is unusable
+    finally:
+        conn.close()
+
+
+def test_snapshot_requests_carry_a_user_agent():
+    """Cloudflare answers urllib's default UA with 403, even when public."""
+    from app.snapshot import USER_AGENT, _request
+
+    request = _request("https://example.com/x.gz")
+    assert request.get_header("User-agent") == USER_AGENT
+    assert "Python-urllib" not in USER_AGENT
+
+
+def test_public_url_accepts_bare_host(monkeypatch):
+    from app.snapshot import public_base
+
+    monkeypatch.setenv("R2_PUBLIC_URL", "data.example.com")
+    assert public_base() == "https://data.example.com"
+
+
+def test_failed_download_does_not_crash_the_app(monkeypatch, tmp_path: Path):
+    """An unreachable snapshot must not take every route down with it."""
+    import app.snapshot as snap
+
+    monkeypatch.setattr(snap, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(snap, "CACHED_DB", tmp_path / "cached.db")
+    monkeypatch.setenv("VALHEATMAP_SNAPSHOT_URL", "https://nonexistent.invalid/x.db.gz")
+
+    path = snap.ensure_local_db()
+    assert path == snap.DEFAULT_PATH  # falls back rather than raising
