@@ -38,6 +38,26 @@ TIER_BANDS = {
 }
 
 
+def _zone(params: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """Parse `zone=x0,y0,x1,y1` in normalised minimap coordinates."""
+    raw = params.get("zone")
+    if not raw:
+        return None
+    parts = str(raw).split(",")
+    if len(parts) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(p) for p in parts)
+    except ValueError:
+        return None
+    # Normalise so a box drawn in any direction works.
+    lo_x, hi_x = sorted((x0, x1))
+    lo_y, hi_y = sorted((y0, y1))
+    if hi_x - lo_x <= 0 or hi_y - lo_y <= 0:
+        return None
+    return (lo_x, lo_y, hi_x, hi_y)
+
+
 @dataclass(slots=True)
 class Filters:
     map_name: str = ""
@@ -46,7 +66,13 @@ class Filters:
     agents: list[str] = field(default_factory=list)
     victim_agents: list[str] = field(default_factory=list)
     weapons: list[str] = field(default_factory=list)
+    abilities: list[str] = field(default_factory=list)
     sides: list[str] = field(default_factory=list)
+    # Zone selection: a box in minimap space, and which end of the duel it
+    # applies to. "killer" answers "who did people in this area kill?",
+    # "victim" answers "who killed the people who died here?".
+    zone: tuple[float, float, float, float] | None = None
+    zone_anchor: str = "victim"
     ranks: list[str] = field(default_factory=list)      # band names
     tier_min: int | None = None
     tier_max: int | None = None
@@ -100,7 +126,12 @@ class Filters:
             agents=lst("agents"),
             victim_agents=lst("victim_agents"),
             weapons=lst("weapons"),
+            abilities=lst("abilities"),
             sides=lst("sides"),
+            zone=_zone(params),
+            zone_anchor=(
+                "killer" if str(params.get("zone_anchor", "")).lower() == "killer" else "victim"
+            ),
             ranks=lst("ranks"),
             tier_min=num("tier_min"),
             tier_max=num("tier_max"),
@@ -206,6 +237,22 @@ class QueryEngine:
                     return "1=0", []
                 clauses.append(f"weapon_id IN ({','.join('?' * len(ids))})")
                 args.extend(ids)
+            if f.abilities:
+                ids = self._resolve("ability", f.abilities)
+                if ids is None:
+                    return "1=0", []
+                clauses.append(f"ability_id IN ({','.join('?' * len(ids))})")
+                args.extend(ids)
+            if f.zone:
+                # The box constrains one end of the duel; the caller plots
+                # the other, which is what makes this a cross-filter rather
+                # than a plain crop.
+                lo_x, lo_y, hi_x, hi_y = f.zone
+                px, py = ("kx", "ky") if f.zone_anchor == "killer" else ("vx", "vy")
+                clauses.append(
+                    f"{px} BETWEEN ? AND ? AND {py} BETWEEN ? AND ? AND {px} IS NOT NULL"
+                )
+                args.extend([lo_x, hi_x, lo_y, hi_y])
             if f.sides:
                 codes = [k for k, v in SIDE_NAME.items() if v in f.sides]
                 if codes:

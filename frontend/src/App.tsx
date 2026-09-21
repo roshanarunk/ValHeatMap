@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { MapCanvas, type RenderMode } from './components/MapCanvas'
+import { MapCanvas, type RenderMode, type Zone } from './components/MapCanvas'
 import {
   ControlBar,
   ControlGroup,
@@ -44,6 +44,12 @@ export default function App() {
   const [act, setAct] = useState('')
   const [rank, setRank] = useState('')
   const [agent, setAgent] = useState('')
+  const [ability, setAbility] = useState('')
+  // Zone cross-filter: the box constrains one end of each duel and the map
+  // plots the other, so "kills by people here" and "deaths caused from
+  // here" are two views of the same selection.
+  const [zoneMode, setZoneMode] = useState(false)
+  const [zone, setZone] = useState<Zone | null>(null)
   const [sides, setSides] = useState<string[]>([])
   const [timeRange, setTimeRange] = useState<[number, number]>([0, ROUND_MAX_MS])
   const [tradedOnly, setTradedOnly] = useState(false)
@@ -87,7 +93,12 @@ export default function App() {
       acts: act ? [act] : [],
       ranks: rank ? [rank] : [],
       agents: agent ? [agent] : [],
+      abilities: ability ? [ability] : [],
       sides,
+      zone: zone ? `${zone.x0},${zone.y0},${zone.x1},${zone.y1}` : undefined,
+      // The zone constrains the opposite end from the one being plotted:
+      // selecting where killers stood shows where their victims fell.
+      zone_anchor: zone ? (anchor === 'victim' ? 'killer' : 'victim') : undefined,
       time_start: timeRange[0] > 0 ? timeRange[0] : undefined,
       time_end: timeRange[1] < ROUND_MAX_MS ? timeRange[1] : undefined,
       traded_only: tradedOnly,
@@ -96,7 +107,7 @@ export default function App() {
       post_plant_only: postPlantOnly,
     }),
     [
-      mapName, act, rank, agent, sides, timeRange,
+      mapName, act, rank, agent, ability, sides, timeRange, zone, anchor,
       tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly,
     ],
   )
@@ -168,7 +179,9 @@ export default function App() {
     setAct('')
     setRank('')
     setAgent('')
+    setAbility('')
     setSides([])
+    setZone(null)
     setTimeRange([0, ROUND_MAX_MS])
     setTradedOnly(false)
     setUntradedOnly(false)
@@ -177,7 +190,8 @@ export default function App() {
   }, [])
 
   const activeFilters =
-    (act ? 1 : 0) + (rank ? 1 : 0) + (agent ? 1 : 0) + sides.length +
+    (act ? 1 : 0) + (rank ? 1 : 0) + (agent ? 1 : 0) + (ability ? 1 : 0) +
+    (zone ? 1 : 0) + sides.length +
     (timeRange[0] > 0 || timeRange[1] < ROUND_MAX_MS ? 1 : 0) +
     [tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly].filter(Boolean).length
 
@@ -278,6 +292,20 @@ export default function App() {
               </ControlGroup>
             )}
 
+            {view === 'utility' && (
+              <ControlGroup label="Ability">
+                <Select
+                  value={ability}
+                  placeholder="All abilities"
+                  options={(facets?.abilities ?? []).map((a) => ({
+                    value: a.ability,
+                    label: `${a.ability} · ${a.agent}`,
+                  }))}
+                  onChange={setAbility}
+                />
+              </ControlGroup>
+            )}
+
             {!isPlants && (
               <ControlGroup label="Agent">
                 <Select
@@ -304,6 +332,25 @@ export default function App() {
                   value={renderMode}
                   onChange={setRenderMode}
                 />
+              </ControlGroup>
+            )}
+
+            {!isPlants && !isInsights && (
+              <ControlGroup label="Zone">
+                <Toggle
+                  label={zoneMode ? 'Drawing' : 'Select area'}
+                  checked={zoneMode}
+                  onChange={(v) => {
+                    setZoneMode(v)
+                    if (!v) setZone(null)
+                  }}
+                  hint="Drag a box on the map to focus one area"
+                />
+                {zone && (
+                  <button type="button" className="linkbtn" onClick={() => setZone(null)}>
+                    Clear
+                  </button>
+                )}
               </ControlGroup>
             )}
 
@@ -339,6 +386,9 @@ export default function App() {
                 loading={loading}
                 selectedSpot={selectedSpot}
                 onSelectSpot={setSelectedSpot}
+                zoneMode={zoneMode && !isPlants}
+                zone={zone}
+                onZoneChange={setZone}
               />
             </div>
           )}
@@ -346,6 +396,27 @@ export default function App() {
           {/* --- controls below the map --- */}
           {!isInsights && (
             <>
+              {zone && !isPlants && (
+                <div className="zonenote">
+                  <strong>
+                    {anchor === 'victim'
+                      ? 'Deaths caused by players inside the box'
+                      : 'Where the players who died inside the box were killed from'}
+                  </strong>
+                  <span>
+                    The box holds one end of each duel; the map plots the other.
+                    Switch <em>Plot</em> to flip which end.
+                  </span>
+                  <button type="button" className="linkbtn" onClick={() => setZone(null)}>
+                    Clear zone
+                  </button>
+                </div>
+              )}
+              {zoneMode && !zone && !isPlants && (
+                <div className="zonenote zonenote--hint">
+                  <span>Drag a box on the map to focus an area.</span>
+                </div>
+              )}
               {renderMode === 'lines' && !isPlants && <DuelLegend />}
               {renderMode === 'heatmap' && !isPlants && (
                 <HeatLegend

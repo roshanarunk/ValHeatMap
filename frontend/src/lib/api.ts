@@ -81,6 +81,10 @@ export interface QueryFilters {
   rounds?: number[]
   weapons?: string[]
   abilities?: string[]
+  /** Zone box as "x0,y0,x1,y1" in normalised minimap space. */
+  zone?: string
+  /** Which end of the duel the zone constrains. */
+  zone_anchor?: 'victim' | 'killer'
   time_start?: number
   time_end?: number
   traded_only?: boolean

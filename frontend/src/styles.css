@@ -640,3 +640,21 @@ input:focus, select:focus { outline: none; border-color: rgba(255, 70, 85, 0.55)
   .controlbar { gap: 10px; padding: 9px; }
   .datasetline { width: 100%; margin-left: 0; }
 }
+
+/* --- zone selection --------------------------------------------------- */
+.zonenote {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 9px 13px; border-radius: var(--radius);
+  background: rgba(255, 70, 85, 0.08);
+  border: 1px solid rgba(255, 70, 85, 0.35);
+  font-size: 12px;
+}
+.zonenote strong { color: var(--text); font-size: 12.5px; }
+.zonenote span { color: var(--text-dim); }
+.zonenote em { font-style: normal; color: var(--accent-soft); }
+.zonenote .linkbtn { margin-left: auto; }
+.zonenote--hint {
+  background: var(--bg-input);
+  border-color: var(--line);
+  border-style: dashed;
+}

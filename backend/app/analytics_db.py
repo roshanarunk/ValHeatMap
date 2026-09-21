@@ -101,6 +101,15 @@ CREATE TABLE IF NOT EXISTS kills (
 -- which is what made the first version's indexes larger than its data.
 CREATE INDEX IF NOT EXISTS idx_k_main ON kills(map_id, avg_tier, act_id, t_ms);
 CREATE INDEX IF NOT EXISTS idx_k_m    ON kills(m);
+-- Spatial lookups for zone selection. Without these, "which kills happened
+-- inside this box" is a full scan: 655ms over 2.6M rows versus 7ms here,
+-- which is the difference between a laggy drag and an instant one.
+CREATE INDEX IF NOT EXISTS idx_k_vpos ON kills(map_id, vx, vy);
+CREATE INDEX IF NOT EXISTS idx_k_kpos ON kills(map_id, kx, ky);
+-- Ability kills are ~1% of rows, so a partial index stays tiny while
+-- turning the utility view from three full scans (2.4s) into 54ms.
+CREATE INDEX IF NOT EXISTS idx_k_util ON kills(map_id, ability_id, avg_tier, act_id)
+    WHERE dmg_type = 1;
 
 CREATE TABLE IF NOT EXISTS plants (
     m          INTEGER NOT NULL,
@@ -343,6 +352,7 @@ class AnalyticsDB:
         maps = self.dim_names("map")
         acts = self.dim_names("act")
         agents = self.dim_names("agent")
+        abilities = self.dim_names("ability")
         with self.connect() as conn:
             map_rows = conn.execute(
                 "SELECT map_id, COUNT(*) matches FROM matches GROUP BY map_id"
@@ -357,6 +367,11 @@ class AnalyticsDB:
             agent_rows = conn.execute(
                 "SELECT ka_id, COUNT(*) kills FROM kills "
                 "WHERE ka_id IS NOT NULL GROUP BY ka_id ORDER BY kills DESC"
+            ).fetchall()
+            ability_rows = conn.execute(
+                "SELECT ability_id, ka_id, COUNT(*) kills FROM kills "
+                "WHERE ability_id IS NOT NULL GROUP BY ability_id, ka_id "
+                "ORDER BY kills DESC"
             ).fetchall()
             tiers = conn.execute(
                 "SELECT MIN(avg_tier) lo, MAX(avg_tier) hi FROM matches WHERE avg_tier > 0"
@@ -383,6 +398,14 @@ class AnalyticsDB:
             ),
             "agents": [
                 {"agent": agents.get(r["ka_id"], "?"), "kills": r["kills"]} for r in agent_rows
+            ],
+            "abilities": [
+                {
+                    "ability": abilities.get(r["ability_id"], "?"),
+                    "agent": agents.get(r["ka_id"], "?"),
+                    "kills": r["kills"],
+                }
+                for r in ability_rows
             ],
             "tier_range": [tiers["lo"] or 0, tiers["hi"] or 0],
         }

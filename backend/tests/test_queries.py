@@ -306,3 +306,82 @@ def test_unresolvable_filter_matches_nothing_not_everything(engine: QueryEngine)
     # A mix of known and unknown keeps the known part.
     mixed = engine.summary(Filters(map_name="Ascent", agents=["Jett", "Nobody"]))
     assert mixed["total"] > 0
+
+
+# --- ability filter -----------------------------------------------------
+def test_ability_filter_narrows_to_one_ability(engine: QueryEngine):
+    all_util = engine.summary(Filters(map_name="Ascent", utility_only=True))["total"]
+    blade = engine.summary(Filters(map_name="Ascent", abilities=["Blade Storm"]))["total"]
+    assert blade > 0
+    assert blade == all_util  # the fixture's only ability kill
+
+
+def test_unknown_ability_matches_nothing(engine: QueryEngine):
+    assert engine.summary(Filters(map_name="Ascent", abilities=["Nope"]))["total"] == 0
+
+
+def test_abilities_appear_in_facets(db: AnalyticsDB):
+    facets = db.facets()
+    assert facets["abilities"]
+    row = facets["abilities"][0]
+    assert row["ability"] == "Blade Storm"
+    assert row["agent"] == "Jett"
+    assert row["kills"] > 0
+
+
+# --- zone cross-filter --------------------------------------------------
+def test_zone_parses_and_normalises_any_drag_direction():
+    """A box drawn bottom-right to top-left must work the same way."""
+    forward = Filters.from_query({"zone": "0.2,0.3,0.6,0.7"})
+    backward = Filters.from_query({"zone": "0.6,0.7,0.2,0.3"})
+    assert forward.zone == (0.2, 0.3, 0.6, 0.7)
+    assert backward.zone == forward.zone
+
+
+def test_zero_area_zone_is_ignored():
+    """A click without a drag should not select an empty sliver."""
+    assert Filters.from_query({"zone": "0.5,0.5,0.5,0.5"}).zone is None
+    assert Filters.from_query({"zone": "garbage"}).zone is None
+    assert Filters.from_query({"zone": "1,2,3"}).zone is None
+
+
+def test_zone_constrains_the_anchor_end_only(engine: QueryEngine, db: AnalyticsDB):
+    """The box holds one end of the duel; the other is free to be anywhere.
+
+    That is what makes this a cross-filter rather than a crop: selecting
+    where killers stood shows where their victims fell, which may be well
+    outside the box.
+    """
+    with db.connect() as conn:
+        row = conn.execute("SELECT vx, vy, kx, ky FROM kills LIMIT 1").fetchone()
+    pad = 0.01
+    around_victim = (row["vx"] - pad, row["vy"] - pad, row["vx"] + pad, row["vy"] + pad)
+
+    victim_side = engine.summary(
+        Filters(map_name="Ascent", zone=around_victim, zone_anchor="victim")
+    )["total"]
+    killer_side = engine.summary(
+        Filters(map_name="Ascent", zone=around_victim, zone_anchor="killer")
+    )["total"]
+
+    assert victim_side >= 1, "the kill whose victim defined the box must match"
+    # The same tiny box around a death position should not also contain the
+    # killer, so the two anchors select different sets.
+    assert killer_side != victim_side
+
+
+def test_zone_returns_points_outside_the_box(engine: QueryEngine, db: AnalyticsDB):
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT kx, ky FROM kills WHERE kx IS NOT NULL LIMIT 1"
+        ).fetchone()
+    pad = 0.02
+    zone = (row["kx"] - pad, row["ky"] - pad, row["kx"] + pad, row["ky"] + pad)
+
+    result = engine.kill_points(
+        Filters(map_name="Ascent", zone=zone, zone_anchor="killer")
+    )
+    assert result["points"], "expected kills by someone inside the box"
+    # Plotted positions are victims, which need not be inside the box.
+    for point in result["points"]:
+        assert 0.0 <= point["victim_pos"]["x"] <= 1.0

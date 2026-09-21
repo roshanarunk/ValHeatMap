@@ -30,6 +30,18 @@ export interface MapCanvasProps {
   loading?: boolean
   onSelectSpot?: (id: number | null) => void
   selectedSpot?: number | null
+  /** Drag-to-select a rectangular zone, in normalised map space. */
+  zoneMode?: boolean
+  zone?: Zone | null
+  onZoneChange?: (zone: Zone | null) => void
+}
+
+/** A box in normalised map space, always stored lo->hi. */
+export interface Zone {
+  x0: number
+  y0: number
+  x1: number
+  y1: number
 }
 
 interface HoverTarget {
@@ -67,6 +79,9 @@ export function MapCanvas({
   loading = false,
   onSelectSpot,
   selectedSpot = null,
+  zoneMode = false,
+  zone = null,
+  onZoneChange,
 }: MapCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const wrapRef = useRef<HTMLDivElement | null>(null)
@@ -74,6 +89,10 @@ export function MapCanvas({
   const [size, setSize] = useState(0)
   const [imageReady, setImageReady] = useState(false)
   const [hover, setHover] = useState<HoverTarget | null>(null)
+  // Drag state lives here rather than in the parent so the rubber band can
+  // redraw at pointer speed without a round trip through React state.
+  const dragRef = useRef<{ x: number; y: number } | null>(null)
+  const [draft, setDraft] = useState<Zone | null>(null)
 
   const radians = useMemo(() => (rotation * Math.PI) / 180, [rotation])
 
@@ -272,11 +291,33 @@ export function MapCanvas({
       })
     }
 
+    // Zone overlay: dim everything outside the box so the selection reads
+    // as a focus rather than just an outline.
+    const box = draft ?? zone
+    if (box) {
+      const x = box.x0 * px
+      const y = box.y0 * px
+      const w = (box.x1 - box.x0) * px
+      const h = (box.y1 - box.y0) * px
+      ctx.save()
+      ctx.fillStyle = 'rgba(6, 10, 20, 0.55)'
+      ctx.beginPath()
+      ctx.rect(0, 0, px, px)
+      ctx.rect(x, y, w, h)
+      ctx.fill('evenodd')
+      ctx.strokeStyle = 'rgba(255, 70, 85, 0.95)'
+      ctx.lineWidth = 1.5 * dpr
+      ctx.setLineDash([5 * dpr, 4 * dpr])
+      ctx.strokeRect(x, y, w, h)
+      ctx.setLineDash([])
+      ctx.restore()
+    }
+
     ctx.restore()
   }, [
     size, heatPoints, duelLines, mode, ramp, radius, intensity, percentile,
     kills, plants, spots, anchor, showCallouts, showSpots, highlightTraded,
-    map, imageReady, radians, selectedSpot,
+    map, imageReady, radians, selectedSpot, zone, draft,
   ])
 
   useEffect(() => {
@@ -293,6 +334,7 @@ export function MapCanvas({
         x: (event.clientX - rect.left) / rect.width,
         y: (event.clientY - rect.top) / rect.height,
       }
+      if (zoneMode && dragRef.current) return
       const pt = rotatePoint(raw, -radians)
 
       const near = <T,>(items: T[], pos: (i: T) => Vec2, limit: number) => {
@@ -347,7 +389,70 @@ export function MapCanvas({
       }
       setHover(null)
     },
-    [kills, spots, size, showSpots, anchor, mode, radians],
+    [kills, spots, size, showSpots, anchor, mode, radians, zoneMode],
+  )
+
+  const toMapSpace = useCallback(
+    (event: React.PointerEvent | React.MouseEvent) => {
+      const canvas = canvasRef.current
+      if (!canvas) return null
+      const rect = canvas.getBoundingClientRect()
+      return rotatePoint(
+        {
+          x: (event.clientX - rect.left) / rect.width,
+          y: (event.clientY - rect.top) / rect.height,
+        },
+        -radians,
+      )
+    },
+    [radians],
+  )
+
+  const onPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!zoneMode) return
+      const p = toMapSpace(event)
+      if (!p) return
+      event.currentTarget.setPointerCapture(event.pointerId)
+      dragRef.current = p
+      setDraft({ x0: p.x, y0: p.y, x1: p.x, y1: p.y })
+    },
+    [zoneMode, toMapSpace],
+  )
+
+  const onPointerMove = useCallback(
+    (event: React.PointerEvent<HTMLCanvasElement>) => {
+      const start = dragRef.current
+      if (!zoneMode || !start) return
+      const p = toMapSpace(event)
+      if (!p) return
+      setDraft({
+        x0: Math.min(start.x, p.x),
+        y0: Math.min(start.y, p.y),
+        x1: Math.max(start.x, p.x),
+        y1: Math.max(start.y, p.y),
+      })
+    },
+    [zoneMode, toMapSpace],
+  )
+
+  const onPointerUp = useCallback(
+    (event: React.PointerEvent<HTMLCanvasElement>) => {
+      if (!zoneMode || !dragRef.current) return
+      dragRef.current = null
+      event.currentTarget.releasePointerCapture?.(event.pointerId)
+      setDraft((current) => {
+        // Ignore an accidental click: a box smaller than this selects
+        // almost nothing and is nearly always a misclick.
+        if (current && current.x1 - current.x0 > 0.01 && current.y1 - current.y0 > 0.01) {
+          onZoneChange?.(current)
+        } else {
+          onZoneChange?.(null)
+        }
+        return null
+      })
+    },
+    [zoneMode, onZoneChange],
   )
 
   const onClick = useCallback(() => {
@@ -366,10 +471,13 @@ export function MapCanvas({
     <div className="map-canvas" ref={wrapRef}>
       <canvas
         ref={canvasRef}
-        style={{ width: size, height: size }}
+        style={{ width: size, height: size, cursor: zoneMode ? 'crosshair' : 'default' }}
         onMouseMove={onMove}
         onMouseLeave={() => setHover(null)}
         onClick={onClick}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
       />
       {!map && <div className="map-overlay">Select a map to begin</div>}
       {loading && <div className="map-overlay map-overlay--soft">Loading…</div>}

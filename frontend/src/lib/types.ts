@@ -272,10 +272,17 @@ export interface RankBand {
   tiers: [number, number]
 }
 
+export interface FacetAbility {
+  ability: string
+  agent: string
+  kills: number
+}
+
 export interface Facets {
   maps: FacetMap[]
   acts: { act: string; matches: number }[]
   agents: FacetAgent[]
+  abilities: FacetAbility[]
   ranks: RankBand[]
   tier_range: [number, number]
   stats: { matches: number; kills: number; plants: number; generated_at: string | null }
