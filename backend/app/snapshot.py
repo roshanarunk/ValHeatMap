@@ -21,6 +21,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -84,9 +85,23 @@ def ensure_local_db(force: bool = False) -> Path:
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CACHED_DB.with_suffix(".part")
-    request = _request(url, headers={"Accept-Encoding": "identity"})
+    # A forced refresh follows an ETag check that bypassed the cache, so the
+    # download has to bypass it too. Otherwise the edge can hand back the
+    # very copy we just decided was stale, and the instance would keep
+    # re-downloading the same old file every poll.
+    fetch_url = url
+    if force:
+        separator = "&" if "?" in url else "?"
+        fetch_url = f"{url}{separator}_={int(time.time())}"
+    request = _request(
+        fetch_url,
+        headers={
+            "Accept-Encoding": "identity",
+            **({"Cache-Control": "no-cache"} if force else {}),
+        },
+    )
     try:
-        return _download(request, tmp, url)
+        return _download(request, tmp, fetch_url)
     except (OSError, urllib.error.URLError, gzip.BadGzipFile) as exc:
         tmp.unlink(missing_ok=True)
         # A download failure at import time must not take the whole app
@@ -119,11 +134,24 @@ def _download(request: urllib.request.Request, tmp: Path, url: str) -> Path:
 
 
 def remote_etag() -> str | None:
-    """HEAD the snapshot to see whether a newer copy has been published."""
+    """HEAD the snapshot to see whether a newer copy has been published.
+
+    The request deliberately bypasses the CDN cache. A plain HEAD is served
+    from the same edge cache as the file itself, so for the length of the
+    edge TTL after a publish it returns the *old* ETag -- the poller
+    concludes nothing changed and then waits out its whole interval before
+    looking again. Asking the origin directly makes the check authoritative
+    and costs one small HEAD per poll.
+    """
     url = snapshot_url()
     if not url:
         return None
-    request = _request(url, method="HEAD")
+    separator = "&" if "?" in url else "?"
+    request = _request(
+        f"{url}{separator}_={int(time.time())}",
+        method="HEAD",
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+    )
     try:
         with urllib.request.urlopen(request, timeout=15) as resp:
             return resp.headers.get("ETag")

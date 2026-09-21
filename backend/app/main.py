@@ -80,10 +80,20 @@ def _maybe_refresh() -> None:
         return  # another request is already checking
     try:
         _last_refresh_check = now
-        if refresh_if_stale():
-            fresh = AnalyticsDB(_DB_PATH, read_only=True)
-            _db = fresh
-            _engine = QueryEngine(fresh)
+        if not refresh_if_stale():
+            return
+        # Open and sanity-check the new file *before* swapping it in. The
+        # download replaces the path in place, and a connection opened with
+        # immutable=1 keeps reading the file it was opened on, so a failed
+        # or partial refresh must never become the live database.
+        fresh = AnalyticsDB(_DB_PATH, read_only=True)
+        stats = fresh.stats()
+        if not stats.get("matches"):
+            print("[snapshot] refreshed file has no matches; keeping the old one")
+            return
+        _db = fresh
+        _engine = QueryEngine(fresh)
+        print(f"[snapshot] refreshed to {stats['matches']:,} matches")
     except Exception as exc:  # never fail a request over a refresh
         print(f"[snapshot] refresh failed: {exc}")
     finally:

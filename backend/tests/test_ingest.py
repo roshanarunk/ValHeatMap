@@ -522,3 +522,60 @@ def test_failed_download_does_not_crash_the_app(monkeypatch, tmp_path: Path):
 
     path = snap.ensure_local_db()
     assert path == snap.DEFAULT_PATH  # falls back rather than raising
+
+
+def test_etag_check_bypasses_the_cdn_cache(monkeypatch):
+    """The freshness check must ask the origin, not the edge.
+
+    A plain HEAD is served from the same CDN cache as the file, so for the
+    length of the edge TTL after a publish it returns the *old* ETag. The
+    poller then concludes nothing changed and sleeps out its whole
+    interval, which is why a fresh publish appeared not to reach the site.
+    """
+    import app.snapshot as snap
+
+    seen: dict[str, object] = {}
+
+    class FakeResponse:
+        headers = {"ETag": '"new"'}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(request, timeout=0):
+        seen["url"] = request.full_url
+        seen["cache_control"] = request.get_header("Cache-control")
+        return FakeResponse()
+
+    monkeypatch.setenv("VALHEATMAP_SNAPSHOT_URL", "https://cdn.example/a.db.gz")
+    monkeypatch.setattr(snap.urllib.request, "urlopen", fake_urlopen)
+
+    assert snap.remote_etag() == '"new"'
+    # Cache-busted query string and an explicit no-cache both matter: some
+    # CDNs honour one and not the other.
+    assert "?_=" in seen["url"] or "&_=" in seen["url"]
+    assert seen["cache_control"] == "no-cache"
+
+
+def test_forced_download_also_bypasses_the_cache(monkeypatch, tmp_path: Path):
+    """Otherwise the edge hands back the copy we just rejected."""
+    import app.snapshot as snap
+
+    seen: dict[str, object] = {}
+
+    def fake_download(request, tmp, url):
+        seen["url"] = request.full_url
+        seen["cache_control"] = request.get_header("Cache-control")
+        return tmp_path / "db"
+
+    monkeypatch.setenv("VALHEATMAP_SNAPSHOT_URL", "https://cdn.example/a.db.gz")
+    monkeypatch.setattr(snap, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(snap, "CACHED_DB", tmp_path / "cached.db")
+    monkeypatch.setattr(snap, "_download", fake_download)
+
+    snap.ensure_local_db(force=True)
+    assert "_=" in seen["url"]
+    assert seen["cache_control"] == "no-cache"
