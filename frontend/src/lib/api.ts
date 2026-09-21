@@ -1,6 +1,7 @@
 import type {
   AgentInfo,
   Facets,
+  MapInfo,
   InsightsResponseV2,
   KillsResponseV2,
   UtilityResponseV2,
@@ -85,6 +86,12 @@ export interface QueryFilters {
   zone?: string
   /** Which end of the duel the zone constrains. */
   zone_anchor?: 'victim' | 'killer'
+  /** A puuid, for personal stats. */
+  player?: string
+  /** Which end of the duel the player is: their kills, deaths or both. */
+  player_role?: 'killer' | 'victim' | 'either'
+  /** Restrict to a single match, for review. */
+  match_id?: string
   time_start?: number
   time_end?: number
   traded_only?: boolean
@@ -96,6 +103,91 @@ export interface QueryFilters {
   anchor?: 'victim' | 'killer'
   trade_window?: number
   trade_radius?: number
+}
+
+export interface PlayerSummary {
+  puuid: string
+  name: string
+  tag: string
+  riot_id: string
+  region: string | null
+  /** Unix seconds; null until the crawler has fetched their history. */
+  crawled_at: number | null
+  requested_at: number | null
+  kills: number
+  deaths: number
+  kd: number
+  matches: number
+  traded_deaths: number
+  trade_rate: number
+  first_bloods: number
+  first_deaths: number
+  tracked: boolean
+}
+
+export interface PlayerMatch {
+  match_id: string
+  map_name: string
+  mode: string
+  queue: string | null
+  started_at: number | null
+  rounds: number | null
+  agent: string
+  kills: number
+  deaths: number
+  kd: number
+  first_bloods: number
+}
+
+export interface MatchKill {
+  round: number
+  t_ms: number
+  side: string
+  killer_agent: string
+  victim_agent: string
+  killer: string
+  victim: string
+  weapon: string
+  ability: string
+  damage_type: string
+  vx: number
+  vy: number
+  kx: number | null
+  ky: number | null
+  traded: boolean
+  first_blood: boolean
+  post_plant: boolean
+  round_won: boolean
+}
+
+export interface MatchDetail {
+  match_id: string
+  map_name: string
+  /** Calibration and callouts, so the client can draw it without a second call. */
+  map: MapInfo | null
+  mode: string
+  queue: string | null
+  started_at: number | null
+  rounds: number | null
+  avg_tier: number | null
+  kills: MatchKill[]
+  plants: {
+    round: number
+    t_ms: number
+    site: string
+    x: number
+    y: number
+    won: boolean
+    defused: boolean
+  }[]
+  scoreboard: {
+    puuid: string
+    agent: string
+    kills: number
+    deaths: number
+    first_bloods: number
+    kd: number
+  }[]
 }
 
 export interface DatasetStats {
@@ -128,6 +220,21 @@ export const api = {
     get<InsightsResponseV2>('/api/insights', f as Record<string, unknown>),
   dataset: () => get<DatasetStats>('/api/dataset'),
   reloadDataset: () => post<{ loaded: number }>('/api/dataset/reload'),
+
+  // --- players ---
+  registerPlayer: (riotId: string) =>
+    post<{ player: PlayerSummary; new: boolean }>('/api/player/register', {
+      riot_id: riotId,
+    }),
+  // The Riot ID goes in the path, so the # must be encoded or it reads as
+  // a URL fragment and never reaches the server.
+  player: (riotId: string) => get<PlayerSummary>(`/api/player/${encodeURIComponent(riotId)}`),
+  playerMatches: (riotId: string, limit = 20) =>
+    get<{ player: PlayerSummary; matches: PlayerMatch[] }>(
+      `/api/player/${encodeURIComponent(riotId)}/matches`,
+      { limit },
+    ),
+  match: (matchId: string) => get<MatchDetail>(`/api/match/${encodeURIComponent(matchId)}`),
   crawl: (matches: number, region?: string, seed?: string) => {
     const params = new URLSearchParams({ matches: String(matches) })
     if (region) params.set('region', region)

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -114,7 +115,14 @@ CREATE TABLE IF NOT EXISTS kills (
     vy           INTEGER NOT NULL,
     kx           INTEGER,
     ky           INTEGER,
-    flags        INTEGER NOT NULL       -- bitfield, see FLAG_* below
+    flags        INTEGER NOT NULL,      -- bitfield, see FLAG_* below
+    -- Who actually played, interned through dim(kind='player') like every
+    -- other repeated string. A puuid is 36 bytes and appears twice per
+    -- kill; as ids that is 8 bytes instead of 72, which over ~5M rows is
+    -- the difference between ~700 MB and ~80 MB. Nullable because the
+    -- aggregate data collected before this existed has no attribution.
+    killer_pid   INTEGER,
+    victim_pid   INTEGER
 );
 -- One covering index for the hot path: every heatmap query filters on map
 -- first, then narrows. A single composite beats several overlapping ones,
@@ -130,6 +138,13 @@ CREATE INDEX IF NOT EXISTS idx_k_kpos ON kills(map_id, kx, ky);
 -- turning the utility view from three full scans (2.4s) into 54ms.
 CREATE INDEX IF NOT EXISTS idx_k_util ON kills(map_id, ability_id, avg_tier, act_id)
     WHERE dmg_type = 1;
+-- Personal stats: "my kills" and "my deaths" on a given map. Partial, so
+-- they cost nothing for the rows crawled before attribution existed --
+-- which is most of them, and all of them until the backfill runs.
+CREATE INDEX IF NOT EXISTS idx_k_killer ON kills(killer_pid, map_id)
+    WHERE killer_pid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_k_victim ON kills(victim_pid, map_id)
+    WHERE victim_pid IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS plants (
     m          INTEGER NOT NULL,
@@ -152,6 +167,26 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT
 );
 
+-- People who have asked to see their own stats. The crawler prioritises
+-- these players, and `requested_at` is what it sorts by, so someone who
+-- has just registered is served before the general discovery crawl.
+CREATE TABLE IF NOT EXISTS tracked_players (
+    puuid        TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    tag          TEXT NOT NULL,
+    region       TEXT,
+    pid          INTEGER,            -- dim(kind='player') id, for joins
+    requested_at INTEGER NOT NULL,   -- unix seconds, first registration
+    last_seen_at INTEGER,            -- last time anyone opened their page
+    crawled_at   INTEGER,            -- last successful history fetch
+    match_count  INTEGER DEFAULT 0
+);
+-- The crawler's work queue: who needs fetching, oldest crawl first.
+CREATE INDEX IF NOT EXISTS idx_tracked_pending
+    ON tracked_players(crawled_at, requested_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tracked_riot_id
+    ON tracked_players(name, tag);
+
 -- Facet counts, precomputed. Deriving them means grouping over every kill
 -- row: ~2.3s locally and over 7s on a serverless function's slower disk,
 -- on a request the UI makes before it can render anything. They only
@@ -164,6 +199,30 @@ CREATE TABLE IF NOT EXISTS facet_cache (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> list[str]:
+    """Bring an existing database up to the current schema.
+
+    `CREATE TABLE IF NOT EXISTS` does nothing to a table that already
+    exists, so a column added to SCHEMA never reaches a database built
+    before it. That is not theoretical: switching positions to integers
+    appeared to work and silently did not, until every database was
+    rebuilt from scratch. Cheap, additive changes belong here instead.
+
+    Returns the statements applied, so callers can report them.
+    """
+    applied: list[str] = []
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(kills)")}
+    if not columns:
+        return applied  # fresh database; SCHEMA builds it correctly
+    for column in ("killer_pid", "victim_pid"):
+        if column not in columns:
+            # NULL for every existing row: attribution for those comes
+            # from the backfill, which re-reads the raw payloads.
+            conn.execute(f"ALTER TABLE kills ADD COLUMN {column} INTEGER")
+            applied.append(f"kills.{column}")
+    return applied
+
+
 class AnalyticsDB:
     def __init__(self, path: Path | None = None, read_only: bool = False) -> None:
         self.path = Path(path) if path else DEFAULT_PATH
@@ -174,6 +233,10 @@ class AnalyticsDB:
         self._dim_cache: dict[str, dict[str, int]] = {}
         if not read_only:
             with self.connect() as conn:
+                # Migrate first: SCHEMA creates indexes over the new
+                # columns, which fails outright on a database that predates
+                # them. On a fresh database this is a no-op.
+                _migrate(conn)
                 conn.executescript(SCHEMA)
 
     def _conn(self) -> sqlite3.Connection:
@@ -203,6 +266,11 @@ class AnalyticsDB:
         except Exception:
             if not self.read_only:
                 conn.rollback()
+                # The rollback may have discarded dim rows this transaction
+                # inserted, while the cache still holds their ids. Keeping
+                # it would hand out ids for rows that no longer exist, so
+                # drop it and let the next call re-read committed state.
+                self._dim_cache.clear()
             raise
 
     # --- dimension interning -------------------------------------------
@@ -214,6 +282,10 @@ class AnalyticsDB:
         hit = cache.get(name)
         if hit is not None:
             return hit
+        # Not cached: look it up, and insert only if it is genuinely absent.
+        # The lookup below is also what repairs a cache entry left behind by
+        # a rolled-back transaction, since `invalidate_dim_cache` drops the
+        # stale entry and sends the next call back through here.
         row = conn.execute(
             "SELECT id FROM dim WHERE kind=? AND name=?", (kind, name)
         ).fetchone()
@@ -221,8 +293,19 @@ class AnalyticsDB:
             nxt = conn.execute(
                 "SELECT COALESCE(MAX(id), 0) + 1 n FROM dim WHERE kind=?", (kind,)
             ).fetchone()["n"]
-            conn.execute("INSERT INTO dim (kind, id, name) VALUES (?,?,?)", (kind, nxt, name))
-            value = nxt
+            # DO NOTHING rather than a plain INSERT: the process cache can
+            # outlive the transaction that wrote a row, so after a rollback
+            # this asks for a name the cache thinks exists. Re-reading the
+            # committed id is correct; failing on the conflict is not.
+            conn.execute(
+                "INSERT INTO dim (kind, id, name) VALUES (?,?,?) "
+                "ON CONFLICT(kind, name) DO NOTHING",
+                (kind, nxt, name),
+            )
+            row = conn.execute(
+                "SELECT id FROM dim WHERE kind=? AND name=?", (kind, name)
+            ).fetchone()
+            value = row["id"] if row else nxt
         else:
             value = row["id"]
         cache[name] = value
@@ -245,6 +328,14 @@ class AnalyticsDB:
                 ).fetchone()
                 is not None
             )
+
+    def match_row_id(self, match_id: str) -> int | None:
+        """The compact `matches.id` for a Riot match id, or None."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM matches WHERE match_id = ?", (match_id,)
+            ).fetchone()
+        return row["id"] if row else None
 
     def add_match(
         self, match: Match, map_info, enriched: Sequence[EnrichedKill] | None = None
@@ -319,6 +410,8 @@ class AnalyticsDB:
                         None if kx is None else to_pos(kx),
                         None if ky is None else to_pos(ky),
                         flags,
+                        self._dim_id(conn, "player", k.killer_puuid or None),
+                        self._dim_id(conn, "player", k.victim_puuid or None),
                     )
                 )
 
@@ -335,14 +428,98 @@ class AnalyticsDB:
                 )
 
             if kill_rows:
+                # Columns named rather than positional: a bare VALUES list
+                # breaks silently the next time the table gains a column.
                 conn.executemany(
-                    "INSERT INTO kills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", kill_rows
+                    """INSERT INTO kills (
+                           m, map_id, act_id, avg_tier, round_num, t_ms, side,
+                           ka_id, va_id, weapon_id, ability_id, dmg_type,
+                           vx, vy, kx, ky, flags, killer_pid, victim_pid
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    kill_rows,
                 )
             if plant_rows:
                 conn.executemany(
                     "INSERT INTO plants VALUES (?,?,?,?,?,?,?,?,?,?,?)", plant_rows
                 )
         return len(kill_rows)
+
+    # --- tracked players -----------------------------------------------
+    def track_player(
+        self, puuid: str, name: str, tag: str, region: str | None = None
+    ) -> dict[str, Any]:
+        """Register someone for personal stats, or touch them if known.
+
+        `requested_at` is set once and never moved, so the crawler's
+        ordering reflects who has been waiting longest rather than who
+        refreshed the page most recently.
+        """
+        now = int(time.time())
+        with self.connect() as conn:
+            pid = self._dim_id(conn, "player", puuid)
+            conn.execute(
+                """INSERT INTO tracked_players
+                       (puuid, name, tag, region, pid, requested_at, last_seen_at)
+                   VALUES (?,?,?,?,?,?,?)
+                   ON CONFLICT(puuid) DO UPDATE SET
+                       name=excluded.name, tag=excluded.tag,
+                       region=COALESCE(excluded.region, tracked_players.region),
+                       pid=excluded.pid,
+                       last_seen_at=excluded.last_seen_at""",
+                (puuid, name, tag, region, pid, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM tracked_players WHERE puuid = ?", (puuid,)
+            ).fetchone()
+        return dict(row)
+
+    def tracked_player(self, name: str, tag: str) -> dict[str, Any] | None:
+        """Look someone up by Riot ID. Case-insensitive, as Riot IDs are."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tracked_players "
+                "WHERE LOWER(name) = LOWER(?) AND LOWER(tag) = LOWER(?)",
+                (name, tag),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def tracked_by_puuid(self, puuid: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tracked_players WHERE puuid = ?", (puuid,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def players_needing_crawl(self, limit: int = 5, max_age_s: int = 900) -> list[dict[str, Any]]:
+        """Tracked players due a history fetch, longest-waiting first.
+
+        Never-crawled players sort first because someone who has just
+        registered is watching an empty page.
+        """
+        cutoff = int(time.time()) - max_age_s
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT * FROM tracked_players
+                   WHERE crawled_at IS NULL OR crawled_at < ?
+                   ORDER BY crawled_at IS NOT NULL, crawled_at, requested_at
+                   LIMIT ?""",
+                (cutoff, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_player_crawled(self, puuid: str, match_count: int | None = None) -> None:
+        with self.connect() as conn:
+            if match_count is None:
+                conn.execute(
+                    "UPDATE tracked_players SET crawled_at = ? WHERE puuid = ?",
+                    (int(time.time()), puuid),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tracked_players SET crawled_at = ?, match_count = ? "
+                    "WHERE puuid = ?",
+                    (int(time.time()), match_count, puuid),
+                )
 
     def set_meta(self, key: str, value: str) -> None:
         with self.connect() as conn:

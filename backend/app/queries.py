@@ -17,6 +17,7 @@ from .analytics_db import (
     from_pos,
     FLAG_FIRST_BLOOD,
     FLAG_POST_PLANT,
+    FLAG_ROUND_WON,
     FLAG_TRADED,
     SIDE_NAME,
     AnalyticsDB,
@@ -75,6 +76,12 @@ class Filters:
     # "victim" answers "who killed the people who died here?".
     zone: tuple[float, float, float, float] | None = None
     zone_anchor: str = "victim"
+    # Personal stats. `player` is a puuid; `player_role` picks which end of
+    # the duel it constrains -- "killer" for my kills, "victim" for my
+    # deaths, "either" for everything I was involved in.
+    player: str = ""
+    player_role: str = "killer"
+    match_id: str = ""                  # single-match review
     ranks: list[str] = field(default_factory=list)      # band names
     tier_min: int | None = None
     tier_max: int | None = None
@@ -134,6 +141,14 @@ class Filters:
             zone_anchor=(
                 "killer" if str(params.get("zone_anchor", "")).lower() == "killer" else "victim"
             ),
+            player=str(params.get("player") or ""),
+            player_role=(
+                str(params.get("player_role", "")).lower()
+                if str(params.get("player_role", "")).lower()
+                in {"killer", "victim", "either"}
+                else "killer"
+            ),
+            match_id=str(params.get("match_id") or ""),
             ranks=lst("ranks"),
             tier_min=num("tier_min"),
             tier_max=num("tier_max"),
@@ -219,6 +234,40 @@ class QueryEngine:
         if hi is not None:
             clauses.append(f"{table}.avg_tier <= ?")
             args.append(hi)
+
+        if f.match_id:
+            row = self.db.match_row_id(f.match_id)
+            if row is None:
+                return "1=0", []
+            clauses.append(f"{table}.m = ?")
+            args.append(row)
+
+        if f.player and table == "kills":
+            pid = self._ids("player").get(f.player)
+            if pid is None:
+                # Never crawled, or crawled before attribution existed.
+                # Empty is the honest answer; a full scan is not.
+                return "1=0", []
+            if f.player_role == "victim":
+                clauses.append("victim_pid = ?")
+                args.append(pid)
+            elif f.player_role == "either":
+                # Not `killer_pid = ? OR victim_pid = ?`: an OR across two
+                # columns cannot use either partial index, so SQLite falls
+                # back to scanning a positional one -- 2,026ms against
+                # 0.1ms here. A UNION of rowids searches both indexes and
+                # deduplicates, which matters because a self-kill would
+                # otherwise appear twice.
+                clauses.append(
+                    f"{table}.rowid IN ("
+                    " SELECT rowid FROM kills WHERE killer_pid = ?"
+                    " UNION"
+                    " SELECT rowid FROM kills WHERE victim_pid = ?)"
+                )
+                args.extend([pid, pid])
+            else:
+                clauses.append("killer_pid = ?")
+                args.append(pid)
 
         if table == "kills":
             if f.agents:
@@ -445,3 +494,204 @@ class QueryEngine:
             ).fetchall()
         weapons = self._names("weapon")
         return [{"weapon": weapons.get(r["weapon_id"], "?"), "kills": r["kills"]} for r in rows]
+
+    # --- personal stats -------------------------------------------------
+    def player_summary(self, puuid: str) -> dict[str, Any]:
+        """Career totals for one player across everything we have.
+
+        Kills and deaths come from the same rows read from both ends, so
+        a single pass answers both rather than two filtered queries.
+        """
+        pid = self._ids("player").get(puuid)
+        if pid is None:
+            return {
+                "kills": 0, "deaths": 0, "kd": 0.0, "matches": 0,
+                "traded_deaths": 0, "trade_rate": 0.0,
+                "first_bloods": 0, "first_deaths": 0, "tracked": False,
+            }
+        with self.db.connect() as conn:
+            row = conn.execute(
+                f"""SELECT
+                        SUM(killer_pid = ?) kills,
+                        SUM(victim_pid = ?) deaths,
+                        SUM(victim_pid = ? AND (flags & {FLAG_TRADED}) != 0) traded_deaths,
+                        SUM(killer_pid = ? AND (flags & {FLAG_FIRST_BLOOD}) != 0) first_bloods,
+                        SUM(victim_pid = ? AND (flags & {FLAG_FIRST_BLOOD}) != 0) first_deaths,
+                        COUNT(DISTINCT m) matches
+                    FROM kills
+                    WHERE killer_pid = ? OR victim_pid = ?""",
+                [pid] * 7,
+            ).fetchone()
+        kills = row["kills"] or 0
+        deaths = row["deaths"] or 0
+        traded = row["traded_deaths"] or 0
+        return {
+            "kills": kills,
+            "deaths": deaths,
+            # Deaths can be zero in a small sample; report kills rather
+            # than dividing by it.
+            "kd": round(kills / deaths, 2) if deaths else float(kills),
+            "matches": row["matches"] or 0,
+            "traded_deaths": traded,
+            # How often a team-mate answered your death: the one number
+            # here that says something about the team, not the player.
+            "trade_rate": round(traded / deaths, 4) if deaths else 0.0,
+            "first_bloods": row["first_bloods"] or 0,
+            "first_deaths": row["first_deaths"] or 0,
+            "tracked": True,
+        }
+
+    def player_matches(self, puuid: str, limit: int = 20) -> list[dict[str, Any]]:
+        """A player's matches, newest first, with their line in each."""
+        pid = self._ids("player").get(puuid)
+        if pid is None:
+            return []
+        maps = self._names("map")
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                f"""SELECT m.match_id, m.map_id, m.mode, m.queue, m.started_at,
+                           m.rounds, m.avg_tier,
+                           SUM(k.killer_pid = ?) kills,
+                           SUM(k.victim_pid = ?) deaths,
+                           SUM(k.killer_pid = ? AND (k.flags & {FLAG_FIRST_BLOOD}) != 0)
+                               first_bloods,
+                           MAX(CASE WHEN k.killer_pid = ? THEN k.ka_id
+                                    WHEN k.victim_pid = ? THEN k.va_id END) agent_id
+                    FROM kills k
+                    JOIN matches m ON m.id = k.m
+                    WHERE k.killer_pid = ? OR k.victim_pid = ?
+                    GROUP BY k.m
+                    ORDER BY m.started_at DESC
+                    LIMIT ?""",
+                [pid] * 7 + [limit],
+            ).fetchall()
+        agents = self._names("agent")
+        out = []
+        for r in rows:
+            kills = r["kills"] or 0
+            deaths = r["deaths"] or 0
+            out.append(
+                {
+                    "match_id": r["match_id"],
+                    "map_name": maps.get(r["map_id"], "?"),
+                    "mode": r["mode"],
+                    "queue": r["queue"],
+                    "started_at": r["started_at"],
+                    "rounds": r["rounds"],
+                    "agent": agents.get(r["agent_id"], ""),
+                    "kills": kills,
+                    "deaths": deaths,
+                    "kd": round(kills / deaths, 2) if deaths else float(kills),
+                    "first_bloods": r["first_bloods"] or 0,
+                }
+            )
+        return out
+
+    def match_detail(self, match_id: str) -> dict[str, Any] | None:
+        """Everything needed to review one match.
+
+        Returns every kill with both endpoints, so the client can draw
+        duel lines and filter by round or player without another request:
+        a match is a few hundred kills, small enough to send whole.
+        """
+        row_id = self.db.match_row_id(match_id)
+        if row_id is None:
+            return None
+
+        maps = self._names("map")
+        agents = self._names("agent")
+        weapons = self._names("weapon")
+        abilities = self._names("ability")
+        players = self._names("player")
+
+        with self.db.connect() as conn:
+            meta = conn.execute("SELECT * FROM matches WHERE id = ?", (row_id,)).fetchone()
+            kill_rows = conn.execute(
+                """SELECT round_num, t_ms, side, ka_id, va_id, weapon_id,
+                          ability_id, dmg_type, vx, vy, kx, ky, flags,
+                          killer_pid, victim_pid
+                   FROM kills WHERE m = ? ORDER BY round_num, t_ms""",
+                (row_id,),
+            ).fetchall()
+            plant_rows = conn.execute(
+                """SELECT round_num, t_ms, site, x, y, won, defused
+                   FROM plants WHERE m = ? ORDER BY round_num""",
+                (row_id,),
+            ).fetchall()
+
+        kills = [
+            {
+                "round": r["round_num"],
+                "t_ms": r["t_ms"],
+                "side": SIDE_NAME.get(r["side"], "none"),
+                "killer_agent": agents.get(r["ka_id"], ""),
+                "victim_agent": agents.get(r["va_id"], ""),
+                "killer": players.get(r["killer_pid"], ""),
+                "victim": players.get(r["victim_pid"], ""),
+                "weapon": weapons.get(r["weapon_id"], ""),
+                "ability": abilities.get(r["ability_id"], ""),
+                "damage_type": DMG_NAME.get(r["dmg_type"], "other"),
+                "vx": from_pos(r["vx"]),
+                "vy": from_pos(r["vy"]),
+                "kx": from_pos(r["kx"]),
+                "ky": from_pos(r["ky"]),
+                "traded": bool(r["flags"] & FLAG_TRADED),
+                "first_blood": bool(r["flags"] & FLAG_FIRST_BLOOD),
+                "post_plant": bool(r["flags"] & FLAG_POST_PLANT),
+                "round_won": bool(r["flags"] & FLAG_ROUND_WON),
+            }
+            for r in kill_rows
+        ]
+
+        # Per-player scoreboard, derived from the kills rather than stored
+        # separately: the same rows already say who killed whom.
+        board: dict[str, dict[str, Any]] = {}
+
+        def entry(puuid: str, agent: str) -> dict[str, Any]:
+            row = board.setdefault(
+                puuid,
+                {"puuid": puuid, "agent": agent, "kills": 0, "deaths": 0, "first_bloods": 0},
+            )
+            row["agent"] = row["agent"] or agent
+            return row
+
+        for k in kills:
+            if k["killer"]:
+                e = entry(k["killer"], k["killer_agent"])
+                e["kills"] += 1
+                if k["first_blood"]:
+                    e["first_bloods"] += 1
+            if k["victim"]:
+                entry(k["victim"], k["victim_agent"])["deaths"] += 1
+
+        scoreboard = sorted(board.values(), key=lambda p: (-p["kills"], p["deaths"]))
+        for row in scoreboard:
+            row["kd"] = (
+                round(row["kills"] / row["deaths"], 2)
+                if row["deaths"]
+                else float(row["kills"])
+            )
+
+        return {
+            "match_id": match_id,
+            "map_name": maps.get(meta["map_id"], "?"),
+            "mode": meta["mode"],
+            "queue": meta["queue"],
+            "started_at": meta["started_at"],
+            "rounds": meta["rounds"],
+            "avg_tier": meta["avg_tier"],
+            "kills": kills,
+            "plants": [
+                {
+                    "round": r["round_num"],
+                    "t_ms": r["t_ms"],
+                    "site": r["site"],
+                    "x": from_pos(r["x"]),
+                    "y": from_pos(r["y"]),
+                    "won": bool(r["won"]),
+                    "defused": bool(r["defused"]),
+                }
+                for r in plant_rows
+            ],
+            "scoreboard": scoreboard,
+        }

@@ -457,3 +457,189 @@ def test_crawler_refreshes_facets_before_the_reader_sees_them_as_stale():
         f"crawler rebuilds every {FACET_REFRESH_MATCHES} matches but the reader "
         f"calls the cache stale after {tolerance}; the crawler must go first"
     )
+
+
+# --- player attribution -------------------------------------------------
+def test_kills_record_who_played(db: AnalyticsDB):
+    """Personal stats need identity, which agent ids alone cannot give.
+
+    Two Jett players in one match are indistinguishable by agent, so the
+    puuid is stored (interned) alongside it.
+    """
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT killer_pid, victim_pid FROM kills WHERE killer_pid IS NOT NULL LIMIT 1"
+        ).fetchone()
+    assert row is not None, "kills should carry player attribution"
+    assert row["killer_pid"] != row["victim_pid"]
+
+    players = db.dim_ids("player")
+    assert {"atk", "def"} <= set(players)
+
+
+def test_player_ids_are_interned_not_repeated(db: AnalyticsDB):
+    """A puuid is 36 bytes and appears twice per kill; ids are 4."""
+    with db.connect() as conn:
+        rows = conn.execute("SELECT COUNT(*) n FROM dim WHERE kind='player'").fetchone()["n"]
+    # Six matches, two players each, all the same two people.
+    assert rows == 2
+
+
+def test_migration_adds_columns_to_an_existing_database(tmp_path: Path):
+    """A database built before attribution existed must gain it in place.
+
+    `CREATE TABLE IF NOT EXISTS` does nothing to an existing table, so
+    without an explicit migration the new columns never appear -- the same
+    trap that made the switch to integer positions silently do nothing.
+    """
+    import sqlite3
+
+    from app.analytics_db import _migrate
+
+    path = tmp_path / "old.db"
+    # A database shaped like the pre-attribution schema.
+    old = sqlite3.connect(path)
+    old.executescript(
+        """
+        CREATE TABLE kills (
+            m INTEGER NOT NULL, map_id INTEGER NOT NULL, act_id INTEGER,
+            avg_tier INTEGER, round_num INTEGER NOT NULL, t_ms INTEGER NOT NULL,
+            side INTEGER NOT NULL, ka_id INTEGER, va_id INTEGER,
+            weapon_id INTEGER, ability_id INTEGER, dmg_type INTEGER NOT NULL,
+            vx INTEGER NOT NULL, vy INTEGER NOT NULL, kx INTEGER, ky INTEGER,
+            flags INTEGER NOT NULL
+        );
+        INSERT INTO kills VALUES (1,1,1,25,0,1000,1,1,2,1,NULL,0,100,200,300,400,0);
+        """
+    )
+    old.commit()
+    old.close()
+
+    applied = _migrate(sqlite3.connect(path))
+    assert "kills.killer_pid" in applied and "kills.victim_pid" in applied
+
+    # Opening it through AnalyticsDB must now succeed: SCHEMA builds
+    # indexes over those columns and would fail if they were missing.
+    opened = AnalyticsDB(path)
+    with opened.connect() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(kills)")}
+        assert {"killer_pid", "victim_pid"} <= cols
+        # The existing row survives, with no attribution until backfill.
+        row = conn.execute("SELECT COUNT(*) n FROM kills").fetchone()
+        assert row["n"] == 1
+
+
+def test_migration_is_idempotent(db: AnalyticsDB):
+    """Every open runs it, so running it twice must be harmless."""
+    from app.analytics_db import _migrate
+
+    with db.connect() as conn:
+        assert _migrate(conn) == []
+
+
+def test_dim_id_survives_a_rolled_back_transaction(tmp_path: Path):
+    """The name cache outlives the transaction that wrote the row.
+
+    _dim_id caches name -> id in the process. If the transaction that
+    inserted the row is rolled back, the cache still claims it exists,
+    and the next insert of that name collided on the unique index. With
+    hundreds of thousands of player puuids this stopped being theoretical.
+    """
+    database = AnalyticsDB(tmp_path / "d.db")
+
+    # A batch that interns a name and then fails, as a bad payload would.
+    with pytest.raises(RuntimeError):
+        with database.connect() as conn:
+            database._dim_id(conn, "player", "ghost-puuid")
+            raise RuntimeError("payload blew up mid-batch")
+
+    # The next batch interns the same name. Before the fix this raised
+    # IntegrityError: the cache still held an id for the rolled-back row.
+    with database.connect() as conn:
+        again = database._dim_id(conn, "player", "ghost-puuid")
+        assert again is not None
+
+    # And the name resolves to exactly one committed row.
+    with database.connect() as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) n FROM dim WHERE kind='player' AND name='ghost-puuid'"
+        ).fetchone()["n"]
+    assert rows == 1
+
+
+# --- personal stats -----------------------------------------------------
+def test_player_summary_counts_both_ends_of_the_duel(db: AnalyticsDB):
+    engine = QueryEngine(db)
+    summary = engine.player_summary("atk")
+    # The fixture alternates: atk kills on even indices, dies on odd.
+    assert summary["kills"] > 0
+    assert summary["deaths"] > 0
+    assert summary["tracked"] is True
+    assert summary["matches"] == 6
+
+
+def test_player_summary_of_an_unknown_player_is_empty_not_everything(db: AnalyticsDB):
+    summary = QueryEngine(db).player_summary("never-seen")
+    assert summary["tracked"] is False
+    assert summary["kills"] == 0 and summary["deaths"] == 0
+
+
+def test_kd_reports_kills_when_deaths_are_zero(db: AnalyticsDB):
+    """Dividing by zero deaths would crash; a flawless player is not a bug."""
+    engine = QueryEngine(db)
+    with db.connect() as conn:
+        conn.execute("UPDATE kills SET victim_pid = NULL WHERE victim_pid IS NOT NULL")
+    engine.invalidate()
+    summary = engine.player_summary("atk")
+    assert summary["deaths"] == 0
+    assert summary["kd"] == float(summary["kills"])
+
+
+def test_player_role_either_matches_kills_and_deaths(engine: QueryEngine):
+    """'either' must be the union of the two, with no double counting.
+
+    A plain `killer_pid = ? OR victim_pid = ?` cannot use either partial
+    index -- SQLite falls back to a scan, measured at 2,026ms versus
+    0.1ms -- so this is expressed as a UNION of rowids. UNION rather than
+    UNION ALL, or a kill where someone is both ends would count twice.
+    """
+    as_killer = engine.summary(Filters(map_name="Ascent", player="atk", player_role="killer"))
+    as_victim = engine.summary(Filters(map_name="Ascent", player="atk", player_role="victim"))
+    either = engine.summary(Filters(map_name="Ascent", player="atk", player_role="either"))
+    assert as_killer["total"] > 0 and as_victim["total"] > 0
+    assert either["total"] == as_killer["total"] + as_victim["total"]
+
+
+def test_unknown_player_matches_nothing(engine: QueryEngine):
+    assert engine.summary(Filters(map_name="Ascent", player="nobody"))["total"] == 0
+
+
+def test_player_matches_lists_newest_first(db: AnalyticsDB):
+    rows = QueryEngine(db).player_matches("atk", limit=10)
+    assert len(rows) == 6
+    starts = [r["started_at"] for r in rows]
+    assert starts == sorted(starts, reverse=True)
+    assert rows[0]["agent"] == "Jett"      # atk's agent in the fixture
+    assert rows[0]["kills"] > 0
+
+
+def test_match_detail_scoreboard_reconciles_with_its_kills(db: AnalyticsDB):
+    detail = QueryEngine(db).match_detail("m0")
+    assert detail is not None
+    assert len(detail["kills"]) == 4
+    # Every kill has exactly one killer and one victim, so the scoreboard
+    # totals must add up to the number of kill rows.
+    assert sum(p["kills"] for p in detail["scoreboard"]) == len(detail["kills"])
+    assert sum(p["deaths"] for p in detail["scoreboard"]) == len(detail["kills"])
+    assert {p["puuid"] for p in detail["scoreboard"]} == {"atk", "def"}
+
+
+def test_match_detail_is_none_for_an_unknown_match(db: AnalyticsDB):
+    assert QueryEngine(db).match_detail("no-such-match") is None
+
+
+def test_match_filter_restricts_to_one_match(engine: QueryEngine):
+    one = engine.summary(Filters(map_name="Ascent", match_id="m0"))
+    every = engine.summary(Filters(map_name="Ascent"))
+    assert one["total"] == 4
+    assert every["total"] > one["total"]

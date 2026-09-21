@@ -9,6 +9,7 @@ import {
   MultiSelect,
   Select,
 } from './components/MapControls'
+import { PlayerView } from './components/PlayerView'
 import { TimeSlider } from './components/TimeSlider'
 import { Empty, Panel, Slider, StatTile, Toggle } from './components/Controls'
 import { HeatLegend } from './components/HeatLegend'
@@ -23,7 +24,7 @@ import type {
   UtilityResponseV2,
 } from './lib/types'
 
-type View = 'kills' | 'utility' | 'plants' | 'insights'
+type View = 'kills' | 'utility' | 'plants' | 'insights' | 'player'
 
 const ROUND_MAX_MS = 120_000
 const VIEWS: { id: View; label: string }[] = [
@@ -31,6 +32,7 @@ const VIEWS: { id: View; label: string }[] = [
   { id: 'utility', label: 'Utility' },
   { id: 'plants', label: 'Plants' },
   { id: 'insights', label: 'Breakdown' },
+  { id: 'player', label: 'My stats' },
 ]
 
 // Valorant's own shop categories, so "Rifles" selects what a player means
@@ -127,7 +129,9 @@ export default function App() {
   )
 
   useEffect(() => {
-    if (!mapName) return
+    // The player tab fetches its own data and has no map selected, so it
+    // must not fall through to the insights request below.
+    if (!mapName || view === 'player') return
     let cancelled = false
     setLoading(true)
     setError(null)
@@ -212,6 +216,7 @@ export default function App() {
 
   const isPlants = view === 'plants'
   const isInsights = view === 'insights'
+  const isPlayer = view === 'player'
 
   return (
     <div className="app">
@@ -245,6 +250,12 @@ export default function App() {
         )}
       </header>
 
+      {/* The player tab is its own thing: no map picker and none of the
+          global filters apply to it, so it replaces the stage entirely. */}
+      {isPlayer ? (
+        <PlayerView />
+      ) : (
+      <>
       <div className="mapselect">
         {facets?.maps.map((m) => (
           <button
@@ -648,6 +659,8 @@ export default function App() {
           )}
         </aside>
       </main>
+      </>
+      )}
     </div>
   )
 }

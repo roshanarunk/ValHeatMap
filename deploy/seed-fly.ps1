@@ -286,6 +286,69 @@ if state != "ok" or counts["matches"] == 0:
     sys.exit(f"uploaded database is unusable (integrity={state}, {counts})")
 print(f"unpacked ok: {counts['matches']:,} matches, {counts['kills']:,} kills")
 
+# Carry over anything the remote crawler collected while the upload was
+# being prepared. Without this, every seed silently discards the matches
+# gathered since the local database was last built -- which after a few
+# days of crawling is thousands of them.
+if target.exists():
+    merged = 0
+    try:
+        conn = sqlite3.connect(staged)
+        conn.execute("ATTACH ? AS live", (str(target),))
+        missing = [
+            r[0]
+            for r in conn.execute(
+                "SELECT match_id FROM live.matches"
+                " WHERE match_id NOT IN (SELECT match_id FROM main.matches)"
+            )
+        ]
+        if missing:
+            print(f"carrying over {len(missing):,} matches the crawler added")
+            # Row ids differ between the two databases, so matches are
+            # re-keyed and their kills and plants repointed.
+            for match_id in missing:
+                row = conn.execute(
+                    "SELECT * FROM live.matches WHERE match_id = ?", (match_id,)
+                ).fetchone()
+                old_id = row[0]
+                cur = conn.execute(
+                    "INSERT INTO main.matches"
+                    " (match_id, map_id, mode, queue, act_id, patch_id, region,"
+                    "  started_at, avg_tier, rounds)"
+                    " SELECT match_id, map_id, mode, queue, act_id, patch_id, region,"
+                    "        started_at, avg_tier, rounds"
+                    " FROM live.matches WHERE id = ?",
+                    (old_id,),
+                )
+                new_id = cur.lastrowid
+                conn.execute(
+                    "INSERT INTO main.kills"
+                    " (m, map_id, act_id, avg_tier, round_num, t_ms, side, ka_id,"
+                    "  va_id, weapon_id, ability_id, dmg_type, vx, vy, kx, ky, flags)"
+                    " SELECT ?, map_id, act_id, avg_tier, round_num, t_ms, side, ka_id,"
+                    "        va_id, weapon_id, ability_id, dmg_type, vx, vy, kx, ky, flags"
+                    " FROM live.kills WHERE m = ?",
+                    (new_id, old_id),
+                )
+                conn.execute(
+                    "INSERT INTO main.plants"
+                    " (m, map_id, act_id, avg_tier, round_num, t_ms, site, x, y, won, defused)"
+                    " SELECT ?, map_id, act_id, avg_tier, round_num, t_ms, site, x, y,"
+                    "        won, defused"
+                    " FROM live.plants WHERE m = ?",
+                    (new_id, old_id),
+                )
+                merged += 1
+            conn.commit()
+        conn.execute("DETACH live")
+        conn.close()
+    except sqlite3.Error as exc:
+        # Merging is a bonus; a failure here must not cost the seed. The
+        # carried-over matches will be re-crawled instead.
+        print(f"could not carry matches over ({exc}); continuing with the upload")
+    if merged:
+        print(f"carried over {merged:,} matches")
+
 # A stale WAL belongs to the old file and would corrupt the new one.
 for suffix in ("-wal", "-shm"):
     Path(str(target) + suffix).unlink(missing_ok=True)
@@ -311,6 +374,18 @@ print(f"indexes rebuilt in {ensure_indexes(target):.0f}s")
 # 40s+ at this size. build_slim does it for published snapshots; a seeded
 # database has to do it here.
 from app.analytics_db import AnalyticsDB  # noqa: E402
+
+# Matches carried over above came from rows that predate attribution, so
+# they arrive with no killer/victim. The raw payloads for them are on this
+# volume (the crawler that fetched them wrote them here), so fill them in.
+try:
+    from app.backfill_players import run as backfill
+
+    result = backfill(AnalyticsDB(target), verbose=False)
+    if result["kills"]:
+        print(f"attributed {result['kills']:,} carried-over kills")
+except Exception as exc:
+    print(f"attribution backfill skipped: {exc}")
 
 print("building the facet cache...")
 AnalyticsDB(target).rebuild_facet_cache()

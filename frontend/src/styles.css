@@ -705,3 +705,123 @@ input:focus, select:focus { outline: none; border-color: rgba(255, 70, 85, 0.55)
   margin-left: auto; font-style: normal; font-size: 10.5px;
   color: var(--text-faint); font-variant-numeric: tabular-nums;
 }
+
+/* --- player tab -------------------------------------------------------
+   Its own layout: no map picker, no global filters. A lookup form, the
+   player's headline numbers, their matches, and a review pane that
+   appears once a match is picked. */
+.playerview {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 18px 22px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.playerform { display: flex; gap: 10px; }
+
+.playerform__input {
+  flex: 1 1 auto;
+  max-width: 340px;
+  padding: 11px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-input);
+  color: var(--text);
+  font: 500 15px/1.2 var(--font);
+}
+.playerform__input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(255, 70, 85, 0.16);
+}
+.playerform__input::placeholder { color: var(--text-faint); }
+
+.playerform__go {
+  padding: 11px 20px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font: 600 14px/1 var(--font);
+  cursor: pointer;
+}
+.playerform__go:disabled { opacity: 0.5; cursor: not-allowed; }
+.playerform__go:not(:disabled):hover { background: var(--accent-soft); }
+
+.playerview__error {
+  margin: 0;
+  padding: 11px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 70, 85, 0.4);
+  background: rgba(255, 70, 85, 0.1);
+  color: var(--accent-soft);
+  font-size: 14px;
+}
+
+.playerhead { display: flex; align-items: baseline; gap: 14px; }
+.playerhead__name { margin: 0; font-size: 26px; letter-spacing: -0.01em; }
+.playerhead__meta { margin: 3px 0 0; color: var(--text-dim); font-size: 13px; }
+
+.matchlist { display: flex; flex-direction: column; gap: 4px; }
+.matchlist__title { margin: 6px 0 0; font-size: 16px; }
+.matchlist__hint { margin: 0 0 8px; color: var(--text-faint); font-size: 13px; }
+.matchlist__rows { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+
+.matchrow {
+  width: 100%;
+  display: grid;
+  /* map | agent | k/d | ratio | when */
+  grid-template-columns: 1.4fr 1fr 70px 56px 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-soft);
+  background: var(--bg-panel);
+  color: var(--text);
+  font: 500 14px/1.2 var(--font);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.matchrow:hover { border-color: var(--line); background: var(--bg-raise); }
+.matchrow--active { border-color: var(--accent); background: rgba(255, 70, 85, 0.08); }
+
+.matchrow__map { font-weight: 600; }
+.matchrow__agent { color: var(--text-dim); }
+.matchrow__kd { font-family: var(--mono); font-size: 13px; }
+.matchrow__ratio { font-family: var(--mono); font-weight: 600; }
+.matchrow__ratio.is-good { color: var(--good); }
+.matchrow__ratio.is-bad { color: var(--text-dim); }
+.matchrow__when { color: var(--text-faint); font-size: 12px; text-align: right; }
+
+.review { display: flex; flex-direction: column; gap: 12px; }
+.review__body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 16px;
+  align-items: start;
+}
+.review__map { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.review__count { margin: 10px 0 0; color: var(--text-faint); font-size: 12px; }
+
+.scoreboard { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+.scorerow {
+  display: grid;
+  grid-template-columns: 1fr 58px 44px;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.scorerow--me { background: rgba(255, 70, 85, 0.12); font-weight: 600; }
+.scorerow__kd { font-family: var(--mono); color: var(--text-dim); }
+.scorerow__ratio { font-family: var(--mono); text-align: right; }
+
+@media (max-width: 900px) {
+  .review__body { grid-template-columns: minmax(0, 1fr); }
+  .matchrow { grid-template-columns: 1.2fr 1fr 66px 50px; }
+  .matchrow__when { display: none; }
+}

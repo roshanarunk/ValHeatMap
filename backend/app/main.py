@@ -283,6 +283,133 @@ async def insights_endpoint(request: Request) -> dict[str, Any]:
     }
 
 
+# --- players ------------------------------------------------------------
+def _split_riot_id(riot_id: str) -> tuple[str, str]:
+    """"Name#TAG" -> (name, tag). Names may contain spaces, tags may not."""
+    raw = (riot_id or "").strip().lstrip("#")
+    if "#" not in raw:
+        raise HTTPException(400, "Riot ID must look like Name#TAG.")
+    name, _, tag = raw.rpartition("#")
+    name, tag = name.strip(), tag.strip()
+    if not name or not tag:
+        raise HTTPException(400, "Riot ID must look like Name#TAG.")
+    return name, tag
+
+
+@app.post("/api/player/register")
+async def register_player(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Start tracking a Riot ID, so the crawler prioritises their matches.
+
+    Resolving the account is what validates the ID: a typo comes back as
+    404 from upstream rather than as a player who never gets any data.
+    """
+    if _READ_ONLY:
+        raise HTTPException(409, "This deployment is read-only.")
+    name, tag = _split_riot_id(str(payload.get("riot_id") or ""))
+
+    known = _db.tracked_player(name, tag)
+    if known:
+        # Already tracked: touch it so the page reflects the visit, but do
+        # not spend an upstream request re-resolving a known puuid.
+        _db.track_player(known["puuid"], known["name"], known["tag"], known.get("region"))
+        return {"player": _player_payload(known["puuid"]), "new": False}
+
+    account = await clients.henrik_account(name, tag)
+    record = _db.track_player(
+        account["puuid"],
+        account.get("name") or name,
+        account.get("tag") or tag,
+        account.get("region"),
+    )
+    _engine.invalidate()  # a new player id was interned
+    return {"player": _player_payload(record["puuid"]), "new": True}
+
+
+def _player_payload(puuid: str) -> dict[str, Any]:
+    """Everything the player tab needs about one tracked player."""
+    record = _db.tracked_by_puuid(puuid) or {}
+    summary = _engine.player_summary(puuid)
+    return {
+        "puuid": puuid,
+        "name": record.get("name", ""),
+        "tag": record.get("tag", ""),
+        "region": record.get("region"),
+        "riot_id": f"{record.get('name', '')}#{record.get('tag', '')}",
+        "crawled_at": record.get("crawled_at"),
+        "requested_at": record.get("requested_at"),
+        **summary,
+    }
+
+
+@app.get("/api/player/{riot_id:path}/matches")
+async def player_matches(riot_id: str, limit: int = 20) -> dict[str, Any]:
+    """A tracked player's matches, newest first, for the review list."""
+    name, tag = _split_riot_id(riot_id)
+    record = _db.tracked_player(name, tag)
+    if record is None:
+        raise HTTPException(404, f"{name}#{tag} is not being tracked yet.")
+    return {
+        "player": _player_payload(record["puuid"]),
+        "matches": _engine.player_matches(record["puuid"], limit=limit),
+    }
+
+
+@app.get("/api/player/{riot_id:path}")
+async def player_detail(riot_id: str) -> dict[str, Any]:
+    """Headline stats for a tracked player."""
+    name, tag = _split_riot_id(riot_id)
+    record = _db.tracked_player(name, tag)
+    if record is None:
+        raise HTTPException(404, f"{name}#{tag} is not being tracked yet.")
+    # Touch it: the crawler uses last_seen_at to keep active players fresh.
+    _db.track_player(record["puuid"], record["name"], record["tag"], record.get("region"))
+    return _player_payload(record["puuid"])
+
+
+@app.get("/api/match/{match_id}")
+async def match_detail(match_id: str, request: Request) -> dict[str, Any]:
+    """One match, for review: its kills, plants, players and scoreboard.
+
+    Fetches and stores the match if we do not have it, so a game finished
+    minutes ago can be reviewed without waiting for the crawler.
+    """
+    row_id = _db.match_row_id(match_id)
+    if row_id is None:
+        if _READ_ONLY:
+            raise HTTPException(404, "Match not in the dataset.")
+        await _ingest_match(match_id)
+        row_id = _db.match_row_id(match_id)
+        if row_id is None:
+            raise HTTPException(404, "Match could not be ingested.")
+
+    detail = _engine.match_detail(match_id)
+    if detail is None:
+        raise HTTPException(404, "Match not in the dataset.")
+    # The map's calibration and callouts travel with the match: the client
+    # needs both to draw it, and asking for them separately would be a
+    # second round trip for something we already know here.
+    info = get_map(detail["map_name"])
+    detail["map"] = info.as_dict() if info else None
+    return detail
+
+
+async def _ingest_match(match_id: str, region: str | None = None) -> int:
+    """Pull one match from upstream and store it. Returns kills written."""
+    from .analytics.kills import enrich
+    from .store import parse_any
+
+    payload = await clients.henrik_match(match_id, region)
+    match = parse_any(payload, source="henrik")
+    if not match.meta.match_id:
+        match.meta.match_id = match_id
+    info = get_map(match.meta.map_id) or get_map(match.meta.map_name)
+    if info is None or not info.has_calibration:
+        raise HTTPException(422, "This map has no coordinate calibration.")
+    kills = _db.add_match(match, info, enrich(match))
+    _engine.invalidate()
+    return kills
+
+
 # --- ingestion ----------------------------------------------------------
 @app.post("/api/import/upload")
 async def import_upload(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:

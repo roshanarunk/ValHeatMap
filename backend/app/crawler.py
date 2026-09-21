@@ -207,7 +207,8 @@ class Crawler:
         self, client: httpx.AsyncClient, url: str, params: dict[str, Any] | None = None
     ) -> Any | None:
         """One rate-limited GET, retrying once on 429 or a transient error."""
-        for attempt in range(2):
+        attempts = 2
+        for attempt in range(attempts):
             if self.control is not None:
                 await self.control.wait_while_paused()
                 if self.control.stopping:
@@ -233,6 +234,13 @@ class Crawler:
             if resp.status_code in (404, 400):
                 return None
             if resp.status_code >= 500:
+                # Usually transient, so retry. But a wrong region answers
+                # 500 every time, and silently returning None made that
+                # look like a player with no matches -- so say so on the
+                # last attempt rather than failing quietly.
+                if attempt == attempts - 1:
+                    self.log(f"  ! HTTP {resp.status_code} (giving up) for {url}")
+                    self.errors += 1
                 await asyncio.sleep(2)
                 continue
             if resp.status_code >= 400:
@@ -333,14 +341,22 @@ class Crawler:
         return True
 
     async def crawl_player(
-        self, client: httpx.AsyncClient, puuid: str, size: int = 5
+        self, client: httpx.AsyncClient, puuid: str, size: int = 5,
+        region: str | None = None,
     ) -> int:
-        """Fetch a player's recent matches. Returns how many were stored."""
+        """Fetch a player's recent matches. Returns how many were stored.
+
+        `region` matters: the matchlist endpoint is per-region and answers
+        500 for a player who is not on the one asked for. A registered
+        player from another region would otherwise look like a successful
+        crawl that stored nothing.
+        """
         stored = 0
+        region = (region or self.region).lower()
         for mode in self.modes:
             payload = await self._get(
                 client,
-                f"{HENRIK_BASE}/v4/by-puuid/matches/{self.region}/pc/{puuid}",
+                f"{HENRIK_BASE}/v4/by-puuid/matches/{region}/pc/{puuid}",
                 {"size": size, "mode": mode},
             )
             for raw in (payload or {}).get("data") or []:
@@ -349,9 +365,48 @@ class Crawler:
         self.db.mark_player_crawled(puuid, stored)
         return stored
 
+    async def crawl_tracked_players(
+        self, client: httpx.AsyncClient, limit: int = 5, per_player: int = 10
+    ) -> int:
+        """Fetch history for people who asked to see their own stats.
+
+        These jump the queue: someone who has just registered is watching
+        an empty page, while the discovery crawl is background work that
+        nobody is waiting on. It is a small slice of each cycle -- five
+        players at ~2 requests each against a 200-match batch -- so it
+        costs the general crawl very little.
+        """
+        if self.analytics is None:
+            return 0
+        try:
+            pending = self.analytics.players_needing_crawl(limit=limit)
+        except Exception as exc:  # never let this stop the main crawl
+            self.log(f"  ! tracked player lookup failed: {exc}")
+            return 0
+
+        stored = 0
+        for player in pending:
+            try:
+                got = await self.crawl_player(
+                    client, player["puuid"], per_player, region=player.get("region")
+                )
+                stored += got
+                self.analytics.mark_player_crawled(player["puuid"], got)
+                self.log(f"  · tracked {player['name']}#{player['tag']} +{got}")
+            except Exception as exc:
+                # Mark it crawled anyway: a player whose fetch always fails
+                # would otherwise be retried forever at the front of the
+                # queue, starving everyone behind them.
+                self.analytics.mark_player_crawled(player["puuid"])
+                self.log(f"  ! tracked {player['name']}#{player['tag']} failed: {exc}")
+        return stored
+
     async def run(self, target_matches: int = 200, per_player: int = 5) -> dict[str, Any]:
         started = time.monotonic()
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+            # Registered players first, before the discovery crawl.
+            await self.crawl_tracked_players(client)
+
             if not self.db.pending_players(limit=1):
                 await self.seed_from_leaderboard(client)
 

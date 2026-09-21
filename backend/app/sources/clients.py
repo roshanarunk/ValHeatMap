@@ -94,6 +94,43 @@ async def henrik_matchlist(
     return await _get_json(url, {"Authorization": key}, params)
 
 
+async def henrik_account(name: str, tag: str) -> dict[str, Any]:
+    """Resolve a Riot ID to an account, chiefly for its puuid.
+
+    Riot IDs are mutable and case-insensitive; the puuid is neither, so
+    everything downstream keys on the puuid and treats the name as a
+    label that may go stale.
+    """
+    key = henrik_key()
+    if not key:
+        raise SourceError("HENRIK_API_KEY is not set on the server.", 400)
+    url = f"{HENRIK_BASE}/v2/account/{name}/{tag}"
+    payload = await _get_json(url, {"Authorization": key})
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data.get("puuid"):
+        raise SourceError(f"No Valorant account for {name}#{tag}.", 404)
+    return data
+
+
+async def henrik_matchlist_by_puuid(
+    puuid: str, region: str | None = None, mode: str | None = None, size: int = 5
+) -> dict[str, Any]:
+    """Recent matches for a puuid.
+
+    Preferred over the name/tag form once we know the puuid: it keeps
+    working after a name change.
+    """
+    key = henrik_key()
+    if not key:
+        raise SourceError("HENRIK_API_KEY is not set on the server.", 400)
+    region = (region or DEFAULT_REGION).lower()
+    url = f"{HENRIK_BASE}/v4/by-puuid/matches/{region}/pc/{puuid}"
+    params: dict[str, Any] = {"size": max(1, min(size, 10))}
+    if mode:
+        params["mode"] = mode
+    return await _get_json(url, {"Authorization": key}, params)
+
+
 # --- Riot official -----------------------------------------------------
 async def riot_match(match_id: str, region: str | None = None) -> dict[str, Any]:
     key = riot_key()
