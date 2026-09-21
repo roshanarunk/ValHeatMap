@@ -1,0 +1,413 @@
+"""Queryable analytics database.
+
+Why this exists
+---------------
+The raw payloads are the source of truth, but they are 2.5 GB of JSON and
+re-parsing them takes ~41s -- fine for a long-lived local process, fatal for
+a serverless cold start. This module derives a flat, indexed table with one
+row per kill (and per plant) so the API answers a heatmap query with an
+indexed SELECT instead of a full re-parse.
+
+It is a *derived* store: it can be rebuilt from `data/raw` at any time, and
+the crawler appends to it as matches arrive, so it is never stale.
+
+Size: ~70 bytes per kill row, so 1M kills is ~75 MB -- small enough to ship
+to object storage and read from a read-only filesystem.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+
+from .analytics.kills import EnrichedKill, enrich
+from .models import DamageType, Match, Side
+
+DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "analytics.db"
+
+# Kill flags packed into one integer column instead of five.
+FLAG_TRADED = 1
+FLAG_TRADE_KILL = 2
+FLAG_FIRST_BLOOD = 4
+FLAG_POST_PLANT = 8
+FLAG_ROUND_WON = 16
+
+SIDE_ID = {Side.NONE: 0, Side.ATTACK: 1, Side.DEFENSE: 2}
+SIDE_NAME = {0: "none", 1: "attack", 2: "defense"}
+DMG_ID = {
+    DamageType.WEAPON: 0,
+    DamageType.ABILITY: 1,
+    DamageType.BOMB: 2,
+    DamageType.FALL: 3,
+    DamageType.UNKNOWN: 3,
+}
+DMG_NAME = {0: "weapon", 1: "ability", 2: "bomb", 3: "other"}
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+
+-- Small lookup tables. Map/agent/weapon names repeat on every kill row, so
+-- storing them as ids instead of text cuts the table roughly in half and
+-- shrinks every index that covers them.
+CREATE TABLE IF NOT EXISTS dim (
+    kind  TEXT NOT NULL,            -- map | agent | weapon | ability | act | patch
+    id    INTEGER NOT NULL,
+    name  TEXT NOT NULL,
+    PRIMARY KEY (kind, id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dim_name ON dim(kind, name);
+
+CREATE TABLE IF NOT EXISTS matches (
+    id           INTEGER PRIMARY KEY,   -- compact surrogate key
+    match_id     TEXT NOT NULL UNIQUE,
+    map_id       INTEGER NOT NULL,
+    mode         TEXT NOT NULL,
+    queue        TEXT,
+    act_id       INTEGER,
+    patch_id     INTEGER,
+    region       TEXT,
+    started_at   INTEGER,
+    avg_tier     INTEGER,
+    rounds       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_m_map ON matches(map_id, avg_tier);
+
+-- One row per kill. Positions are already projected into minimap space
+-- [0,1] so the API never repeats the transform.
+CREATE TABLE IF NOT EXISTS kills (
+    m            INTEGER NOT NULL,      -- matches.id
+    map_id       INTEGER NOT NULL,
+    act_id       INTEGER,
+    avg_tier     INTEGER,
+    round_num    INTEGER NOT NULL,
+    t_ms         INTEGER NOT NULL,
+    side         INTEGER NOT NULL,      -- 0 none, 1 attack, 2 defense
+    ka_id        INTEGER,               -- killer agent
+    va_id        INTEGER,               -- victim agent
+    weapon_id    INTEGER,
+    ability_id   INTEGER,
+    dmg_type     INTEGER NOT NULL,      -- 0 weapon 1 ability 2 bomb 3 other
+    vx           REAL NOT NULL,
+    vy           REAL NOT NULL,
+    kx           REAL,
+    ky           REAL,
+    flags        INTEGER NOT NULL       -- bitfield, see FLAG_* below
+);
+-- One covering index for the hot path: every heatmap query filters on map
+-- first, then narrows. A single composite beats several overlapping ones,
+-- which is what made the first version's indexes larger than its data.
+CREATE INDEX IF NOT EXISTS idx_k_main ON kills(map_id, avg_tier, act_id, t_ms);
+CREATE INDEX IF NOT EXISTS idx_k_m    ON kills(m);
+
+CREATE TABLE IF NOT EXISTS plants (
+    m          INTEGER NOT NULL,
+    map_id     INTEGER NOT NULL,
+    act_id     INTEGER,
+    avg_tier   INTEGER,
+    round_num  INTEGER NOT NULL,
+    t_ms       INTEGER NOT NULL,
+    site       TEXT NOT NULL,
+    x          REAL NOT NULL,
+    y          REAL NOT NULL,
+    won        INTEGER NOT NULL,
+    defused    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_p_main ON plants(map_id, avg_tier, act_id);
+CREATE INDEX IF NOT EXISTS idx_p_m    ON plants(m);
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+
+class AnalyticsDB:
+    def __init__(self, path: Path | None = None, read_only: bool = False) -> None:
+        self.path = Path(path) if path else DEFAULT_PATH
+        self.read_only = read_only
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
+        self._dim_cache: dict[str, dict[str, int]] = {}
+        if not read_only:
+            with self.connect() as conn:
+                conn.executescript(SCHEMA)
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            if self.read_only:
+                # immutable=1 tells SQLite the file will not change, which
+                # skips locking entirely -- required on a read-only FS.
+                conn = sqlite3.connect(
+                    f"file:{self.path}?immutable=1", uri=True, check_same_thread=False
+                )
+            else:
+                conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return conn
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        conn = self._conn()
+        try:
+            yield conn
+            if not self.read_only:
+                conn.commit()
+        except Exception:
+            if not self.read_only:
+                conn.rollback()
+            raise
+
+    # --- dimension interning -------------------------------------------
+    def _dim_id(self, conn: sqlite3.Connection, kind: str, name: str | None) -> int | None:
+        """Map a name to a small integer id, creating it on first sight."""
+        if not name:
+            return None
+        cache = self._dim_cache.setdefault(kind, {})
+        hit = cache.get(name)
+        if hit is not None:
+            return hit
+        row = conn.execute(
+            "SELECT id FROM dim WHERE kind=? AND name=?", (kind, name)
+        ).fetchone()
+        if row is None:
+            nxt = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 n FROM dim WHERE kind=?", (kind,)
+            ).fetchone()["n"]
+            conn.execute("INSERT INTO dim (kind, id, name) VALUES (?,?,?)", (kind, nxt, name))
+            value = nxt
+        else:
+            value = row["id"]
+        cache[name] = value
+        return value
+
+    def dim_names(self, kind: str) -> dict[int, str]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT id, name FROM dim WHERE kind=?", (kind,)).fetchall()
+        return {r["id"]: r["name"] for r in rows}
+
+    def dim_ids(self, kind: str) -> dict[str, int]:
+        return {v: k for k, v in self.dim_names(kind).items()}
+
+    # --- ingest --------------------------------------------------------
+    def has_match(self, match_id: str) -> bool:
+        with self.connect() as conn:
+            return (
+                conn.execute(
+                    "SELECT 1 FROM matches WHERE match_id = ?", (match_id,)
+                ).fetchone()
+                is not None
+            )
+
+    def add_match(
+        self, match: Match, map_info, enriched: Sequence[EnrichedKill] | None = None
+    ) -> int:
+        """Derive and store every row for one match. Returns kills written."""
+        if map_info is None or not map_info.has_calibration:
+            return 0
+        meta = match.meta
+        avg_tier = _avg_tier(match)
+        rows = enriched if enriched is not None else enrich(match)
+
+        with self.connect() as conn:
+            map_id = self._dim_id(conn, "map", meta.map_name)
+            if map_id is None:
+                return 0
+            act_id = self._dim_id(conn, "act", meta.act or None)
+            patch_id = self._dim_id(conn, "patch", _patch_of(meta.game_version) or None)
+
+            conn.execute(
+                """INSERT INTO matches (match_id, map_id, mode, queue, act_id, patch_id,
+                                        region, started_at, avg_tier, rounds)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(match_id) DO UPDATE SET
+                     map_id=excluded.map_id, act_id=excluded.act_id,
+                     avg_tier=excluded.avg_tier""",
+                (
+                    meta.match_id, map_id, meta.mode, meta.queue, act_id, patch_id,
+                    meta.region, meta.started_at, avg_tier, len(match.rounds),
+                ),
+            )
+            m = conn.execute(
+                "SELECT id FROM matches WHERE match_id=?", (meta.match_id,)
+            ).fetchone()["id"]
+
+            # Re-ingesting a match replaces its rows rather than duplicating.
+            conn.execute("DELETE FROM kills WHERE m = ?", (m,))
+            conn.execute("DELETE FROM plants WHERE m = ?", (m,))
+
+            kill_rows = []
+            for ek in rows:
+                k = ek.kill
+                if k.victim_location is None:
+                    continue
+                vx, vy = map_info.to_minimap(k.victim_location.x, k.victim_location.y)
+                if not (0.0 <= vx <= 1.0 and 0.0 <= vy <= 1.0):
+                    continue
+                kx = ky = None
+                if k.killer_location is not None:
+                    cx, cy = map_info.to_minimap(k.killer_location.x, k.killer_location.y)
+                    if 0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0:
+                        kx, ky = round(cx, 4), round(cy, 4)
+                flags = (
+                    (FLAG_TRADED if ek.traded else 0)
+                    | (FLAG_TRADE_KILL if ek.trade_kill else 0)
+                    | (FLAG_FIRST_BLOOD if ek.first_blood else 0)
+                    | (FLAG_POST_PLANT if ek.post_plant else 0)
+                    | (FLAG_ROUND_WON if ek.round_won else 0)
+                )
+                kill_rows.append(
+                    (
+                        m, map_id, act_id, avg_tier,
+                        k.round_num, k.time_in_round_ms,
+                        SIDE_ID.get(k.killer_side, 0),
+                        self._dim_id(conn, "agent", ek.killer_agent),
+                        self._dim_id(conn, "agent", ek.victim_agent),
+                        self._dim_id(conn, "weapon", k.weapon_name or None),
+                        self._dim_id(conn, "ability", k.ability_name or None),
+                        DMG_ID.get(k.damage_type, 3),
+                        # 4 decimals is ~0.1px on a 1000px minimap: plenty of
+                        # precision, and it keeps the stored floats short.
+                        round(vx, 4), round(vy, 4), kx, ky, flags,
+                    )
+                )
+
+            plant_rows = []
+            for p in match.plants:
+                px, py = map_info.to_minimap(p.location.x, p.location.y)
+                if not (0.0 <= px <= 1.0 and 0.0 <= py <= 1.0):
+                    continue
+                plant_rows.append(
+                    (
+                        m, map_id, act_id, avg_tier, p.round_num, p.round_time_ms,
+                        p.site, round(px, 4), round(py, 4), int(p.won), int(p.defused),
+                    )
+                )
+
+            if kill_rows:
+                conn.executemany(
+                    "INSERT INTO kills VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", kill_rows
+                )
+            if plant_rows:
+                conn.executemany(
+                    "INSERT INTO plants VALUES (?,?,?,?,?,?,?,?,?,?,?)", plant_rows
+                )
+        return len(kill_rows)
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def optimise(self) -> None:
+        """Compact and analyse. Worth running once after a bulk build."""
+        conn = self._conn()
+        conn.execute("ANALYZE")
+        conn.commit()
+        previous = conn.isolation_level
+        conn.isolation_level = None
+        conn.execute("VACUUM")
+        conn.isolation_level = previous
+
+    # --- query ---------------------------------------------------------
+    def stats(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            m = conn.execute("SELECT COUNT(*) n FROM matches").fetchone()["n"]
+            k = conn.execute("SELECT COUNT(*) n FROM kills").fetchone()["n"]
+            p = conn.execute("SELECT COUNT(*) n FROM plants").fetchone()["n"]
+        return {
+            "matches": m,
+            "kills": k,
+            "plants": p,
+            "generated_at": self.get_meta("generated_at"),
+        }
+
+    def facets(self) -> dict[str, Any]:
+        """Distinct filter values present in the data, for populating the UI."""
+        maps = self.dim_names("map")
+        acts = self.dim_names("act")
+        agents = self.dim_names("agent")
+        with self.connect() as conn:
+            map_rows = conn.execute(
+                "SELECT map_id, COUNT(*) matches FROM matches GROUP BY map_id"
+            ).fetchall()
+            kill_rows = conn.execute(
+                "SELECT map_id, COUNT(*) kills FROM kills GROUP BY map_id"
+            ).fetchall()
+            act_rows = conn.execute(
+                "SELECT act_id, COUNT(*) matches FROM matches "
+                "WHERE act_id IS NOT NULL GROUP BY act_id"
+            ).fetchall()
+            agent_rows = conn.execute(
+                "SELECT ka_id, COUNT(*) kills FROM kills "
+                "WHERE ka_id IS NOT NULL GROUP BY ka_id ORDER BY kills DESC"
+            ).fetchall()
+            tiers = conn.execute(
+                "SELECT MIN(avg_tier) lo, MAX(avg_tier) hi FROM matches WHERE avg_tier > 0"
+            ).fetchone()
+        kills_by_map = {r["map_id"]: r["kills"] for r in kill_rows}
+        return {
+            "maps": sorted(
+                (
+                    {
+                        "map_name": maps.get(r["map_id"], "?"),
+                        "matches": r["matches"],
+                        "kills": kills_by_map.get(r["map_id"], 0),
+                    }
+                    for r in map_rows
+                ),
+                key=lambda d: -d["kills"],
+            ),
+            # Acts sort numerically, not lexically: "e11a5" must come after
+            # "e9a3", which a plain string sort gets backwards.
+            "acts": sorted(
+                ({"act": acts.get(r["act_id"], "?"), "matches": r["matches"]} for r in act_rows),
+                key=lambda d: _act_sort_key(d["act"]),
+                reverse=True,
+            ),
+            "agents": [
+                {"agent": agents.get(r["ka_id"], "?"), "kills": r["kills"]} for r in agent_rows
+            ],
+            "tier_range": [tiers["lo"] or 0, tiers["hi"] or 0],
+        }
+
+
+# --- derivation helpers -------------------------------------------------
+def _act_sort_key(act: str) -> tuple[int, int]:
+    """'e11a5' -> (11, 5), so acts order by episode then act."""
+    import re
+
+    m = re.match(r"e(\d+)a(\d+)", (act or "").lower())
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def _patch_of(version: str) -> str:
+    """'release-13.05-shipping-11-5350494' -> '13.05'."""
+    if not version:
+        return ""
+    parts = version.split("-")
+    for part in parts:
+        if part and part[0].isdigit() and "." in part:
+            return part
+    return ""
+
+
+def _avg_tier(match: Match) -> int:
+    tiers = [p.tier for p in match.players if p.tier]
+    return round(sum(tiers) / len(tiers)) if tiers else 0

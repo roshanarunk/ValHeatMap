@@ -34,8 +34,11 @@ from typing import Any
 
 import httpx
 
+from .analytics.kills import enrich
+from .analytics_db import AnalyticsDB
 from .config import load_env
 from .db import Database, db as default_db
+from .reference import get_map
 from .store import parse_any
 
 HENRIK_BASE = "https://api.henrikdev.xyz/valorant"
@@ -102,6 +105,7 @@ class Crawler:
         self,
         api_key: str,
         database: Database | None = None,
+        analytics: AnalyticsDB | None = None,
         region: str = "na",
         modes: tuple[str, ...] = DEFAULT_MODES,
         rate_limit: int = 90,
@@ -109,6 +113,9 @@ class Crawler:
     ) -> None:
         self.key = api_key
         self.db = database or default_db
+        # Matches land in the analytics database as they arrive, so the site
+        # never needs a separate rebuild pass to see new data.
+        self.analytics = analytics if analytics is not None else AnalyticsDB()
         self.region = region
         self.modes = modes
         self.limiter = RateLimiter(limit=rate_limit, remaining=rate_limit)
@@ -242,6 +249,12 @@ class Crawler:
         }
         self.db.save_match(match_id, raw, summary)
         self.db.mark_match(match_id, "done")
+        if self.analytics is not None:
+            info = get_map(match.meta.map_id) or get_map(match.meta.map_name)
+            try:
+                self.analytics.add_match(match, info, enrich(match))
+            except Exception as exc:  # never let analytics kill a crawl
+                self.log(f"  ! analytics write failed for {match_id}: {exc}")
         self.stored += 1
 
         # Every player in this match is a new crawl candidate.
@@ -305,6 +318,67 @@ class Crawler:
         }
 
 
+async def run_forever(
+    crawler: "Crawler",
+    batch: int = 200,
+    publish_every: int = 2000,
+    pause_s: float = 0.0,
+) -> None:
+    """Crawl continuously, publishing a snapshot as the dataset grows.
+
+    Serverless functions cannot host this -- they are killed at 300-800s --
+    so it runs wherever you keep a long-lived process (a local machine, a
+    small VM). Each batch resumes from the stored frontier, so restarting is
+    free and no work is repeated.
+    """
+    from .publish import publish
+
+    since_publish = 0
+    cycle = 0
+    while True:
+        cycle += 1
+        before = crawler.stored
+        try:
+            await crawler.run(target_matches=before + batch)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            crawler.log(f"  ! crawl cycle failed: {exc}; retrying in 60s")
+            await asyncio.sleep(60)
+            continue
+
+        gained = crawler.stored - before
+        since_publish += gained
+        stats = crawler.analytics.stats() if crawler.analytics else {}
+        crawler.log(
+            f"[cycle {cycle}] +{gained} this batch, {crawler.stored} this run, "
+            f"db {stats.get('matches', '?')} matches / {stats.get('kills', '?')} kills"
+        )
+
+        if gained == 0:
+            # Frontier exhausted or upstream unhappy; back off rather than spin.
+            crawler.log("  · nothing new, pausing 120s")
+            await asyncio.sleep(120)
+            continue
+
+        if publish_every and since_publish >= publish_every:
+            try:
+                crawler.analytics.set_meta(
+                    "generated_at",
+                    __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc
+                    ).isoformat(timespec="seconds"),
+                )
+                url = publish(verbose=True)
+                crawler.log(f"  · published snapshot -> {url}")
+                since_publish = 0
+            except Exception as exc:
+                crawler.log(f"  ! publish failed: {exc}")
+
+        if pause_s:
+            await asyncio.sleep(pause_s)
+
+
 async def _main(args: argparse.Namespace) -> int:
     load_env()
     key = os.environ.get("HENRIK_API_KEY")
@@ -322,6 +396,22 @@ async def _main(args: argparse.Namespace) -> int:
         name, _, tag = args.seed.partition("#")
         async with httpx.AsyncClient(timeout=30) as client:
             await crawler.seed_from_riot_id(client, name, tag)
+
+    if args.forever:
+        crawler.log(
+            f"running continuously: batches of {args.batch}, "
+            f"publishing every {args.publish_every} new matches. Ctrl-C to stop."
+        )
+        try:
+            await run_forever(
+                crawler,
+                batch=args.batch,
+                publish_every=args.publish_every,
+                pause_s=args.pause,
+            )
+        except KeyboardInterrupt:
+            pass
+        return 0
 
     result = await crawler.run(target_matches=args.matches, per_player=args.per_player)
     print("\n--- crawl complete ---")
@@ -342,6 +432,15 @@ def main() -> int:
     parser.add_argument("--per-player", type=int, default=5, help="matches per player per mode")
     parser.add_argument("--rate", type=int, default=90, help="requests/min budget")
     parser.add_argument("--seed", default="", help="seed from a Riot ID, e.g. Name#TAG")
+    parser.add_argument(
+        "--forever", action="store_true", help="crawl continuously until stopped"
+    )
+    parser.add_argument("--batch", type=int, default=200, help="matches per cycle in --forever")
+    parser.add_argument(
+        "--publish-every", type=int, default=2000,
+        help="publish a snapshot after this many new matches (0 disables)",
+    )
+    parser.add_argument("--pause", type=float, default=0.0, help="seconds between cycles")
     args = parser.parse_args()
     return asyncio.run(_main(args))
 

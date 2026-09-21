@@ -177,6 +177,7 @@ class MatchMeta:
     game_length_ms: int
     game_version: str = ""
     region: str = ""
+    act: str = ""                   # season short code, e.g. "e11a5"
     source: str = "local"           # which adapter produced this match
     is_ranked: bool = False
 

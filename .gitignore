@@ -22,3 +22,9 @@ data/raw/
 data/valheatmap.db
 data/valheatmap.db-wal
 data/valheatmap.db-shm
+
+# derived analytics database (rebuildable from data/raw)
+data/analytics.db
+data/analytics.db-*
+data/*.db.gz
+frontend/tsconfig.tsbuildinfo

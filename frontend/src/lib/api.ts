@@ -1,5 +1,9 @@
 import type {
   AgentInfo,
+  Facets,
+  InsightsResponseV2,
+  KillsResponseV2,
+  UtilityResponseV2,
   InsightsResponse,
   KillsResponse,
   MapRow,
@@ -66,9 +70,10 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
 
 /** Filters shared by the kill, utility and insight endpoints. */
 export interface QueryFilters {
-  match_ids?: string[]
   map_name?: string
-  mode?: string
+  acts?: string[]
+  patches?: string[]
+  ranks?: string[]
   agents?: string[]
   victim_agents?: string[]
   players?: string[]
@@ -111,6 +116,12 @@ export interface CrawlResult {
 }
 
 export const api = {
+  facets: () => get<Facets>('/api/facets'),
+  killsV2: (f: QueryFilters) => get<KillsResponseV2>('/api/kills', f as Record<string, unknown>),
+  utilityV2: (f: QueryFilters) =>
+    get<UtilityResponseV2>('/api/utility', f as Record<string, unknown>),
+  insightsV2: (f: QueryFilters) =>
+    get<InsightsResponseV2>('/api/insights', f as Record<string, unknown>),
   dataset: () => get<DatasetStats>('/api/dataset'),
   reloadDataset: () => post<{ loaded: number }>('/api/dataset/reload'),
   crawl: (matches: number, region?: string, seed?: string) => {

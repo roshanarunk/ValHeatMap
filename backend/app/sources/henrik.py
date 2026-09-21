@@ -131,6 +131,11 @@ def parse(data: dict[str, Any], source: str = "henrik") -> Match:
         except ValueError:
             started_ms = 0
 
+    season_raw = meta_raw.get("season") or {}
+    act = (
+        season_raw.get("short") if isinstance(season_raw, dict) else str(season_raw or "")
+    ) or ""
+
     meta = MatchMeta(
         match_id=meta_raw.get("match_id") or "",
         map_id=map_info.map_url if map_info else (map_name or ""),
@@ -142,6 +147,7 @@ def parse(data: dict[str, Any], source: str = "henrik") -> Match:
         game_length_ms=int(meta_raw.get("game_length_in_ms") or 0),
         game_version=meta_raw.get("game_version") or "",
         region=meta_raw.get("region") or "",
+        act=act,
         source=source,
         is_ranked=str(queue_raw.get("id") if isinstance(queue_raw, dict) else "").lower()
         == "competitive",

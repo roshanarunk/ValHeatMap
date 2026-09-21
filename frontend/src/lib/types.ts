@@ -248,3 +248,65 @@ export interface WeaponInfo {
   category: string
   icon: string
 }
+
+
+// --- v2 API -------------------------------------------------------------
+export interface FacetMap {
+  map_name: string
+  matches: number
+  kills: number
+  minimap: string
+  splash: string
+}
+
+export interface FacetAgent {
+  agent: string
+  kills: number
+  icon: string
+  role: string
+}
+
+export interface RankBand {
+  id: string
+  name: string
+  tiers: [number, number]
+}
+
+export interface Facets {
+  maps: FacetMap[]
+  acts: { act: string; matches: number }[]
+  agents: FacetAgent[]
+  ranks: RankBand[]
+  tier_range: [number, number]
+  stats: { matches: number; kills: number; plants: number; generated_at: string | null }
+}
+
+export interface KillsResponseV2 {
+  map: MapInfo
+  points: KillPoint[]
+  total: number
+  sampled: boolean
+  stats: {
+    total: number
+    matches: number
+    traded: number
+    trade_rate: number
+    first_bloods: number
+    post_plant: number
+    utility: number
+    utility_rate: number
+  }
+  histogram: { t: number; count: number }[]
+}
+
+export interface UtilityResponseV2 extends KillsResponseV2 {
+  abilities: { ability: string; agent: string; kills: number }[]
+}
+
+export interface InsightsResponseV2 {
+  stats: KillsResponseV2['stats']
+  agents: { agent: string; kills: number; traded: number }[]
+  weapons: { weapon: string; kills: number }[]
+  abilities: { ability: string; agent: string; kills: number }[]
+  histogram: { t: number; count: number }[]
+}

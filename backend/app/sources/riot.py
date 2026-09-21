@@ -152,6 +152,8 @@ def parse(data: dict[str, Any], source: str = "riot") -> Match:
         started_at=int(info.get("gameStartMillis") or 0),
         game_length_ms=int(info.get("gameLengthMillis") or 0),
         game_version=info.get("gameVersion") or "",
+        # The official payload only carries a season uuid, not a short code.
+        act=info.get("seasonId") or "",
         source=source,
         is_ranked=bool(info.get("isRanked")),
     )

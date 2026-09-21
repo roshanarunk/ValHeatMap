@@ -1,7 +1,13 @@
 """ValHeatMap API.
 
-Serves normalised Valorant match analytics: kill heatmaps with agent/time
-filtering, utility-damage maps, plant heatmaps and plant-spot win rates.
+Serves spatial Valorant analytics from a precomputed database: kill
+heatmaps with agent/act/rank/time filtering, utility-damage maps, plant
+heatmaps and plant-spot win rates.
+
+The API never parses raw match JSON. Every request is answered from
+`analytics.db`, which the crawler and `build_analytics` keep current. That
+is what makes cold starts viable on a serverless host, where re-reading the
+2.5 GB of raw payloads would take ~40s.
 """
 
 from __future__ import annotations
@@ -10,35 +16,23 @@ import os
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .analytics import insights, plants as plant_analytics
-from .analytics.kills import (
-    EnrichedKill,
-    KillFilters,
-    apply_filters,
-    enrich,
-    summarise,
-    time_histogram,
-    to_points,
-)
-from .models import DamageType, Match
-from .reference import agents_by_id, get_map, weapons_by_id
+from .analytics import plants as plant_analytics
+from .analytics_db import AnalyticsDB
 from .config import load_env
-from .crawler import Crawler
-from .db import db as match_db
+from .models import Plant, Point
+from .queries import Filters, QueryEngine
+from .reference import agents_by_id, get_map, weapons_by_id
+from .snapshot import ensure_local_db
 from .sources import clients
-from .store import parse_any, store
 
-# Pick up HENRIK_API_KEY / RIOT_API_KEY from .env before anything reads them.
 load_env()
 
-app = FastAPI(title="ValHeatMap API", version="1.0.0")
+app = FastAPI(title="ValHeatMap API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,47 +42,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enriched kills are pure functions of a match, so cache them per match id.
-_enriched_cache: dict[tuple[str, int, float], list[EnrichedKill]] = {}
+# On serverless this downloads a published snapshot into the writable temp
+# dir; locally it is just the file on disk.
+_DB_PATH = ensure_local_db()
+_READ_ONLY = os.environ.get("VALHEATMAP_READ_ONLY", "").lower() in {"1", "true", "yes"}
+_db = AnalyticsDB(_DB_PATH, read_only=_READ_ONLY)
+_engine = QueryEngine(_db)
 
 
-def _enriched(match: Match, window_ms: int, radius: float) -> list[EnrichedKill]:
-    key = (match.meta.match_id, window_ms, radius)
-    hit = _enriched_cache.get(key)
-    if hit is None:
-        hit = enrich(match, trade_window_ms=window_ms, trade_radius=radius)
-        _enriched_cache[key] = hit
-    return hit
+def _filters(request: Request) -> Filters:
+    return Filters.from_query(dict(request.query_params))
 
 
-def _selected(
-    match_ids: str | None, map_name: str | None, mode: str | None
-) -> list[Match]:
-    ids = [m for m in (match_ids or "").split(",") if m]
-    matches = store.select(match_ids=ids or None, map_name=map_name, mode=mode)
-    if not matches:
-        raise HTTPException(404, "No matches found for that selection.")
-    return matches
-
-
-def _resolve_map(matches: list[Match]):
-    map_info = get_map(matches[0].meta.map_id) or get_map(matches[0].meta.map_name)
-    if map_info is None or not map_info.has_calibration:
-        raise HTTPException(
-            422,
-            f"No minimap calibration available for '{matches[0].meta.map_name}'.",
-        )
-    return map_info
-
-
-def _collect(
-    matches: list[Match], request: Request, window_ms: int, radius: float
-) -> list[EnrichedKill]:
-    filters = KillFilters.from_query(dict(request.query_params))
-    out: list[EnrichedKill] = []
-    for match in matches:
-        out.extend(apply_filters(_enriched(match, window_ms, radius), filters))
-    return out
+def _require_map(f: Filters):
+    if not f.map_name:
+        raise HTTPException(400, "map_name is required.")
+    info = get_map(f.map_name)
+    if info is None or not info.has_calibration:
+        raise HTTPException(422, f"No minimap calibration for '{f.map_name}'.")
+    return info
 
 
 @app.exception_handler(clients.SourceError)
@@ -99,305 +71,189 @@ async def _source_error(_: Request, exc: clients.SourceError) -> JSONResponse:
 # --- meta ---------------------------------------------------------------
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    store.ensure_loaded()
+    stats = _db.stats()
     return {
         "status": "ok",
-        "matches": len(store.all()),
+        "matches": stats["matches"],
+        "kills": stats["kills"],
+        "generated_at": stats["generated_at"],
+        "read_only": _READ_ONLY,
         "live_sources": clients.available_sources(),
     }
 
 
+@app.get("/api/facets")
+async def facets() -> dict[str, Any]:
+    """Everything the UI needs to populate its filter controls."""
+    data = _db.facets()
+    for row in data["maps"]:
+        info = get_map(row["map_name"])
+        row["minimap"] = info.minimap if info else ""
+        row["splash"] = info.splash if info else ""
+    agent_meta = {a.name: a for a in agents_by_id().values()}
+    for row in data["agents"]:
+        info = agent_meta.get(row["agent"])
+        row["icon"] = info.icon if info else ""
+        row["role"] = info.role if info else ""
+    # Rank bands, highest first -- these mirror queries.TIER_BANDS.
+    data["ranks"] = [
+        {"id": "radiant", "name": "Radiant", "tiers": [27, 27]},
+        {"id": "immortal", "name": "Immortal", "tiers": [24, 26]},
+        {"id": "ascendant", "name": "Ascendant", "tiers": [21, 23]},
+        {"id": "diamond", "name": "Diamond", "tiers": [18, 20]},
+        {"id": "platinum", "name": "Platinum", "tiers": [15, 17]},
+    ]
+    data["stats"] = _db.stats()
+    return data
+
+
 @app.get("/api/reference")
 async def reference() -> dict[str, Any]:
-    """Agents, weapons and calibrated maps, for populating filter UI."""
     return {
         "agents": [a.as_dict() for a in sorted(agents_by_id().values(), key=lambda a: a.name)],
         "weapons": [w.as_dict() for w in sorted(weapons_by_id().values(), key=lambda w: w.name)],
     }
 
 
-@app.get("/api/matches")
-async def list_matches() -> dict[str, Any]:
-    return {"matches": [m.to_summary() for m in store.all()]}
-
-
-@app.get("/api/maps")
-async def list_maps() -> dict[str, Any]:
-    rows = []
-    for row in store.maps():
-        info = get_map(row["map_id"]) or get_map(row["map_name"])
-        rows.append({**row, "minimap": info.minimap if info else "", "splash": info.splash if info else ""})
-    return {"maps": rows}
-
-
-@app.get("/api/matches/{match_id}")
-async def get_match(match_id: str) -> dict[str, Any]:
-    match = store.get(match_id)
-    if match is None:
-        raise HTTPException(404, "Match not found.")
-    info = get_map(match.meta.map_id) or get_map(match.meta.map_name)
-    return {
-        "match": match.to_summary(),
-        "map": info.as_dict() if info else None,
-        "rounds": [
-            {
-                "number": r.number,
-                "winning_team": r.winning_team,
-                "result": r.result,
-                "kills": len(r.kills),
-                "planted": r.plant is not None,
-                "plant_site": r.plant.site if r.plant else "",
-                "sides": {t: s.value for t, s in r.team_sides.items()},
-            }
-            for r in match.rounds
-        ],
-    }
+@app.get("/api/maps/{map_name}")
+async def map_detail(map_name: str) -> dict[str, Any]:
+    info = get_map(map_name)
+    if info is None:
+        raise HTTPException(404, "Unknown map.")
+    return info.as_dict()
 
 
 # --- core analytics -----------------------------------------------------
 @app.get("/api/kills")
-async def kills_endpoint(
-    request: Request,
-    match_ids: str | None = None,
-    map_name: str | None = None,
-    mode: str | None = None,
-    anchor: str = Query("victim", pattern="^(victim|killer)$"),
-    trade_window: int = Query(3000, ge=0, le=10000),
-    trade_radius: float = Query(3000.0, ge=0),
-) -> dict[str, Any]:
+async def kills_endpoint(request: Request) -> dict[str, Any]:
     """Filtered kill points in minimap space, plus headline stats.
 
-    Every filter in `KillFilters` is accepted as a query parameter, e.g.
-    `?agents=Jett,Reyna&sides=attack&time_end=30000&traded_only=1`.
+    Filters arrive as query parameters, e.g.
+    `?map_name=Ascent&agents=Jett&ranks=radiant&acts=e11a5&time_end=30000`.
     """
-    matches = _selected(match_ids, map_name, mode)
-    map_info = _resolve_map(matches)
-    selected = _collect(matches, request, trade_window, trade_radius)
+    f = _filters(request)
+    info = _require_map(f)
+    result = _engine.kill_points(f)
     return {
-        "map": map_info.as_dict(),
-        "points": to_points(selected, map_info, anchor=anchor),
-        "stats": summarise(selected, matches[0]),
-        "histogram": time_histogram(selected),
-        "matches": [m.meta.match_id for m in matches],
-        "anchor": anchor,
+        "map": info.as_dict(),
+        "points": result["points"],
+        "total": result["total"],
+        "sampled": result["sampled"],
+        "stats": _engine.summary(f),
+        "histogram": _engine.histogram(f),
     }
 
 
 @app.get("/api/utility")
-async def utility_endpoint(
-    request: Request,
-    match_ids: str | None = None,
-    map_name: str | None = None,
-    mode: str | None = None,
-    trade_window: int = Query(3000, ge=0, le=10000),
-    trade_radius: float = Query(3000.0, ge=0),
-) -> dict[str, Any]:
-    """Kills caused by damaging utility, by agent and ability."""
-    matches = _selected(match_ids, map_name, mode)
-    map_info = _resolve_map(matches)
-    selected = [
-        ek
-        for ek in _collect(matches, request, trade_window, trade_radius)
-        if ek.kill.damage_type is DamageType.ABILITY
-    ]
+async def utility_endpoint(request: Request) -> dict[str, Any]:
+    """Kills finished by damaging abilities."""
+    f = _filters(request)
+    f.utility_only = True
+    info = _require_map(f)
+    result = _engine.kill_points(f)
     return {
-        "map": map_info.as_dict(),
-        "points": to_points(selected, map_info, anchor="victim"),
-        "report": insights.utility_report(selected, matches[0]),
-        "stats": summarise(selected, matches[0]),
+        "map": info.as_dict(),
+        "points": result["points"],
+        "total": result["total"],
+        "sampled": result["sampled"],
+        "stats": _engine.summary(f),
+        "abilities": _engine.ability_breakdown(f),
     }
 
 
 @app.get("/api/plants")
 async def plants_endpoint(
-    match_ids: str | None = None,
-    map_name: str | None = None,
-    mode: str | None = None,
-    sites: str | None = None,
+    request: Request,
     cluster_radius: float = Query(plant_analytics.CLUSTER_RADIUS, ge=100, le=4000),
-    min_sample: int = Query(plant_analytics.MIN_SAMPLE, ge=1, le=50),
+    min_sample: int = Query(plant_analytics.MIN_SAMPLE, ge=1, le=500),
 ) -> dict[str, Any]:
-    """Plant locations, clustered plant spots and their round win rates."""
-    matches = _selected(match_ids, map_name, mode)
-    map_info = _resolve_map(matches)
-    wanted = {s for s in (sites or "").split(",") if s}
-    all_plants = [p for m in matches for p in m.plants if not wanted or p.site in wanted]
-    if not all_plants:
+    """Plant locations, clustered spots and their round win rates."""
+    f = _filters(request)
+    info = _require_map(f)
+    raw = _engine.plants(f)
+    if not raw:
         return {
-            "map": map_info.as_dict(),
+            "map": info.as_dict(),
             "points": [], "spots": [], "sites": [],
-            "summary": {"planted_rounds": 0, "plant_win_rate": 0.0},
+            "summary": {"planted_rounds": 0, "plant_win_rate": 0.0, "defused": 0, "spots": 0},
         }
-    spots = plant_analytics.cluster(all_plants, radius=cluster_radius)
-    wins = sum(1 for p in all_plants if p.won)
+
+    # Stored positions are already in minimap space, so the clustering
+    # radius (given in world units) has to be scaled into that space too.
+    scale = abs(info.x_multiplier) or 1.0
+    plants = [
+        Plant(
+            round_num=p["round"], round_time_ms=p["t"], site=p["site"],
+            location=Point(p["position"]["x"], p["position"]["y"]),
+            planter_puuid="", planter_team="",
+            won=p["won"], defused=p["defused"],
+        )
+        for p in raw
+    ]
+    spots = plant_analytics.cluster(plants, radius=cluster_radius * scale)
+    payload = plant_analytics.spot_payload(spots, info, min_sample=min_sample)
+    # spot_payload projects centroids through to_minimap(); these are
+    # already in minimap space, so put the raw centroid back.
+    for row, spot in zip(payload, spots):
+        cx, cy = spot.centroid
+        row["position"] = {"x": round(cx, 4), "y": round(cy, 4)}
+
+    wins = sum(1 for p in raw if p["won"])
     return {
-        "map": map_info.as_dict(),
-        "points": plant_analytics.plant_points(all_plants, map_info),
-        "spots": plant_analytics.spot_payload(spots, map_info, min_sample=min_sample),
-        "sites": plant_analytics.site_breakdown(all_plants),
+        "map": info.as_dict(),
+        "points": raw,
+        "spots": payload,
+        "sites": plant_analytics.site_breakdown(plants),
         "summary": {
-            "planted_rounds": len(all_plants),
-            "plant_win_rate": round(wins / len(all_plants), 4),
-            "defused": sum(1 for p in all_plants if p.defused),
+            "planted_rounds": len(raw),
+            "plant_win_rate": round(wins / len(raw), 4),
+            "defused": sum(1 for p in raw if p["defused"]),
             "spots": len(spots),
         },
     }
 
 
 @app.get("/api/insights")
-async def insights_endpoint(
-    request: Request,
-    match_ids: str | None = None,
-    map_name: str | None = None,
-    mode: str | None = None,
-    trade_window: int = Query(3000, ge=0, le=10000),
-    trade_radius: float = Query(3000.0, ge=0),
-    grid: int = Query(insights.ZONE_GRID, ge=4, le=32),
-) -> dict[str, Any]:
-    """The differentiated stats: trades, opening duels, zones, ranges."""
-    matches = _selected(match_ids, map_name, mode)
-    map_info = _resolve_map(matches)
-    selected = _collect(matches, request, trade_window, trade_radius)
-    primary = matches[0]
+async def insights_endpoint(request: Request) -> dict[str, Any]:
+    """Aggregate breakdowns for the current selection."""
+    f = _filters(request)
+    _require_map(f)
     return {
-        "stats": summarise(selected, primary),
-        "trades": insights.trade_report(selected, primary),
-        "opening_duels": insights.opening_duels(selected, primary),
-        "utility": insights.utility_report(selected, primary),
-        "weapons": insights.weapon_report(selected),
-        "distance": insights.duel_distance(selected),
-        "zones": insights.hot_zones(selected, map_info, grid=grid),
-        "timing": insights.timing_profile(selected),
-        "multikills": insights.multikill_rounds(selected, primary),
-        "opening_impact": insights.economy_of_death(selected, primary),
+        "stats": _engine.summary(f),
+        "agents": _engine.agent_breakdown(f),
+        "weapons": _engine.weapon_breakdown(f),
+        "abilities": _engine.ability_breakdown(f),
+        "histogram": _engine.histogram(f, bucket_ms=10_000),
     }
 
 
 # --- ingestion ----------------------------------------------------------
-def _persist(match: Match, payload: dict[str, Any]) -> None:
-    """Index the match and keep its raw payload, so it survives a restart."""
-    store.add(match)
-    match_db.save_match(
-        match.meta.match_id,
-        payload,
-        {
-            "map_name": match.meta.map_name,
-            "mode": match.meta.mode,
-            "queue": match.meta.queue,
-            "region": match.meta.region,
-            "started_at": match.meta.started_at,
-            "rounds": len(match.rounds),
-            "kills": len(match.kills),
-            "plants": len(match.plants),
-            "source": match.meta.source,
-        },
-    )
-
-
 @app.post("/api/import/upload")
 async def import_upload(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Ingest a raw match JSON (Riot or HenrikDev shape) into the store."""
+    """Ingest a raw match JSON straight into the analytics database."""
+    if _READ_ONLY:
+        raise HTTPException(409, "This deployment is read-only.")
+    from .analytics.kills import enrich
+    from .store import parse_any
+
     try:
         match = parse_any(payload, source="upload")
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not match.meta.match_id:
         raise HTTPException(400, "Match payload has no match id.")
-    _persist(match, payload)
-    return {"imported": match.meta.match_id, "match": match.to_summary()}
-
-
-@app.post("/api/import/henrik/{match_id}")
-async def import_henrik(match_id: str, region: str | None = None) -> dict[str, Any]:
-    payload = await clients.henrik_match(match_id, region)
-    match = parse_any(payload, source="henrik")
-    if not match.meta.match_id:
-        match.meta.match_id = match_id
-    _persist(match, payload)
-    return {"imported": match.meta.match_id, "match": match.to_summary()}
-
-
-@app.post("/api/import/riot/{match_id}")
-async def import_riot(match_id: str, region: str | None = None) -> dict[str, Any]:
-    payload = await clients.riot_match(match_id, region)
-    match = parse_any(payload, source="riot")
-    if not match.meta.match_id:
-        match.meta.match_id = match_id
-    _persist(match, payload)
-    return {"imported": match.meta.match_id, "match": match.to_summary()}
-
-
-@app.post("/api/import/henrik/player/{name}/{tag}")
-async def import_henrik_player(
-    name: str, tag: str, region: str | None = None, mode: str | None = None, size: int = 5
-) -> dict[str, Any]:
-    """Pull a player's recent matches in one go."""
-    payload = await clients.henrik_matchlist(name, tag, region, mode, size)
-    data = payload.get("data") or []
-    imported: list[str] = []
-    for entry in data:
-        try:
-            match = parse_any(entry, source="henrik")
-        except ValueError:
-            continue
-        if match.meta.match_id:
-            _persist(match, entry)
-            imported.append(match.meta.match_id)
-    if not imported:
-        raise HTTPException(422, "No usable matches in the upstream response.")
-    return {"imported": imported, "count": len(imported)}
+    info = get_map(match.meta.map_id) or get_map(match.meta.map_name)
+    kills = _db.add_match(match, info, enrich(match))
+    _engine.invalidate()
+    return {"imported": match.meta.match_id, "kills": kills}
 
 
 @app.get("/api/dataset")
 async def dataset_stats() -> dict[str, Any]:
-    """Size and composition of the stored dataset, plus crawl progress."""
-    stats = match_db.stats()
-    stats["loaded_in_memory"] = len(store.all())
-    return stats
-
-
-@app.post("/api/dataset/reload")
-async def dataset_reload() -> dict[str, Any]:
-    """Re-read matches from disk to pick up new crawler output."""
-    count = store.reload()
-    return {"loaded": count}
-
-
-@app.post("/api/crawl")
-async def start_crawl(
-    matches: int = Query(50, ge=1, le=5000),
-    region: str | None = None,
-    seed: str | None = None,
-) -> dict[str, Any]:
-    """Run a crawl to grow the dataset.
-
-    Blocks until the target is met; with a 90 req/min key, 50 matches takes
-    roughly a minute. For large crawls prefer the CLI:
-    `python -m app.crawler --matches 2000`.
-    """
-    key = clients.henrik_key()
-    if not key:
-        raise HTTPException(400, "HENRIK_API_KEY is not set on the server.")
-
-    crawler = Crawler(
-        api_key=key,
-        region=region or clients.DEFAULT_REGION,
-        rate_limit=int(os.environ.get("HENRIK_RATE_LIMIT", 90)),
-        verbose=False,
-    )
-    if seed and "#" in seed:
-        name, _, tag = seed.partition("#")
-        async with httpx.AsyncClient(timeout=30) as client:
-            await crawler.seed_from_riot_id(client, name, tag)
-
-    result = await crawler.run(target_matches=matches)
-    # Make the new matches visible without a restart.
-    store.reload()
-    return {**result, "dataset": match_db.stats()}
+    return {**_db.stats(), "read_only": _READ_ONLY}
 
 
 # --- static frontend ----------------------------------------------------
-# Serve the built SPA when it exists, so one process hosts the whole app.
 _DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 if _DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
