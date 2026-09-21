@@ -3,39 +3,42 @@
 # One machine runs the API and the crawler; a volume holds the database
 # they share. That removes the constraint that made the serverless
 # deployment fail repeatedly -- there is no /tmp ceiling and no snapshot.
+#
+# Reference: https://fly.io/docs/reference/configuration/
 
-app = "valheatmap"
-primary_region = "iad"
+app = 'valheatmap'
+primary_region = 'iad'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  VALHEATMAP_DATA_DIR = "/data"
+  VALHEATMAP_DATA_DIR = '/data'
   # The API writes nothing, but it shares the file with the crawler, so it
   # must not open the database read-only.
-  VALHEATMAP_READ_ONLY = "0"
+  VALHEATMAP_READ_ONLY = '0'
 
-[mounts]
-  source = "valheatmap_data"
-  destination = "/data"
+[[mounts]]
+  source = 'valheatmap_data'
+  destination = '/data'
 
 [http_service]
   internal_port = 8000
   force_https = true
   # The crawler must keep running, so the machine never stops. This is
   # also why the cost is a flat monthly figure rather than per-request.
-  auto_stop_machines = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
   min_machines_running = 1
 
   [[http_service.checks]]
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "60s"
-    method = "GET"
-    path = "/api/health"
+    interval = '30s'
+    timeout = '5s'
+    # Generous: on boot the API opens a ~540 MB database before answering.
+    grace_period = '1m0s'
+    method = 'GET'
+    path = '/api/health'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = 'shared-cpu-1x'
+  memory = '512mb'

@@ -86,25 +86,49 @@ while the crawler fills it.
 
 ## 5. Bring your existing data across
 
-Skip the cold start by copying the database you already have:
+A fresh machine starts empty and would need most of a day to re-crawl
+what this PC already has. One command copies it over instead:
 
 ```powershell
-# a shell on the machine, with the volume mounted
-fly ssh console
-
-# in another terminal, push the file
-fly ssh sftp shell
-put data/analytics.db /data/analytics.db
+.\deploy\seed-fly.ps1
 ```
 
-For a 500 MB file, `fly sftp` can be slow; an alternative is to let the
-crawler rebuild from scratch, which takes a few hours and needs no
-transfer.
+Takes about four minutes. Measured on a 33,244-match database:
 
-After copying, restart so the API picks it up:
+| | |
+|---|---|
+| Local database | 540 MB |
+| Indexes dropped (rebuilt remotely in 43s) | 221 MB |
+| Compressed with zstd | **101 MB** |
+| Transfer at ~0.75 MB/s | 2.2 min |
+
+Uploading the file as-is would move 540 MB and take about twelve
+minutes, so the script drops the indexes first: they are 335 MB of the
+540, and recreating them on the other side is far quicker than sending
+them.
+
+It also copies `valheatmap.db`, the crawler's record of which matches it
+already has. Without it the remote crawler would re-fetch all 33,000
+matches it was just handed.
+
+What the script does, in order:
+
+1. Copies the database and drops the nine `idx_*` indexes, then vacuums
+2. Verifies integrity before sending anything
+3. Turns the remote crawler **off** — it writes to the same file, and
+   swapping it underneath a running crawler risks corruption
+4. Uploads, then unpacks and verifies again before replacing the live file
+5. Rebuilds the indexes and the facet cache
+6. Turns the crawler back on, even if an earlier step failed
+
+`data/raw/` is deliberately left behind: 12.85 GB against a 20 GB volume,
+and nothing at runtime reads it. Only `build_analytics --rebuild` needs
+the payloads, and that can run on your PC.
+
+Verify afterwards:
 
 ```powershell
-fly apps restart valheatmap
+curl https://valheatmap.fly.dev/api/health
 ```
 
 ## 6. Point the domain at it
@@ -129,6 +153,7 @@ issued, you can switch Cloudflare's proxy back on.
 | Task | Command |
 |---|---|
 | Deploy a change | `fly deploy` |
+| Seed/replace the data | `.\deploy\seed-fly.ps1` |
 | Logs (both processes) | `fly logs` |
 | Shell on the machine | `fly ssh console` |
 | Pause crawling | `fly secrets set VALHEATMAP_CRAWLER=0` (restarts the app) |
@@ -139,6 +164,23 @@ issued, you can switch Cloudflare's proxy back on.
 
 Both processes restart automatically if they exit, and the machine is
 configured never to auto-stop, because a sleeping machine is not crawling.
+
+### The facet cache
+
+`/api/facets` fills every filter dropdown, and computing it means
+grouping over all 4.9M kills -- about 45s. It is cached in the database,
+and because the crawler writes to the same file the cache would go stale
+as matches arrive. The reader treats it as stale after 500 new matches,
+so the crawler rebuilds it every 400 (`FACET_REFRESH_MATCHES` in
+`app/crawler.py`), keeping the work on the crawler's side rather than
+letting some unlucky request pay 45s mid-response.
+
+If `/api/facets` is ever slow, the cache is missing. Rebuild it:
+
+```powershell
+fly ssh console --app valheatmap
+cd /app/backend && python -c "from app.analytics_db import AnalyticsDB; from pathlib import Path; AnalyticsDB(Path('/data/analytics.db')).rebuild_facet_cache()"
+```
 
 ---
 

@@ -46,6 +46,12 @@ HENRIK_BASE = "https://api.henrikdev.xyz/valorant"
 # Queues worth collecting: these have rounds, plants and sides.
 DEFAULT_MODES = ("competitive", "unrated")
 
+# Rebuild the facet cache after this many new matches. Kept below the
+# reader's staleness tolerance (500 in AnalyticsDB._facets_are_stale) so
+# the crawler always refreshes it before a request finds it stale and
+# recomputes the whole thing mid-response.
+FACET_REFRESH_MATCHES = 400
+
 
 @dataclass
 class RateLimiter:
@@ -401,6 +407,7 @@ async def run_forever(
 
     control = control or crawler.control
     since_publish = 0
+    since_facets = 0
     cycle = 0
 
     def note(status: str) -> None:
@@ -448,6 +455,23 @@ async def run_forever(
             f"[cycle {cycle}] +{gained} this batch, {crawler.stored} this run, "
             f"db {stats.get('matches', '?')} matches / {stats.get('kills', '?')} kills"
         )
+
+        # Refresh the facet cache here rather than letting a request find
+        # it stale. When the crawler and the API share one file -- as they
+        # do on a server -- the reader's staleness check otherwise makes
+        # some unlucky request recompute over every kill, which is 40s+ at
+        # 5M rows. Doing it on this side keeps /api/facets instant.
+        since_facets += gained
+        if crawler.analytics is not None and since_facets >= FACET_REFRESH_MATCHES:
+            try:
+                started = time.monotonic()
+                crawler.analytics.rebuild_facet_cache()
+                crawler.log(
+                    f"  · facet cache rebuilt in {time.monotonic() - started:.0f}s"
+                )
+                since_facets = 0
+            except Exception as exc:  # a stale cache is not worth stopping over
+                crawler.log(f"  ! facet cache rebuild failed: {exc}")
 
         if gained == 0:
             # Frontier exhausted or upstream unhappy; back off rather than spin.

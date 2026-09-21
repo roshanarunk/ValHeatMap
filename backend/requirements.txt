@@ -3,3 +3,7 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 httpx>=0.27
+# Used by deploy/seed-fly.ps1 to unpack a database uploaded from a
+# developer machine. zstd halves gzip's output on this data, which is
+# several minutes off a transfer that runs at under 1 MB/s.
+zstandard>=0.22

@@ -436,3 +436,24 @@ def test_weapons_appear_in_facets(db: AnalyticsDB):
     # Sorted by usage, so the UI can show the common ones first.
     counts = [w["kills"] for w in facets["weapons"]]
     assert counts == sorted(counts, reverse=True)
+
+
+def test_crawler_refreshes_facets_before_the_reader_sees_them_as_stale():
+    """The crawler must rebuild the cache before a request would.
+
+    On a server both share one database file, so the cache goes stale as
+    matches arrive. If the reader's tolerance were the smaller of the two,
+    some unlucky request would recompute facets over every kill -- 45s at
+    5M rows -- instead of the crawler absorbing it between batches.
+    """
+    import inspect
+
+    from app.crawler import FACET_REFRESH_MATCHES
+
+    tolerance = inspect.signature(
+        AnalyticsDB._facets_are_stale
+    ).parameters["tolerance"].default
+    assert FACET_REFRESH_MATCHES < tolerance, (
+        f"crawler rebuilds every {FACET_REFRESH_MATCHES} matches but the reader "
+        f"calls the cache stale after {tolerance}; the crawler must go first"
+    )
