@@ -19,6 +19,8 @@ export interface MapCanvasProps {
   showCallouts?: boolean
   showSpots?: boolean
   loading?: boolean
+  /** Density percentile treated as full heat; lower = more of the map hot. */
+  percentile?: number
 }
 
 interface HoverTarget {
@@ -42,6 +44,7 @@ export function MapCanvas({
   showCallouts = false,
   showSpots = false,
   loading = false,
+  percentile = 0.995,
 }: MapCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const wrapRef = useRef<HTMLDivElement | null>(null)
@@ -126,7 +129,7 @@ export function MapCanvas({
 
     // Darken the map so the data layer reads clearly on top of it.
     ctx.save()
-    ctx.fillStyle = 'rgba(6, 10, 20, 0.45)'
+    ctx.fillStyle = 'rgba(6, 10, 20, 0.35)'
     ctx.fillRect(0, 0, px, px)
     ctx.restore()
 
@@ -136,7 +139,7 @@ export function MapCanvas({
         radius: radius * dpr,
         intensity,
         ramp,
-        saturation: 'auto',
+        percentile,
       })
     }
 
@@ -227,8 +230,8 @@ export function MapCanvas({
       ctx.restore()
     }
   }, [
-    size, points, mode, ramp, radius, intensity, kills, plants, spots,
-    anchor, highlightTraded, showCallouts, showSpots, map, imageReady,
+    size, points, mode, ramp, radius, intensity, percentile, kills, plants,
+    spots, anchor, highlightTraded, showCallouts, showSpots, map, imageReady,
   ])
 
   useEffect(() => {

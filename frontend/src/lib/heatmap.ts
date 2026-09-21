@@ -1,11 +1,18 @@
 /**
  * Canvas heatmap renderer.
  *
- * Density is accumulated into an offscreen alpha field using radial
- * gradient splats, then the field is colourised through a lookup ramp in a
- * single pass over the pixels. This is the standard two-pass approach: it
- * keeps per-point cost to one gradient fill and makes the colour ramp
- * independent of point count, so 10k kills render as fast as 100.
+ * Density is accumulated into a Float32 grid, not into canvas pixels. That
+ * matters: canvas alpha clamps at 1.0, so with ~19k kill points the hot
+ * areas saturate more than 100x over and every bit of structure is
+ * destroyed *before* it can be normalised -- the result is a white blob.
+ * Accumulating in floats keeps the full dynamic range, and the colour ramp
+ * is applied afterwards against a percentile-based ceiling.
+ *
+ * Pipeline:
+ *   1. splat each point into a float grid with a quadratic falloff kernel
+ *   2. pick a saturation ceiling from a high percentile of non-empty cells
+ *      (not the max -- one freak hotspot would flatten everything else)
+ *   3. apply a perceptual curve, then the colour ramp, into ImageData
  */
 
 import type { Vec2 } from './types'
@@ -14,36 +21,41 @@ export type RampName = 'inferno' | 'ice' | 'toxic' | 'duel'
 
 /** Control stops as [position, r, g, b]. Interpolated into a 256-entry LUT. */
 const RAMPS: Record<RampName, [number, number, number, number][]> = {
-  // Classic heat: transparent -> violet -> magenta -> amber -> white.
+  // Cool -> hot, matching the convention players expect from map overlays:
+  // sparse activity reads blue/violet, genuine hotspots read orange/white.
   inferno: [
-    [0.0, 12, 8, 38],
-    [0.25, 88, 24, 108],
-    [0.5, 186, 42, 96],
-    [0.72, 242, 118, 40],
-    [0.9, 252, 206, 96],
-    [1.0, 255, 250, 224],
+    [0.0, 38, 24, 120],
+    [0.18, 74, 42, 168],
+    [0.38, 150, 44, 148],
+    [0.58, 214, 68, 96],
+    [0.76, 246, 132, 44],
+    [0.9, 252, 198, 84],
+    [1.0, 255, 248, 220],
   ],
   ice: [
-    [0.0, 6, 18, 44],
-    [0.3, 16, 78, 130],
-    [0.6, 34, 160, 190],
-    [0.85, 122, 226, 231],
-    [1.0, 236, 253, 255],
+    [0.0, 16, 32, 92],
+    [0.25, 22, 84, 158],
+    [0.5, 32, 150, 196],
+    [0.72, 90, 206, 222],
+    [0.88, 164, 232, 238],
+    [1.0, 240, 253, 255],
   ],
   toxic: [
-    [0.0, 10, 30, 18],
-    [0.35, 22, 96, 60],
-    [0.65, 96, 178, 54],
-    [0.88, 196, 232, 74],
+    [0.0, 18, 54, 40],
+    [0.28, 26, 104, 68],
+    [0.55, 74, 168, 70],
+    [0.78, 158, 214, 66],
+    [0.92, 214, 240, 96],
     [1.0, 247, 255, 214],
   ],
-  // Single-hue Valorant red, for the "deaths" view.
+  // Single-hue red, for the "deaths" view.
   duel: [
-    [0.0, 26, 10, 18],
-    [0.35, 110, 20, 48],
-    [0.65, 198, 40, 62],
-    [0.88, 248, 110, 96],
-    [1.0, 255, 226, 214],
+    [0.0, 52, 16, 40],
+    [0.28, 116, 24, 58],
+    [0.55, 186, 42, 62],
+    [0.78, 232, 88, 70],
+    [0.92, 248, 150, 120],
+    [1.0, 255, 232, 220],
   ],
 }
 
@@ -80,27 +92,59 @@ export interface HeatmapOptions {
   points: Vec2[]
   /** Splat radius in device pixels. */
   radius: number
-  /** Peak opacity of the rendered field, 0..1. */
+  /** Overall opacity of the rendered field, 0..1. */
   intensity: number
   ramp: RampName
   /**
-   * Density at which the ramp saturates. `auto` derives it from the
-   * observed peak so sparse selections stay readable; a fixed number keeps
-   * colours comparable across different filters.
+   * Fraction of the density range treated as "full heat". Lower values make
+   * more of the map read as hot. The ceiling is taken from this percentile
+   * of non-empty cells so a single freak hotspot cannot flatten the rest.
    */
-  saturation?: number | 'auto'
+  percentile?: number
+  /** Hide the faintest cells so isolated one-off kills don't fog the map. */
+  floor?: number
 }
 
-/** Scratch canvas for the density field, reused across renders. */
-let scratch: HTMLCanvasElement | null = null
+/** Reusable buffers, keyed by size, so panning/resizing doesn't reallocate. */
+let densityBuf: Float32Array | null = null
+let densityLen = 0
+let imageCanvas: HTMLCanvasElement | null = null
 
-function getScratch(w: number, h: number): HTMLCanvasElement {
-  if (!scratch) scratch = document.createElement('canvas')
-  if (scratch.width !== w || scratch.height !== h) {
-    scratch.width = w
-    scratch.height = h
+function getDensity(len: number): Float32Array {
+  if (!densityBuf || densityLen !== len) {
+    densityBuf = new Float32Array(len)
+    densityLen = len
+  } else {
+    densityBuf.fill(0)
   }
-  return scratch
+  return densityBuf
+}
+
+/**
+ * Precomputed radial kernel: weight by squared distance, so a splat falls
+ * off smoothly to zero at its edge. Cached per radius.
+ */
+let kernel: Float32Array | null = null
+let kernelRadius = -1
+
+function getKernel(r: number): Float32Array {
+  if (kernel && kernelRadius === r) return kernel
+  const size = r * 2 + 1
+  const k = new Float32Array(size * size)
+  const r2 = r * r
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      const d2 = dx * dx + dy * dy
+      if (d2 > r2) continue
+      // (1 - (d/r)^2)^2 -- a smooth bump, cheaper than a true gaussian and
+      // visually indistinguishable once summed over many points.
+      const t = 1 - d2 / r2
+      k[(dy + r) * size + (dx + r)] = t * t
+    }
+  }
+  kernel = k
+  kernelRadius = r
+  return k
 }
 
 export function renderHeatmap(
@@ -109,64 +153,102 @@ export function renderHeatmap(
   height: number,
   opts: HeatmapOptions,
 ): void {
-  const { points, radius, intensity, ramp } = opts
-  if (width <= 0 || height <= 0) return
-  if (points.length === 0) return
+  const { points, intensity, ramp } = opts
+  if (width <= 0 || height <= 0 || points.length === 0) return
 
-  const field = getScratch(width, height)
-  const fctx = field.getContext('2d', { willReadFrequently: true })
-  if (!fctx) return
-  fctx.clearRect(0, 0, width, height)
+  // Accumulate at reduced resolution: the field is smooth by construction,
+  // so a half-scale grid is visually identical and ~4x faster to fill.
+  const scaleDown = 2
+  const gw = Math.max(1, Math.ceil(width / scaleDown))
+  const gh = Math.max(1, Math.ceil(height / scaleDown))
+  const radius = Math.max(1, Math.round(opts.radius / scaleDown))
 
-  // Pass 1: accumulate density. Each point contributes a radial falloff;
-  // overlapping splats sum via 'lighter' to build the density field.
-  fctx.globalCompositeOperation = 'lighter'
-  // Per-splat alpha is low so that density, not a single point, drives
-  // saturation. Scaled up slightly for sparse sets so they stay visible.
-  const splatAlpha = points.length > 400 ? 0.28 : points.length > 120 ? 0.42 : 0.6
-  for (const p of points) {
-    const cx = p.x * width
-    const cy = p.y * height
-    if (cx < -radius || cy < -radius || cx > width + radius || cy > height + radius) continue
-    const g = fctx.createRadialGradient(cx, cy, 0, cx, cy, radius)
-    g.addColorStop(0, `rgba(255,255,255,${splatAlpha})`)
-    g.addColorStop(0.45, `rgba(255,255,255,${splatAlpha * 0.5})`)
-    g.addColorStop(1, 'rgba(255,255,255,0)')
-    fctx.fillStyle = g
-    fctx.beginPath()
-    fctx.arc(cx, cy, radius, 0, Math.PI * 2)
-    fctx.fill()
+  const density = getDensity(gw * gh)
+  const k = getKernel(radius)
+  const ksize = radius * 2 + 1
+
+  // --- pass 1: accumulate ------------------------------------------------
+  for (let i = 0; i < points.length; i++) {
+    const px = Math.round(points[i].x * gw)
+    const py = Math.round(points[i].y * gh)
+    if (px < -radius || py < -radius || px > gw + radius || py > gh + radius) continue
+
+    const x0 = Math.max(0, px - radius)
+    const x1 = Math.min(gw - 1, px + radius)
+    const y0 = Math.max(0, py - radius)
+    const y1 = Math.min(gh - 1, py + radius)
+
+    for (let y = y0; y <= y1; y++) {
+      const krow = (y - py + radius) * ksize
+      const drow = y * gw
+      for (let x = x0; x <= x1; x++) {
+        const w = k[krow + (x - px + radius)]
+        if (w > 0) density[drow + x] += w
+      }
+    }
   }
-  fctx.globalCompositeOperation = 'source-over'
 
-  // Pass 2: colourise the field through the ramp.
-  const img = fctx.getImageData(0, 0, width, height)
+  // --- pass 2: choose a ceiling -----------------------------------------
+  // Sampling a high percentile of *non-empty* cells keeps the scale tied to
+  // typical hotspot density rather than to the single hottest pixel.
+  const percentile = opts.percentile ?? 0.995
+  let ceiling = 0
+  {
+    const sample: number[] = []
+    // Stride-sample for speed; the field is smooth so this is representative.
+    const stride = Math.max(1, Math.floor(density.length / 40000))
+    for (let i = 0; i < density.length; i += stride) {
+      if (density[i] > 0) sample.push(density[i])
+    }
+    if (sample.length === 0) return
+    sample.sort((a, b) => a - b)
+    ceiling = sample[Math.min(sample.length - 1, Math.floor(sample.length * percentile))]
+    // Guard against a degenerate field where everything is equal.
+    if (!(ceiling > 0)) ceiling = sample[sample.length - 1] || 1
+  }
+
+  // --- pass 3: colourise -------------------------------------------------
+  if (!imageCanvas) imageCanvas = document.createElement('canvas')
+  if (imageCanvas.width !== gw || imageCanvas.height !== gh) {
+    imageCanvas.width = gw
+    imageCanvas.height = gh
+  }
+  const ictx = imageCanvas.getContext('2d')
+  if (!ictx) return
+  const img = ictx.createImageData(gw, gh)
   const data = img.data
   const lut = buildLut(ramp)
+  const floor = opts.floor ?? 0.04
 
-  let peak = 0
-  if (opts.saturation === 'auto' || opts.saturation === undefined) {
-    for (let i = 3; i < data.length; i += 4) if (data[i] > peak) peak = data[i]
-  } else {
-    peak = Math.max(1, Math.min(255, opts.saturation * 255))
-  }
-  if (peak <= 0) return
-  const scale = 255 / peak
+  for (let i = 0; i < density.length; i++) {
+    const raw = density[i]
+    if (raw <= 0) continue
+    let t = raw / ceiling
+    if (t > 1) t = 1
+    if (t < floor) continue
 
-  for (let i = 0; i < data.length; i += 4) {
-    const a = data[i + 3]
-    if (a === 0) continue
-    const v = Math.min(255, a * scale) | 0
-    const o = v * 3
-    data[i] = lut[o]
-    data[i + 1] = lut[o + 1]
-    data[i + 2] = lut[o + 2]
-    // Fade the low end so the field dissolves into the map rather than
-    // ending in a hard edge.
-    data[i + 3] = Math.min(255, v * intensity * 1.6)
+    // Perceptual curve: sqrt lifts the mid-range so moderately busy areas
+    // stay visible instead of collapsing into the background.
+    const shaped = Math.sqrt(t)
+    const idx = (shaped * 255) | 0
+    const o = idx * 3
+    const p = i * 4
+    data[p] = lut[o]
+    data[p + 1] = lut[o + 1]
+    data[p + 2] = lut[o + 2]
+    // Fade in the low end so the field dissolves into the map rather than
+    // ending on a hard edge, and never fully hide the base map.
+    const alpha = Math.min(1, shaped * 1.35) * intensity
+    data[p + 3] = (alpha * 235) | 0
   }
-  fctx.putImageData(img, 0, 0)
-  ctx.drawImage(field, 0, 0)
+  ictx.putImageData(img, 0, 0)
+
+  // Scale the reduced-resolution field back up; smoothing hides the grid.
+  ctx.save()
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(imageCanvas, 0, 0, gw, gh, 0, 0, width, height)
+  ctx.restore()
 }
 
 /** Discrete point rendering, used for the "duel"/scatter views. */
@@ -223,4 +305,15 @@ export function winRateColor(rate: number, alpha = 1): string {
   const g = t < 0.5 ? 122 + (160 - 122) * (t / 0.5) : 160 + (222 - 160) * ((t - 0.5) / 0.5)
   const b = t < 0.5 ? 220 - (220 - 150) * (t / 0.5) : 150 - (150 - 120) * ((t - 0.5) / 0.5)
   return `rgba(${r | 0}, ${g | 0}, ${b | 0}, ${alpha})`
+}
+
+/** Sample the ramp for UI legends, as CSS colour stops. */
+export function rampStops(name: RampName, steps = 12): string[] {
+  const lut = buildLut(name)
+  const out: string[] = []
+  for (let i = 0; i < steps; i++) {
+    const idx = Math.round((i / (steps - 1)) * 255) * 3
+    out.push(`rgb(${lut[idx]}, ${lut[idx + 1]}, ${lut[idx + 2]})`)
+  }
+  return out
 }

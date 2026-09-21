@@ -3,6 +3,7 @@ import { MapCanvas, type RenderMode } from './components/MapCanvas'
 import { TimeSlider } from './components/TimeSlider'
 import { Bar, ChipGroup, Empty, Field, Panel, Slider, StatTile, Toggle } from './components/Controls'
 import { ImportPanel } from './components/ImportPanel'
+import { HeatLegend } from './components/HeatLegend'
 import { InsightsView } from './components/InsightsView'
 import { api, ApiError, type QueryFilters } from './lib/api'
 import type { RampName } from './lib/heatmap'
@@ -54,8 +55,11 @@ export default function App() {
   const [renderMode, setRenderMode] = useState<RenderMode>('heatmap')
   const [anchor, setAnchor] = useState<'victim' | 'killer'>('victim')
   const [ramp, setRamp] = useState<RampName>('inferno')
-  const [radius, setRadius] = useState(26)
-  const [intensity, setIntensity] = useState(0.85)
+  // null = follow the auto-scaled default; a number means the user has
+  // taken manual control of the slider.
+  const [radiusOverride, setRadiusOverride] = useState<number | null>(null)
+  const [intensity, setIntensity] = useState(0.95)
+  const [percentile, setPercentile] = useState(0.985)
   const [showCallouts, setShowCallouts] = useState(false)
   const [clusterRadius, setClusterRadius] = useState(800)
 
@@ -185,6 +189,20 @@ export default function App() {
   const shownKills =
     view === 'utility' ? (utility?.points ?? []) : view === 'kills' ? (kills?.points ?? []) : []
   const stats = view === 'utility' ? utility?.stats : kills?.stats
+
+  // The right blur depends on how much data is on screen: a handful of
+  // points needs a wide splat to read at all, while thousands need a tight
+  // one or every distinct angle merges into a single mass.
+  const autoRadius = useMemo(() => {
+    const n = shownKills.length
+    if (n === 0) return 14
+    if (n < 60) return 24
+    if (n < 250) return 18
+    if (n < 1200) return 14
+    if (n < 5000) return 11
+    return 9
+  }, [shownKills.length])
+  const radius = radiusOverride ?? autoRadius
 
   const resetFilters = () => {
     setAgentFilter([])
@@ -401,7 +419,14 @@ export default function App() {
                     showCallouts={showCallouts}
                     showSpots={view === 'plants'}
                     loading={loading}
+                    percentile={percentile}
                   />
+                  {view !== 'plants' && renderMode === 'heatmap' && (
+                    <HeatLegend
+                      ramp={view === 'utility' ? 'toxic' : ramp}
+                      label={anchor === 'killer' ? 'Kills from here' : 'Deaths here'}
+                    />
+                  )}
                 </div>
 
                 <div className="stage__side">
@@ -438,7 +463,20 @@ export default function App() {
                         />
                       </div>
 
-                      <Panel title="Display">
+                      <Panel
+                        title="Display"
+                        actions={
+                          radiusOverride !== null ? (
+                            <button
+                              type="button"
+                              className="linkbtn"
+                              onClick={() => setRadiusOverride(null)}
+                            >
+                              Auto size
+                            </button>
+                          ) : undefined
+                        }
+                      >
                         <Field label="Render">
                           <ChipGroup
                             options={[
@@ -474,15 +512,35 @@ export default function App() {
                             />
                           </Field>
                         )}
-                        <Slider label="Blur radius" min={8} max={60} value={radius} onChange={setRadius} />
                         <Slider
-                          label="Intensity"
-                          min={0.2}
-                          max={1.4}
+                          label="Spot size"
+                          min={5}
+                          max={40}
+                          value={radius}
+                          onChange={setRadiusOverride}
+                          format={(v) =>
+                            radiusOverride === null ? `${v}px · auto` : `${v}px`
+                          }
+                        />
+                        <Slider
+                          label="Hotspot focus"
+                          min={0.9}
+                          max={1}
+                          step={0.005}
+                          value={percentile}
+                          onChange={setPercentile}
+                          format={(v) =>
+                            v >= 0.999 ? 'Peaks only' : v >= 0.985 ? 'Balanced' : 'Broad'
+                          }
+                        />
+                        <Slider
+                          label="Opacity"
+                          min={0.3}
+                          max={1}
                           step={0.05}
                           value={intensity}
                           onChange={setIntensity}
-                          format={(v) => v.toFixed(2)}
+                          format={(v) => `${Math.round(v * 100)}%`}
                         />
                         <div className="togglegrid">
                           <Toggle

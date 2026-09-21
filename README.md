@@ -18,6 +18,16 @@ agent, side, round window and weapon. A dual-handle time slider scrubs the
 round, with a kill-density strip so you can see when the fights happen.
 Plot either where people died or where the killers stood.
 
+Density is accumulated into a float grid rather than into canvas pixels.
+That distinction matters at scale: canvas alpha clamps at 1.0, so with
+~20k points the busy areas saturate more than 100x over and every bit of
+structure is destroyed *before* it can be normalised — the result is a
+featureless white blob. Accumulating in floats preserves the full range,
+and the colour scale is then set from a high percentile of the density
+(not the maximum, which a single freak hotspot would dominate). The splat
+radius also scales with how many points are on screen, since a blur that
+suits 50 kills merges 20,000 of them into one mass.
+
 **Trade detection** — a death counts as traded when a teammate kills the
 killer within a time window *and* near where the death happened. Both the
 window (default 3s) and the distance (default 30m) are adjustable in the UI,

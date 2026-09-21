@@ -457,3 +457,16 @@ input:focus, select:focus { outline: none; border-color: rgba(255, 70, 85, 0.55)
 }
 .dataset strong { color: var(--text); font-variant-numeric: tabular-nums; }
 .dataset__dim { color: var(--text-faint); font-size: 10.5px; }
+
+/* --- heatmap legend --------------------------------------------------- */
+.heatlegend {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-top: 10px; padding: 0 2px;
+}
+.heatlegend__label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--text-faint);
+}
+.heatlegend__scale { display: flex; align-items: center; gap: 7px; flex: 1; max-width: 260px; }
+.heatlegend__scale span { font-size: 10.5px; color: var(--text-faint); }
+.heatlegend__scale i { flex: 1; height: 7px; border-radius: 4px; display: block; }
