@@ -70,7 +70,9 @@ def _point(raw: Any) -> Point | None:
     x, y = raw.get("x"), raw.get("y")
     if x is None or y is None:
         return None
-    return Point(float(x), float(y))
+    point = Point(float(x), float(y))
+    # Drop Riot's out-of-world sentinel rather than plotting it.
+    return point if point.is_plausible else None
 
 
 def _normalise_mode(game_mode: str) -> tuple[str, str]:
@@ -266,7 +268,7 @@ def parse(data: dict[str, Any], source: str = "riot") -> Match:
                         time_in_match_ms=_match_time(k),
                         killer_puuid=killer_puuid,
                         victim_puuid=victim,
-                        victim_location=_point(k.get("victimLocation")) or Point(0.0, 0.0),
+                        victim_location=_point(k.get("victimLocation")),
                         killer_location=killer_loc,
                         assistants=[a for a in (k.get("assistants") or ()) if isinstance(a, str)],
                         player_locations=locs,

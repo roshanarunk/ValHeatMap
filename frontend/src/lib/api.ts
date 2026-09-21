@@ -89,7 +89,36 @@ export interface QueryFilters {
   trade_radius?: number
 }
 
+export interface DatasetStats {
+  matches: number
+  kills: number
+  plants: number
+  by_map: { map_name: string; matches: number; kills: number }[]
+  players_known: number
+  players_pending: number
+  queue: Record<string, number>
+  loaded_in_memory: number
+}
+
+export interface CrawlResult {
+  stored: number
+  skipped: number
+  errors: number
+  requests: number
+  elapsed_s: number
+  rate_per_min: number
+  dataset: DatasetStats
+}
+
 export const api = {
+  dataset: () => get<DatasetStats>('/api/dataset'),
+  reloadDataset: () => post<{ loaded: number }>('/api/dataset/reload'),
+  crawl: (matches: number, region?: string, seed?: string) => {
+    const params = new URLSearchParams({ matches: String(matches) })
+    if (region) params.set('region', region)
+    if (seed) params.set('seed', seed)
+    return post<CrawlResult>(`/api/crawl?${params.toString()}`)
+  },
   health: () => get<{ status: string; matches: number; live_sources: Record<string, boolean> }>('/api/health'),
   maps: () => get<{ maps: MapRow[] }>('/api/maps'),
   matches: () => get<{ matches: MatchSummary[] }>('/api/matches'),

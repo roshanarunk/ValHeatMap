@@ -156,7 +156,7 @@ def enrich(
                     continue
                 if kill.victim_team and later.killer_team != kill.victim_team:
                     continue
-                if trade_radius > 0:
+                if trade_radius > 0 and kill.victim_location is not None:
                     ref = later.victim_location or kill.killer_location
                     if ref is not None and _distance(ref, kill.victim_location) > trade_radius:
                         continue
@@ -176,7 +176,11 @@ def enrich(
                     continue
                 if trade_radius > 0:
                     ref = kill.victim_location
-                    if _distance(ref, earlier.victim_location) > trade_radius:
+                    if (
+                        ref is not None
+                        and earlier.victim_location is not None
+                        and _distance(ref, earlier.victim_location) > trade_radius
+                    ):
                         continue
                 trade_kill = True
                 latency = dt
@@ -277,6 +281,10 @@ def to_points(
             "post_plant": ek.post_plant,
             "round_won": ek.round_won,
         }
+        if k.victim_location is None:
+            # No usable death position; the kill still counts in the
+            # summaries but there is nothing to plot.
+            continue
         vx, vy = map_info.to_minimap(k.victim_location.x, k.victim_location.y)
         entry["victim_pos"] = {"x": vx, "y": vy}
         if k.killer_location is not None:

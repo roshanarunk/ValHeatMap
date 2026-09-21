@@ -24,8 +24,16 @@ DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "matches"
 
 @pytest.fixture(scope="session")
 def loaded_store() -> MatchStore:
+    """Only the bundled sample matches.
+
+    Deliberately bypasses `load_local()`, which also pulls in whatever the
+    crawler has stored -- the tests assert on a fixed, known corpus and must
+    not change meaning as the real dataset grows.
+    """
     s = MatchStore(DATA_DIR)
-    s.load_local()
+    for path in sorted(DATA_DIR.glob("*.json")):
+        s._load_file(path, "local")
+    s._loaded = True
     return s
 
 
@@ -424,3 +432,50 @@ def test_henrik_plant_carries_round_outcome():
 def test_henrik_accepts_inner_object_without_envelope():
     inner = _henrik_payload()["data"]
     assert parse_any(inner).meta.match_id == "henrik-1"
+
+
+# --- out-of-world sentinels ---------------------------------------------
+def test_sentinel_coordinates_are_rejected():
+    """Riot writes ~-49800 when a position is unknown; it is not a location."""
+    from app.models import WORLD_LIMIT
+    from app.sources.riot import _point
+
+    assert _point({"x": 1000, "y": 2000}) == Point(1000.0, 2000.0)
+    assert _point({"x": -49794, "y": -856}) is None
+    assert _point({"x": WORLD_LIMIT + 1, "y": 0}) is None
+    # A legitimate position at the edge of the world survives.
+    assert _point({"x": WORLD_LIMIT, "y": 0}) is not None
+
+
+def test_kill_without_position_is_counted_but_not_plotted():
+    """It still belongs in the stats; it just cannot go on the map."""
+    meta = MatchMeta(
+        match_id="s", map_id="/Game/Maps/Ascent/Ascent", map_name="Ascent",
+        mode="standard", mode_raw="Bomb", queue="unrated", started_at=0, game_length_ms=0,
+    )
+    players = [
+        Player(puuid="A", name="A", tag="1", team="Red", agent="Jett", agent_id=""),
+        Player(puuid="B", name="B", tag="2", team="Blue", agent="Sage", agent_id=""),
+    ]
+    placed = Kill(
+        round_num=0, time_in_round_ms=1000, time_in_match_ms=1000,
+        killer_puuid="A", victim_puuid="B",
+        victim_location=Point(100, 100), killer_location=Point(200, 200),
+        killer_team="Red", victim_team="Blue",
+    )
+    unplaced = Kill(
+        round_num=0, time_in_round_ms=2000, time_in_match_ms=2000,
+        killer_puuid="A", victim_puuid="B",
+        victim_location=None, killer_location=None,
+        killer_team="Red", victim_team="Blue",
+    )
+    match = Match(
+        meta=meta, players=players,
+        rounds=[Round(number=0, winning_team="Red", result="Elimination",
+                      kills=[placed, unplaced])],
+        teams={"Red": True, "Blue": False},
+    )
+    enriched = enrich(match)
+    assert summarise(enriched, match)["total"] == 2
+    from app.analytics.kills import to_points
+    assert len(to_points(enriched, get_map("/Game/Maps/Ascent/Ascent"))) == 1

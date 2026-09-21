@@ -53,7 +53,9 @@ def _point(raw: Any) -> Point | None:
     x, y = raw.get("x"), raw.get("y")
     if x is None or y is None:
         return None
-    return Point(float(x), float(y))
+    point = Point(float(x), float(y))
+    # Drop Riot's out-of-world sentinel rather than plotting it.
+    return point if point.is_plausible else None
 
 
 def _player_ref(raw: Any) -> tuple[str, str]:
@@ -255,7 +257,7 @@ def parse(data: dict[str, Any], source: str = "henrik") -> Match:
                 time_in_match_ms=int(k.get("time_in_match_in_ms") or 0),
                 killer_puuid=killer_puuid,
                 victim_puuid=victim_puuid,
-                victim_location=_point(k.get("location")) or Point(0.0, 0.0),
+                victim_location=_point(k.get("location")),
                 killer_location=killer_loc,
                 assistants=[_player_ref(a)[0] for a in (k.get("assistants") or ())],
                 player_locations=locs,

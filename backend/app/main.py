@@ -6,8 +6,11 @@ filtering, utility-damage maps, plant heatmaps and plant-spot win rates.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,8 +29,14 @@ from .analytics.kills import (
 )
 from .models import DamageType, Match
 from .reference import agents_by_id, get_map, weapons_by_id
+from .config import load_env
+from .crawler import Crawler
+from .db import db as match_db
 from .sources import clients
 from .store import parse_any, store
+
+# Pick up HENRIK_API_KEY / RIOT_API_KEY from .env before anything reads them.
+load_env()
 
 app = FastAPI(title="ValHeatMap API", version="1.0.0")
 
@@ -265,6 +274,26 @@ async def insights_endpoint(
 
 
 # --- ingestion ----------------------------------------------------------
+def _persist(match: Match, payload: dict[str, Any]) -> None:
+    """Index the match and keep its raw payload, so it survives a restart."""
+    store.add(match)
+    match_db.save_match(
+        match.meta.match_id,
+        payload,
+        {
+            "map_name": match.meta.map_name,
+            "mode": match.meta.mode,
+            "queue": match.meta.queue,
+            "region": match.meta.region,
+            "started_at": match.meta.started_at,
+            "rounds": len(match.rounds),
+            "kills": len(match.kills),
+            "plants": len(match.plants),
+            "source": match.meta.source,
+        },
+    )
+
+
 @app.post("/api/import/upload")
 async def import_upload(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
     """Ingest a raw match JSON (Riot or HenrikDev shape) into the store."""
@@ -274,7 +303,7 @@ async def import_upload(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         raise HTTPException(400, str(exc)) from exc
     if not match.meta.match_id:
         raise HTTPException(400, "Match payload has no match id.")
-    store.add(match)
+    _persist(match, payload)
     return {"imported": match.meta.match_id, "match": match.to_summary()}
 
 
@@ -284,7 +313,7 @@ async def import_henrik(match_id: str, region: str | None = None) -> dict[str, A
     match = parse_any(payload, source="henrik")
     if not match.meta.match_id:
         match.meta.match_id = match_id
-    store.add(match)
+    _persist(match, payload)
     return {"imported": match.meta.match_id, "match": match.to_summary()}
 
 
@@ -294,7 +323,7 @@ async def import_riot(match_id: str, region: str | None = None) -> dict[str, Any
     match = parse_any(payload, source="riot")
     if not match.meta.match_id:
         match.meta.match_id = match_id
-    store.add(match)
+    _persist(match, payload)
     return {"imported": match.meta.match_id, "match": match.to_summary()}
 
 
@@ -312,11 +341,59 @@ async def import_henrik_player(
         except ValueError:
             continue
         if match.meta.match_id:
-            store.add(match)
+            _persist(match, entry)
             imported.append(match.meta.match_id)
     if not imported:
         raise HTTPException(422, "No usable matches in the upstream response.")
     return {"imported": imported, "count": len(imported)}
+
+
+@app.get("/api/dataset")
+async def dataset_stats() -> dict[str, Any]:
+    """Size and composition of the stored dataset, plus crawl progress."""
+    stats = match_db.stats()
+    stats["loaded_in_memory"] = len(store.all())
+    return stats
+
+
+@app.post("/api/dataset/reload")
+async def dataset_reload() -> dict[str, Any]:
+    """Re-read matches from disk to pick up new crawler output."""
+    count = store.reload()
+    return {"loaded": count}
+
+
+@app.post("/api/crawl")
+async def start_crawl(
+    matches: int = Query(50, ge=1, le=5000),
+    region: str | None = None,
+    seed: str | None = None,
+) -> dict[str, Any]:
+    """Run a crawl to grow the dataset.
+
+    Blocks until the target is met; with a 90 req/min key, 50 matches takes
+    roughly a minute. For large crawls prefer the CLI:
+    `python -m app.crawler --matches 2000`.
+    """
+    key = clients.henrik_key()
+    if not key:
+        raise HTTPException(400, "HENRIK_API_KEY is not set on the server.")
+
+    crawler = Crawler(
+        api_key=key,
+        region=region or clients.DEFAULT_REGION,
+        rate_limit=int(os.environ.get("HENRIK_RATE_LIMIT", 90)),
+        verbose=False,
+    )
+    if seed and "#" in seed:
+        name, _, tag = seed.partition("#")
+        async with httpx.AsyncClient(timeout=30) as client:
+            await crawler.seed_from_riot_id(client, name, tag)
+
+    result = await crawler.run(target_matches=matches)
+    # Make the new matches visible without a restart.
+    store.reload()
+    return {**result, "dataset": match_db.stats()}
 
 
 # --- static frontend ----------------------------------------------------

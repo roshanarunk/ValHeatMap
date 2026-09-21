@@ -42,10 +42,21 @@ class AbilitySlot(str, Enum):
     PASSIVE = "passive"
 
 
+# Riot writes far-out-of-world coordinates (observed around -49800) when a
+# position is unknown -- a player who fell out of the map, or died in a state
+# the server did not track. Real map extents are well inside +/-20000, so
+# anything beyond this is a sentinel rather than a location.
+WORLD_LIMIT = 30_000.0
+
+
 @dataclass(frozen=True, slots=True)
 class Point:
     x: float
     y: float
+
+    @property
+    def is_plausible(self) -> bool:
+        return abs(self.x) <= WORLD_LIMIT and abs(self.y) <= WORLD_LIMIT
 
     def as_dict(self) -> dict[str, float]:
         return {"x": self.x, "y": self.y}
@@ -90,7 +101,8 @@ class Kill:
     time_in_match_ms: int
     killer_puuid: str
     victim_puuid: str
-    victim_location: Point
+    # None when Riot reported an out-of-world sentinel for the death.
+    victim_location: Point | None
     # Riot does not give the killer's position directly; it is recovered from
     # the `player_locations` snapshot taken at the moment of the kill. It can
     # legitimately be absent (e.g. the killer died in the same tick).

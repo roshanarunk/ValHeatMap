@@ -154,7 +154,7 @@ def weapon_report(kills: Sequence[EnrichedKill]) -> dict[str, Any]:
         row["kills"] += 1
         if ek.traded:
             row["traded"] += 1
-        if k.killer_location is not None:
+        if k.killer_location is not None and k.victim_location is not None:
             row["distance_sum"] += math.hypot(
                 k.killer_location.x - k.victim_location.x,
                 k.killer_location.y - k.victim_location.y,
@@ -177,7 +177,7 @@ def duel_distance(kills: Sequence[EnrichedKill]) -> dict[str, Any]:
     values: list[float] = []
     for ek in kills:
         k = ek.kill
-        if k.killer_location is None:
+        if k.killer_location is None or k.victim_location is None:
             continue
         d = math.hypot(
             k.killer_location.x - k.victim_location.x,

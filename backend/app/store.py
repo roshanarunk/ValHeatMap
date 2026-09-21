@@ -35,27 +35,51 @@ class MatchStore:
         self._loaded = False
 
     # --- loading -------------------------------------------------------
+    def _load_file(self, path: Path, source: str) -> bool:
+        try:
+            with path.open(encoding="utf-8") as fh:
+                payload = json.load(fh)
+            match = parse_any(payload, source=source)
+            if not match.meta.match_id:
+                # Fall back to the filename so bundled samples without a
+                # match id still get a stable, linkable key.
+                match.meta.match_id = path.stem
+            self.add(match)
+            return True
+        except (json.JSONDecodeError, ValueError, KeyError, OSError) as exc:
+            print(f"[store] skipping {path.name}: {exc}")
+            return False
+
     def load_local(self) -> int:
-        """Ingest every JSON file in the data directory. Idempotent."""
-        if not self.data_dir.exists():
-            self._loaded = True
-            return 0
+        """Ingest bundled sample matches plus everything the crawler stored.
+
+        Both live in the same in-memory index, so an analysis can span a
+        bundled match and thousands of crawled ones.
+        """
         count = 0
-        for path in sorted(self.data_dir.glob("*.json")):
-            try:
-                with path.open(encoding="utf-8") as fh:
-                    payload = json.load(fh)
-                match = parse_any(payload, source="local")
-                if not match.meta.match_id:
-                    # Fall back to the filename so bundled samples without a
-                    # match id still get a stable, linkable key.
-                    match.meta.match_id = path.stem
-                self.add(match)
-                count += 1
-            except (json.JSONDecodeError, ValueError, KeyError) as exc:
-                print(f"[store] skipping {path.name}: {exc}")
+        if self.data_dir.exists():
+            for path in sorted(self.data_dir.glob("*.json")):
+                count += self._load_file(path, "local")
+
+        # Crawled matches: indexed in SQLite, payloads on disk.
+        try:
+            from .db import db as match_db
+
+            for path in match_db.iter_payload_paths():
+                if path.exists():
+                    count += self._load_file(path, "henrik")
+        except Exception as exc:  # pragma: no cover - DB is optional
+            print(f"[store] crawled matches unavailable: {exc}")
+
         self._loaded = True
         return count
+
+    def reload(self) -> int:
+        """Re-read everything from disk, picking up new crawler output."""
+        with self._lock:
+            self._matches.clear()
+            self._loaded = False
+        return self.load_local()
 
     def ensure_loaded(self) -> None:
         if not self._loaded:

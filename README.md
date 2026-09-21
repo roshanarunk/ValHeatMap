@@ -75,24 +75,72 @@ cd ../backend && python -m uvicorn app.main:app --port 8000
 Six example matches (Ascent, Bind, Fracture, Haven, Icebox, Split) are
 bundled in `data/matches/`, so the app is useful with no API key at all.
 
-## Adding your own matches
+## Building a dataset
 
-Three routes, all in the **Add matches** panel:
+Six example matches are bundled, but the stats that make this project
+worthwhile — plant-spot win rates, trade economy — need hundreds of matches
+before they mean anything. One Haven match gives you 9 plants; thirty give
+you 113, and only then can you say C site wins 92% of planted rounds and B
+site 71% with any confidence.
 
-1. **Upload** a raw match JSON — Riot `match-v1` or HenrikDev v4 shape, both
-   auto-detected. No key required.
-2. **HenrikDev API** — set `HENRIK_API_KEY` and fetch by Riot ID
-   (`Name#TAG`) or match id. Keys: <https://api.henrikdev.xyz/dashboard>
-3. **Official Riot API** — set `RIOT_API_KEY`. Wired up and ready for when a
-   production `match-v1` key is available.
+Put your key in a `.env` file at the repo root (it is gitignored):
 
-```bash
-export HENRIK_API_KEY=...     # or RIOT_API_KEY=...
-export RIOT_REGION=na         # na | eu | ap | kr | latam | br
+```ini
+HENRIK_API_KEY=HDEV-your-key-here
+HENRIK_RATE_LIMIT=90          # requests/min your key allows
+RIOT_REGION=na                # na | eu | ap | kr | latam | br
 ```
 
-Matches from every source land in the same store, so a heatmap can span a
-bundled match, one pulled live and one uploaded by hand.
+Then crawl:
+
+```bash
+cd backend
+python -m app.crawler --matches 2000
+```
+
+The crawler snowballs. It seeds from the ranked leaderboard, fetches each
+player's recent matches, and adds all ten players from every match to the
+frontier — so the pool of players to crawl grows faster than it drains. One
+matchlist request returns several complete matches, which is why ~8 requests
+can yield 18 matches.
+
+Pacing comes from the API's own `x-ratelimit-*` response headers rather than
+a hardcoded rate, so it adapts to your key's tier and backs off before a 429
+rather than after one.
+
+Useful flags:
+
+```bash
+python -m app.crawler --matches 500 --region eu
+python -m app.crawler --seed "Name#TAG"       # start from a specific player
+python -m app.crawler --modes competitive     # skip unrated
+```
+
+### Other ways in
+
+All in the **Add matches** panel:
+
+- **Crawl** — run a bounded crawl from the UI.
+- **Riot ID** — pull one player's recent matches.
+- **Match ID** — fetch a single match from either API.
+- **Upload** — drop a raw match JSON, Riot `match-v1` or HenrikDev v4 shape,
+  auto-detected. No key required.
+
+Set `RIOT_API_KEY` to use the official API instead; it is wired up and ready
+for a production `match-v1` key.
+
+### Where it all goes
+
+```
+data/valheatmap.db     SQLite index: matches, players, crawl frontier
+data/raw/<id>.json     the raw upstream payload for each match
+data/matches/          the bundled sample matches
+```
+
+The raw payload is the source of truth. Keeping it means a change to the
+analytics — a new stat, a parser fix — is a re-read of local files rather
+than re-fetching thousands of matches you have already paid rate limit for.
+Imports and crawled matches both persist, so nothing is lost on restart.
 
 ## How it works
 
@@ -138,8 +186,10 @@ are pub games where deaths often go unpunished — not a bug.
 cd backend && python -m pytest
 ```
 
-32 tests covering both source adapters, the coordinate transform, trade
-detection windows and radii, plant clustering, filtering and mode awareness.
+48 tests covering both source adapters, the coordinate transform, trade
+detection windows and radii, plant clustering, filtering, mode awareness,
+persistence, crawler dedup and rate-limit handling. The ingestion tests run
+against a temporary database with no network access.
 
 ## Reference data
 
@@ -156,6 +206,9 @@ cd backend && python -m app.refresh_reference
 ```
 backend/app/
   models.py              canonical match model
+  db.py                  SQLite index + raw payload storage
+  crawler.py             snowball dataset builder
+  config.py              .env loading
   reference.py           maps/agents/weapons + coordinate transform
   store.py               match loading, caching, multi-match selection
   sources/               riot.py, henrik.py, clients.py

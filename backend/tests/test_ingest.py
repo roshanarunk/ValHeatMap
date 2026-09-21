@@ -1,0 +1,247 @@
+"""Tests for persistence and the crawler.
+
+Everything here runs against a temporary database and fake HTTP responses --
+no network, no API key, no touching the real dataset.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+
+from app.crawler import Crawler, RateLimiter
+from app.db import Database
+from app.store import MatchStore
+
+
+@pytest.fixture()
+def tmp_db(tmp_path: Path) -> Database:
+    return Database(path=tmp_path / "test.db", raw_dir=tmp_path / "raw")
+
+
+def _match_payload(match_id: str, map_name: str = "Ascent") -> dict:
+    """A minimal HenrikDev v4 match with one plotted kill and one plant."""
+    def ref(puuid: str, team: str) -> dict:
+        return {"puuid": puuid, "name": puuid, "tag": "1", "team": team}
+
+    return {
+        "metadata": {
+            "match_id": match_id,
+            "map": {"id": "m", "name": map_name},
+            "game_length_in_ms": 1000,
+            "started_at": "2024-05-01T10:00:00Z",
+            "queue": {"id": "competitive", "name": "Competitive", "mode_type": "Standard"},
+            "region": "na",
+        },
+        "players": [
+            {
+                "puuid": "p-atk", "name": "Atk", "tag": "1", "team_id": "red",
+                "agent": {"id": "", "name": "Jett"},
+                "stats": {"kills": 1, "deaths": 0, "assists": 0, "score": 1,
+                          "headshots": 0, "bodyshots": 1, "legshots": 0,
+                          "damage": {"dealt": 150}},
+            },
+            {
+                "puuid": "p-def", "name": "Def", "tag": "2", "team_id": "blue",
+                "agent": {"id": "", "name": "Sage"},
+                "stats": {"kills": 0, "deaths": 1, "assists": 0, "score": 0,
+                          "headshots": 0, "bodyshots": 0, "legshots": 0,
+                          "damage": {"dealt": 0}},
+            },
+        ],
+        "teams": [
+            {"team_id": "red", "won": True, "rounds": {"won": 13, "lost": 2}},
+            {"team_id": "blue", "won": False, "rounds": {"won": 2, "lost": 13}},
+        ],
+        "kills": [
+            {
+                "round": 0, "time_in_round_in_ms": 20000, "time_in_match_in_ms": 20000,
+                "killer": ref("p-atk", "red"), "victim": ref("p-def", "blue"),
+                "assistants": [], "location": {"x": 1000, "y": 2000},
+                "weapon": {"id": "w", "name": "Vandal", "type": "Weapon"},
+                "secondary_fire_mode": False,
+                "player_locations": [
+                    {"player": ref("p-atk", "red"), "view_radians": 0.0,
+                     "location": {"x": 1200, "y": 2200}},
+                ],
+            },
+        ],
+        "rounds": [
+            {
+                "id": 0, "result": "Detonate", "ceremony": "", "winning_team": "red",
+                "plant": {
+                    "round_time_in_ms": 40000, "site": "A",
+                    "location": {"x": 900, "y": 1800},
+                    "player": ref("p-atk", "red"), "player_locations": [],
+                },
+                "defuse": None, "stats": [],
+            },
+        ],
+    }
+
+
+# --- database -----------------------------------------------------------
+def test_saves_and_indexes_a_match(tmp_db: Database):
+    payload = _match_payload("m-1")
+    path = tmp_db.save_match("m-1", payload, {"map_name": "Ascent", "mode": "standard", "kills": 1})
+    assert path.exists()
+    assert tmp_db.has_match("m-1")
+    assert tmp_db.match_count() == 1
+    # The raw payload round-trips unchanged: it is the source of truth.
+    assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_saving_twice_does_not_duplicate(tmp_db: Database):
+    for _ in range(3):
+        tmp_db.save_match("m-1", _match_payload("m-1"), {"map_name": "Ascent"})
+    assert tmp_db.match_count() == 1
+
+
+def test_player_frontier_orders_by_tier(tmp_db: Database):
+    tmp_db.add_player("low", "Low", "1", "na", tier=10)
+    tmp_db.add_player("high", "High", "2", "na", tier=27)
+    pending = tmp_db.pending_players(limit=5)
+    assert [p["puuid"] for p in pending] == ["high", "low"]
+
+    tmp_db.mark_player_crawled("high", 4)
+    assert [p["puuid"] for p in tmp_db.pending_players(limit=5)] == ["low"]
+
+
+def test_player_upsert_keeps_best_known_values(tmp_db: Database):
+    tmp_db.add_player("p", "Name", "TAG", "na", tier=20)
+    # A later sighting with no name must not blank the one we have.
+    tmp_db.add_player("p", "", "", "na", tier=25)
+    row = tmp_db.pending_players(limit=1)[0]
+    assert row["name"] == "Name"
+    assert row["tier"] == 25
+
+
+def test_queue_skips_matches_already_stored(tmp_db: Database):
+    assert tmp_db.enqueue_match("new-1") is True
+    assert tmp_db.enqueue_match("new-1") is False  # already queued
+    tmp_db.save_match("have-1", _match_payload("have-1"), {"map_name": "Ascent"})
+    assert tmp_db.enqueue_match("have-1") is False  # already stored
+
+
+def test_stats_reports_totals(tmp_db: Database):
+    tmp_db.save_match("m-1", _match_payload("m-1"), {"map_name": "Ascent", "kills": 10, "plants": 2})
+    tmp_db.save_match("m-2", _match_payload("m-2", "Bind"), {"map_name": "Bind", "kills": 5, "plants": 1})
+    stats = tmp_db.stats()
+    assert stats["matches"] == 2
+    assert stats["kills"] == 15
+    assert {r["map_name"] for r in stats["by_map"]} == {"Ascent", "Bind"}
+
+
+# --- crawler ------------------------------------------------------------
+def test_crawler_stores_and_discovers_players(tmp_db: Database):
+    crawler = Crawler(api_key="test", database=tmp_db, verbose=False)
+    assert crawler._store(_match_payload("m-1")) is True
+    assert crawler.stored == 1
+    assert tmp_db.has_match("m-1")
+    # Both players in the match join the crawl frontier.
+    assert {p["puuid"] for p in tmp_db.pending_players(limit=10)} == {"p-atk", "p-def"}
+
+
+def test_crawler_skips_duplicates(tmp_db: Database):
+    crawler = Crawler(api_key="test", database=tmp_db, verbose=False)
+    crawler._store(_match_payload("m-1"))
+    assert crawler._store(_match_payload("m-1")) is False
+    assert crawler.stored == 1
+    assert crawler.skipped == 1
+
+
+def test_crawler_rejects_match_without_coordinates(tmp_db: Database):
+    """A match with no kill positions cannot feed a heatmap."""
+    payload = _match_payload("m-nocoord")
+    payload["kills"][0]["location"] = {"x": -49794, "y": -800}  # sentinel
+    crawler = Crawler(api_key="test", database=tmp_db, verbose=False)
+    assert crawler._store(payload) is False
+    assert not tmp_db.has_match("m-nocoord")
+
+
+def test_crawler_survives_a_malformed_payload(tmp_db: Database):
+    crawler = Crawler(api_key="test", database=tmp_db, verbose=False)
+    assert crawler._store({"garbage": True}) is False
+    assert crawler.errors == 1
+    assert tmp_db.match_count() == 0
+
+
+# --- rate limiting ------------------------------------------------------
+def test_limiter_reads_budget_from_headers():
+    limiter = RateLimiter(limit=90, remaining=90)
+    limiter.observe(httpx.Headers({
+        "x-ratelimit-limit": "90",
+        "x-ratelimit-remaining": "42",
+        "x-ratelimit-reset": "30",
+    }))
+    assert limiter.limit == 90
+    assert limiter.remaining == 42
+    assert limiter.reset_in == 30.0
+
+
+def test_limiter_ignores_missing_or_junk_headers():
+    limiter = RateLimiter(limit=90, remaining=50)
+    limiter.observe(httpx.Headers({}))
+    assert limiter.remaining == 50  # unchanged
+    limiter.observe(httpx.Headers({"x-ratelimit-remaining": "not-a-number"}))
+    assert limiter.remaining == 50
+
+
+def test_limiter_backs_off_when_budget_is_low(monkeypatch):
+    """With almost nothing left, the limiter waits out the reset window."""
+    import asyncio
+
+    import app.crawler as crawler_mod
+
+    slept: list[float] = []
+
+    async def fake_sleep(d: float) -> None:
+        slept.append(d)
+
+    monkeypatch.setattr(crawler_mod.asyncio, "sleep", fake_sleep)
+
+    async def drive(limiter: RateLimiter) -> None:
+        # `_last` starts at 0, which reads as "ages ago"; set it to now so
+        # the limiter actually has to wait for the next slot.
+        limiter._last = asyncio.get_event_loop().time()
+        monkeypatch.setattr(
+            crawler_mod.time, "monotonic", lambda: limiter._last
+        )
+        await limiter.wait()
+
+    asyncio.run(drive(RateLimiter(limit=90, remaining=1, reset_in=5.0)))
+    assert slept, "expected the limiter to sleep when the budget is spent"
+    assert slept[0] >= 5.0
+
+    slept.clear()
+    asyncio.run(drive(RateLimiter(limit=90, remaining=90, reset_in=60.0)))
+    # Healthy budget: only the even pacing interval, 60/90 = 0.67s.
+    assert slept and slept[0] == pytest.approx(60 / 90, abs=0.01)
+
+
+# --- store integration --------------------------------------------------
+def test_store_loads_crawled_matches_alongside_bundled(tmp_db: Database, tmp_path: Path):
+    """A crawled match must show up in the app after a reload."""
+    bundled = tmp_path / "bundled"
+    bundled.mkdir()
+    (bundled / "sample.json").write_text(
+        json.dumps(_match_payload("bundled-1", "Split")), encoding="utf-8"
+    )
+    tmp_db.save_match("crawled-1", _match_payload("crawled-1", "Haven"), {"map_name": "Haven"})
+
+    store = MatchStore(bundled)
+    for path in sorted(bundled.glob("*.json")):
+        store._load_file(path, "local")
+    # Drive the temp database explicitly; load_local() would reach for the
+    # real one and pull in the live dataset.
+    for path in tmp_db.iter_payload_paths():
+        store._load_file(path, "henrik")
+    # Mark loaded so all() does not trigger a global load of the real data.
+    store._loaded = True
+
+    ids = {m.meta.match_id for m in store.all()}
+    assert ids == {"bundled-1", "crawled-1"}
+    assert {m.meta.map_name for m in store.all()} == {"Split", "Haven"}

@@ -16,3 +16,9 @@ frontend/dist/
 # os
 .DS_Store
 Thumbs.db
+
+# crawled dataset (rebuildable from the API; can grow to GBs)
+data/raw/
+data/valheatmap.db
+data/valheatmap.db-wal
+data/valheatmap.db-shm
