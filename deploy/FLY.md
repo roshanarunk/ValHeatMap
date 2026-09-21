@@ -93,18 +93,19 @@ what this PC already has. One command copies it over instead:
 .\deploy\seed-fly.ps1
 ```
 
-Takes about four minutes. Measured on a 33,244-match database:
+Takes about five minutes. Measured on a 33,247-match database carrying
+player attribution:
 
 | | |
 |---|---|
-| Local database | 540 MB |
-| Indexes dropped (rebuilt remotely in 43s) | 221 MB |
-| Compressed with zstd | **101 MB** |
-| Transfer at ~0.75 MB/s | 2.2 min |
+| Local database | 751 MB |
+| Indexes dropped (rebuilt remotely in 70s) | 263 MB |
+| Compressed with zstd | **120 MB** |
+| Transfer at ~0.8 MB/s | 2.5 min |
 
-Uploading the file as-is would move 540 MB and take about twelve
-minutes, so the script drops the indexes first: they are 335 MB of the
-540, and recreating them on the other side is far quicker than sending
+Uploading the file as-is would move 751 MB and take about fifteen
+minutes, so the script drops the indexes first: they are 489 MB of the
+751, and recreating them on the other side is far quicker than sending
 them.
 
 It also copies `valheatmap.db`, the crawler's record of which matches it
@@ -113,13 +114,18 @@ matches it was just handed.
 
 What the script does, in order:
 
-1. Copies the database and drops the nine `idx_*` indexes, then vacuums
+1. Copies the database and drops the `idx_*` indexes, then vacuums
 2. Verifies integrity before sending anything
 3. Turns the remote crawler **off** — it writes to the same file, and
    swapping it underneath a running crawler risks corruption
 4. Uploads, then unpacks and verifies again before replacing the live file
-5. Rebuilds the indexes and the facet cache
-6. Turns the crawler back on, even if an earlier step failed
+5. **Carries over matches the remote crawler collected** while the upload
+   was being prepared, re-keyed into the new file. Without this every
+   seed silently discards them — 1,996 of them on the last run
+6. Backfills player attribution for carried-over matches whose payloads
+   are on the volume
+7. Rebuilds the indexes and the facet cache
+8. Turns the crawler back on, even if an earlier step failed
 
 `data/raw/` is deliberately left behind: 12.85 GB against a 20 GB volume,
 and nothing at runtime reads it. Only `build_analytics --rebuild` needs

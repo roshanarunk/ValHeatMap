@@ -58,6 +58,26 @@ non-Bomb mode flows through the same pipeline, with round, side and plant
 panels hidden automatically and opening-kill tracking disabled (in DM every
 kill would otherwise look like an opening).
 
+**Your own stats** — enter a Riot ID and the crawler prioritises that
+player's matches ahead of the discovery crawl, so their history is usually
+there within a minute or two. Their kills and deaths can be plotted
+separately or together, with career totals including how often their
+deaths get traded.
+
+This needs identity that the aggregate schema deliberately dropped: kills
+stored *which agent* but not *who played them*, and two Jett players in a
+match are indistinguishable by agent. The puuids were in the raw payloads
+all along, so they are now interned through the same `dim` table as every
+other repeated string — 4-byte ids rather than 36-byte strings, twice per
+row, which over 4.9M kills is ~80 MB instead of ~700 MB.
+
+**Match review** — pick a recent game and replay its duels on the map,
+filtered to a single round or scrubbed with the time slider, next to a
+scoreboard derived from the kills themselves. A match we have not crawled
+is fetched on demand, so a game that finished minutes ago is reviewable.
+The whole match is one 59 KB payload, small enough to filter client-side
+without another request per change.
+
 ## Running it
 
 Requires Python 3.11+ and Node 18+.
@@ -185,6 +205,19 @@ analytics — a new stat, a parser fix — is a re-read of local files rather
 than re-fetching thousands of matches you have already paid rate limit for.
 Imports and crawled matches both persist, so nothing is lost on restart.
 
+That paid off when personal stats were added: `kills` had never stored
+*who* played, only which agent, and the puuids came back out of the
+payloads without re-fetching a single match.
+
+```bash
+python -m app.backfill_players        # fill in missing attribution
+```
+
+It updates two columns in place rather than re-deriving every row the way
+`--rebuild` does, which took 4,900,130 kills across 33,000 matches in
+2.5 minutes, and it is resumable — matches already attributed are skipped,
+so an interrupted run picks up where it stopped.
+
 ## How it works
 
 ```
@@ -229,10 +262,17 @@ are pub games where deaths often go unpunished — not a bug.
 cd backend && python -m pytest
 ```
 
-48 tests covering both source adapters, the coordinate transform, trade
+127 tests covering both source adapters, the coordinate transform, trade
 detection windows and radii, plant clustering, filtering, mode awareness,
-persistence, crawler dedup and rate-limit handling. The ingestion tests run
-against a temporary database with no network access.
+persistence, crawler dedup and rate-limit handling, player attribution,
+schema migration, and the deploy script's carry-over merge. They run
+against temporary databases with no network access.
+
+Several exist because something broke in production and the test is how
+it stays fixed: that the crawler refreshes the facet cache before a
+request finds it stale, that a rolled-back transaction cannot leave a
+stale id in the dimension cache, and that a tracked player is crawled on
+their own region rather than the crawler's default.
 
 ## Reference data
 
@@ -250,8 +290,13 @@ cd backend && python -m app.refresh_reference
 backend/app/
   models.py              canonical match model
   db.py                  SQLite index + raw payload storage
+  analytics_db.py        derived, queryable database (the one the site reads)
+  queries.py             filters -> SQL
   crawler.py             snowball dataset builder
+  backfill_players.py    fills in player attribution from raw payloads
+  build_analytics.py     derives analytics_db from the payloads
   config.py              .env loading
+  paths.py               where data lives (a volume in production)
   reference.py           maps/agents/weapons + coordinate transform
   store.py               match loading, caching, multi-match selection
   sources/               riot.py, henrik.py, clients.py
@@ -259,7 +304,8 @@ backend/app/
   main.py                FastAPI app
 frontend/src/
   lib/heatmap.ts         canvas density renderer
-  components/            MapCanvas, TimeSlider, InsightsView, …
+  components/            MapCanvas, PlayerView, TimeSlider, InsightsView, …
+deploy/                  Fly.io config, seeding and deployment notes
 data/matches/            bundled sample matches
 legacy/                  the original Flask + matplotlib prototype
 ```
