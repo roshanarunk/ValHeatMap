@@ -544,6 +544,7 @@ async def run_forever(
     control = control or crawler.control
     since_publish = 0
     since_facets = 0
+    facet_task: asyncio.Task[None] | None = None
     cycle = 0
 
     def note(status: str) -> None:
@@ -595,19 +596,39 @@ async def run_forever(
         # Refresh the facet cache here rather than letting a request find
         # it stale. When the crawler and the API share one file -- as they
         # do on a server -- the reader's staleness check otherwise makes
-        # some unlucky request recompute over every kill, which is 40s+ at
-        # 5M rows. Doing it on this side keeps /api/facets instant.
+        # some unlucky request recompute over every kill.
+        #
+        # Run it on a worker thread, not inline: this coroutine is on the
+        # crawler's *only* event loop, so a synchronous call here blocks
+        # that whole loop until it returns. At 7M+ kills, with no index
+        # supporting the agent/weapon/ability GROUP BYs, that call was
+        # measured at 139s. On a shared-cpu-1x machine, 139s of one process
+        # pegging the single core starves the sibling API process too --
+        # its health check missed its 5s window and Fly's proxy pulled the
+        # machine out of rotation, which is what actually caused the 503s.
+        # A worker thread keeps this loop free to keep crawling and logging
+        # while the rebuild runs, so nothing downstream of it stalls.
         since_facets += gained
-        if crawler.analytics is not None and since_facets >= FACET_REFRESH_MATCHES:
-            try:
+        if (
+            crawler.analytics is not None
+            and since_facets >= FACET_REFRESH_MATCHES
+            and (facet_task is None or facet_task.done())
+        ):
+            since_facets = 0
+
+            async def _rebuild(analytics: AnalyticsDB) -> None:
                 started = time.monotonic()
-                crawler.analytics.rebuild_facet_cache()
-                crawler.log(
-                    f"  · facet cache rebuilt in {time.monotonic() - started:.0f}s"
-                )
-                since_facets = 0
-            except Exception as exc:  # a stale cache is not worth stopping over
-                crawler.log(f"  ! facet cache rebuild failed: {exc}")
+                try:
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, analytics.rebuild_facet_cache
+                    )
+                    crawler.log(
+                        f"  · facet cache rebuilt in {time.monotonic() - started:.0f}s"
+                    )
+                except Exception as exc:  # a stale cache is not worth stopping over
+                    crawler.log(f"  ! facet cache rebuild failed: {exc}")
+
+            facet_task = asyncio.ensure_future(_rebuild(crawler.analytics))
 
         if gained == 0:
             # Frontier exhausted or upstream unhappy; back off rather than spin.

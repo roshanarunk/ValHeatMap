@@ -145,6 +145,16 @@ CREATE INDEX IF NOT EXISTS idx_k_killer ON kills(killer_pid, map_id)
     WHERE killer_pid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_k_victim ON kills(victim_pid, map_id)
     WHERE victim_pid IS NOT NULL;
+-- The facet cache's agent/weapon/ability breakdowns group the whole
+-- table with no index to lead on, so each one was a full scan plus a
+-- temp B-tree. Measured on 4.9M rows: agent_rows alone was 7.36s: with
+-- this index, 0.13s. At 7M+ rows in production that scan -- times three,
+-- for agents, weapons and abilities -- ran the crawler's facet rebuild
+-- to 139s, long enough on a shared-cpu-1x machine to starve the sibling
+-- API process's health check and take the whole site down with a 503.
+CREATE INDEX IF NOT EXISTS idx_k_agent   ON kills(ka_id);
+CREATE INDEX IF NOT EXISTS idx_k_weapon  ON kills(weapon_id);
+CREATE INDEX IF NOT EXISTS idx_k_ability ON kills(ability_id, ka_id);
 
 CREATE TABLE IF NOT EXISTS plants (
     m          INTEGER NOT NULL,

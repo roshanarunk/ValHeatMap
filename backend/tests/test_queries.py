@@ -282,6 +282,34 @@ def test_facets_list_available_filter_values(db: AnalyticsDB):
     assert facets["tier_range"] == [22, 27]
 
 
+def test_facet_group_by_queries_use_an_index_not_a_full_scan(db: AnalyticsDB):
+    """The queries `_compute_facets` runs must never fall back to `SCAN kills`.
+
+    Without idx_k_agent/idx_k_weapon/idx_k_ability, grouping by ka_id,
+    weapon_id or (ability_id, ka_id) is a full table scan plus a temp
+    B-tree, since no other index leads with those columns. That was cheap
+    on a small table but measured at 139s combined on 7M+ rows in
+    production -- long enough to peg the crawler's single shared CPU and
+    starve the sibling API process's health check, which took the whole
+    site down with a 503. A fixture this small would never catch the
+    slowdown itself, so this asserts on the query plan instead.
+    """
+    queries = [
+        "SELECT ka_id, COUNT(*) FROM kills WHERE ka_id IS NOT NULL "
+        "GROUP BY ka_id ORDER BY 2 DESC",
+        "SELECT weapon_id, COUNT(*) FROM kills WHERE weapon_id IS NOT NULL "
+        "GROUP BY weapon_id ORDER BY 2 DESC",
+        "SELECT ability_id, ka_id, COUNT(*) FROM kills WHERE ability_id IS NOT NULL "
+        "GROUP BY ability_id, ka_id ORDER BY 3 DESC",
+    ]
+    with db.connect() as conn:
+        for q in queries:
+            plan = " ".join(
+                row["detail"] for row in conn.execute("EXPLAIN QUERY PLAN " + q)
+            )
+            assert "SCAN kills" not in plan, f"full scan in plan for: {q}\n  {plan}"
+
+
 def test_summary_rates_are_fractions(engine: QueryEngine):
     s = engine.summary(Filters(map_name="Ascent"))
     assert 0.0 <= s["trade_rate"] <= 1.0
