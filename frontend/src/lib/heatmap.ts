@@ -279,12 +279,46 @@ export interface DivergingOptions {
   floor?: number
 }
 
-// Endpoints of the diverging scale. Green and red are the convention for
-// good/bad; the neutral midpoint is a desaturated slate rather than white
-// so an even spot reads as "contested" instead of "intense".
-const WIN_RGB: [number, number, number] = [64, 220, 130]
-const LOSS_RGB: [number, number, number] = [255, 72, 88]
-const EVEN_RGB: [number, number, number] = [150, 158, 178]
+/**
+ * One continuous red -> amber -> green scale, by win share.
+ *
+ * Stops are [position, r, g, b] where position 0 is "died every time
+ * here" and 1 is "won every time". The midpoint is amber rather than a
+ * neutral grey: grey reads as a *third* colour, which made the field
+ * look like separate red and green blobs laid over each other instead of
+ * one gradient. Amber sits between the ends in hue, so a spot that
+ * shifts from losing to even to winning sweeps smoothly through it.
+ */
+const DIVERGING_STOPS: [number, number, number, number][] = [
+  [0.0, 214, 32, 48],
+  [0.25, 244, 92, 58],
+  [0.42, 250, 154, 60],
+  [0.5, 252, 196, 78],
+  [0.58, 214, 208, 70],
+  [0.75, 122, 202, 74],
+  [1.0, 46, 208, 118],
+]
+
+/** Interpolate the diverging scale at `t` in [0,1]. */
+function divergingColour(t: number): [number, number, number] {
+  const pos = t < 0 ? 0 : t > 1 ? 1 : t
+  let lo = DIVERGING_STOPS[0]
+  let hi = DIVERGING_STOPS[DIVERGING_STOPS.length - 1]
+  for (let s = 0; s < DIVERGING_STOPS.length - 1; s++) {
+    if (pos >= DIVERGING_STOPS[s][0] && pos <= DIVERGING_STOPS[s + 1][0]) {
+      lo = DIVERGING_STOPS[s]
+      hi = DIVERGING_STOPS[s + 1]
+      break
+    }
+  }
+  const span = hi[0] - lo[0]
+  const f = span === 0 ? 0 : (pos - lo[0]) / span
+  return [
+    lo[1] + (hi[1] - lo[1]) * f,
+    lo[2] + (hi[2] - lo[2]) * f,
+    lo[3] + (hi[3] - lo[3]) * f,
+  ]
+}
 
 /**
  * Render kills and deaths as one field, coloured by which dominates.
@@ -350,18 +384,23 @@ export function renderDivergingHeatmap(
     if (t > 1) t = 1
     if (t < floor) continue
 
-    // -1 (all deaths) .. 0 (even) .. +1 (all kills)
-    const balance = (winField[i] - lossField[i]) / sum
-    const strength = Math.abs(balance)
-    const target = balance >= 0 ? WIN_RGB : LOSS_RGB
+    // Win share: 0 = died every duel here, 0.5 = even, 1 = won every one.
+    // Read straight off the ramp, so the colour at a spot depends only on
+    // how that spot went -- not on a separate blend toward a midpoint,
+    // which is what made the old version look like two stacked layers.
+    const share = winField[i] / sum
 
-    // Ease the mix so a slight edge still shows some colour; a linear
-    // ramp leaves most of the map washed out around the midpoint.
-    const mix = Math.sqrt(strength)
+    // Push the share away from the centre a little. Real spots are rarely
+    // lopsided enough to reach the ends, so without this almost the whole
+    // map sits in the amber middle and the scale says nothing.
+    const contrast = 1.6
+    const shifted = 0.5 + (share - 0.5) * contrast
+    const [r, g, b] = divergingColour(shifted)
+
     const p = i * 4
-    data[p] = EVEN_RGB[0] + (target[0] - EVEN_RGB[0]) * mix
-    data[p + 1] = EVEN_RGB[1] + (target[1] - EVEN_RGB[1]) * mix
-    data[p + 2] = EVEN_RGB[2] + (target[2] - EVEN_RGB[2]) * mix
+    data[p] = r
+    data[p + 1] = g
+    data[p + 2] = b
 
     // Same perceptual curve as the single-field renderer, so the two views
     // have comparable weight.
@@ -382,13 +421,8 @@ export function renderDivergingHeatmap(
 export function divergingStops(steps = 9): string[] {
   const out: string[] = []
   for (let i = 0; i < steps; i++) {
-    const balance = (i / (steps - 1)) * 2 - 1
-    const target = balance >= 0 ? WIN_RGB : LOSS_RGB
-    const mix = Math.sqrt(Math.abs(balance))
-    const r = Math.round(EVEN_RGB[0] + (target[0] - EVEN_RGB[0]) * mix)
-    const g = Math.round(EVEN_RGB[1] + (target[1] - EVEN_RGB[1]) * mix)
-    const b = Math.round(EVEN_RGB[2] + (target[2] - EVEN_RGB[2]) * mix)
-    out.push(`rgb(${r}, ${g}, ${b})`)
+    const [r, g, b] = divergingColour(i / (steps - 1))
+    out.push(`rgb(${Math.round(r)}, ${Math.round(g)}, ${Math.round(b)})`)
   }
   return out
 }

@@ -3,6 +3,7 @@ import { MapCanvas, type RenderMode } from './MapCanvas'
 import {
   ControlBar,
   ControlGroup,
+  MultiSelect,
   RotateControl,
   SegmentedControl,
   Select,
@@ -17,9 +18,11 @@ import {
   type PlayerMatch,
   type PlayerSummary,
 } from '../lib/api'
-import type { KillPoint, KillsResponseV2 } from '../lib/types'
+import type { Facets, KillPoint, KillsResponseV2 } from '../lib/types'
 
 const ROUND_MAX_MS = 120_000
+/** Matches the main view's default: tight splats keep spots distinct. */
+const PLAYER_RADIUS = 5
 const STORAGE_KEY = 'valheatmap.riot_id'
 
 type Role = 'killer' | 'victim' | 'either'
@@ -31,6 +34,16 @@ const ROLES: { id: Role; label: string }[] = [
 ]
 
 const num = (v: number) => v.toLocaleString()
+
+// Valorant's own shop categories, matching the global filters.
+const WEAPON_GROUPS: { label: string; values: string[] }[] = [
+  { label: 'Rifles', values: ['Vandal', 'Phantom', 'Bulldog', 'Guardian'] },
+  { label: 'Snipers', values: ['Operator', 'Marshal', 'Outlaw'] },
+  { label: 'SMGs', values: ['Spectre', 'Stinger'] },
+  { label: 'Pistols', values: ['Classic', 'Shorty', 'Frenzy', 'Ghost', 'Sheriff'] },
+  { label: 'Shotguns', values: ['Bucky', 'Judge'] },
+  { label: 'Heavy', values: ['Ares', 'Odin'] },
+]
 
 function when(ts: number | null): string {
   if (!ts) return ''
@@ -91,6 +104,17 @@ export function PlayerView() {
   const [aggBusy, setAggBusy] = useState(false)
   const [aggTime, setAggTime] = useState<[number, number]>([0, ROUND_MAX_MS])
 
+  // Filters. These narrow the *opponent* in each duel: on your kills that
+  // is who you killed, on your deaths who killed you -- which is the
+  // question worth asking ("how do I do against Jett?").
+  const [agents, setAgents] = useState<string[]>([])
+  const [roles, setRoles] = useState<string[]>([])
+  const [weapons, setWeapons] = useState<string[]>([])
+  const [sides, setSides] = useState<string[]>([])
+  const [facets, setFacets] = useState<Facets | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshNote, setRefreshNote] = useState('')
+
   // Review state: one selected match, loaded on demand.
   const [selected, setSelected] = useState<string | null>(null)
   const [detail, setDetail] = useState<MatchDetail | null>(null)
@@ -141,10 +165,42 @@ export function PlayerView() {
     if (!aggMap && player?.maps?.length) setAggMap(player.maps[0].map_name)
   }, [player, aggMap])
 
+  // Agent, weapon and role lists for the filter controls.
+  useEffect(() => {
+    api.facets().then(setFacets).catch(() => setFacets(null))
+  }, [])
+
+  const refresh = useCallback(async () => {
+    if (!player) return
+    setRefreshing(true)
+    setRefreshNote('')
+    try {
+      const res = await api.refreshPlayer(player.riot_id)
+      setPlayer(res.player)
+      setRefreshNote(
+        res.new_matches > 0
+          ? `Added ${res.new_matches} match${res.new_matches === 1 ? '' : 'es'}.`
+          : 'Already up to date.',
+      )
+      const list = await api.playerMatches(player.riot_id, 25)
+      setMatches(list.matches)
+    } catch (err) {
+      setRefreshNote(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRefreshing(false)
+    }
+  }, [player])
+
   useEffect(() => {
     if (!player || !aggMap) return
     let cancelled = false
     setAggBusy(true)
+    // Which end the filters apply to is the mirror of the player's own:
+    // showing your kills, the agent/weapon filters describe your victim;
+    // showing your deaths, they describe your killer. "Both" cannot mean
+    // one fixed end, so it filters the killer side, which is who beat you
+    // or who you beat depending on the row.
+    const opponentIsVictim = aggRole === 'killer'
     api
       .killsV2({
         map_name: aggMap,
@@ -152,6 +208,11 @@ export function PlayerView() {
         player_role: aggRole,
         time_start: aggTime[0],
         time_end: aggTime[1],
+        sides,
+        ...(opponentIsVictim
+          ? { victim_agents: agents, victim_roles: roles }
+          : { agents, roles }),
+        weapons,
       })
       .then((res) => !cancelled && setAgg(res))
       .catch((err) => !cancelled && setError(err instanceof Error ? err.message : String(err)))
@@ -159,7 +220,7 @@ export function PlayerView() {
     return () => {
       cancelled = true
     }
-  }, [player, aggMap, aggRole, aggTime])
+  }, [player, aggMap, aggRole, aggTime, agents, roles, weapons, sides])
 
   useEffect(() => {
     if (!selected) {
@@ -196,6 +257,11 @@ export function PlayerView() {
     if (roundFilter !== '') rows = rows.filter((k) => k.round === roundFilter)
     return rows.filter((k) => k.t >= timeRange[0] && k.t <= timeRange[1])
   }, [detail, player, role, roundFilter, timeRange])
+
+  // The agent/role filters describe the other player in the duel, and
+  // which one that is flips with the view.
+  const opponentLabel =
+    aggRole === 'killer' ? 'Victim role' : aggRole === 'victim' ? 'Killer role' : 'Role'
 
   const rounds = useMemo(
     () => (detail ? Array.from(new Set(detail.kills.map((k) => k.round))).sort((a, b) => a - b) : []),
@@ -234,8 +300,18 @@ export function PlayerView() {
               <p className="playerhead__meta">
                 {player.region?.toUpperCase()} · {num(player.matches)} matches
                 {player.crawled_at ? ` · updated ${when(player.crawled_at)}` : ''}
+                {refreshNote ? ` · ${refreshNote}` : ''}
               </p>
             </div>
+            <button
+              type="button"
+              className="playerhead__refresh"
+              onClick={() => void refresh()}
+              disabled={refreshing}
+              title="Fetch any matches played since the last update"
+            >
+              {refreshing ? 'Refreshing…' : 'Refresh'}
+            </button>
           </header>
 
           {player.matches === 0 ? (
@@ -304,9 +380,78 @@ export function PlayerView() {
                       onChange={(v) => setAggMode(v as RenderMode)}
                     />
                   </ControlGroup>
+                  <ControlGroup label="Side">
+                    <SegmentedControl
+                      size="sm"
+                      value={sides.length === 1 ? sides[0] : ''}
+                      options={[
+                        { value: '', label: 'Both' },
+                        { value: 'attack', label: 'Attack' },
+                        { value: 'defense', label: 'Defend' },
+                      ]}
+                      onChange={(v) => setSides(v ? [v] : [])}
+                    />
+                  </ControlGroup>
                   <ControlGroup label="Orient">
                     <RotateControl rotation={rotation} onChange={setRotation} />
                   </ControlGroup>
+                </ControlBar>
+
+                <ControlBar>
+                  <ControlGroup label={opponentLabel}>
+                    <MultiSelect
+                      values={roles}
+                      placeholder="Any role"
+                      options={(facets?.roles ?? []).map((r) => ({
+                        value: r.role,
+                        label: r.role,
+                      }))}
+                      onChange={setRoles}
+                    />
+                  </ControlGroup>
+                  <ControlGroup label="Agent">
+                    <MultiSelect
+                      values={agents}
+                      placeholder="Any agent"
+                      options={(facets?.agents ?? []).map((a) => ({
+                        value: a.agent,
+                        label: a.agent,
+                        hint: a.role,
+                      }))}
+                      onChange={setAgents}
+                    />
+                  </ControlGroup>
+                  <ControlGroup label="Weapon">
+                    <MultiSelect
+                      values={weapons}
+                      placeholder="Any weapon"
+                      options={(facets?.weapons ?? []).map((w) => ({
+                        value: w.weapon,
+                        label: w.weapon,
+                      }))}
+                      groups={WEAPON_GROUPS}
+                      onChange={setWeapons}
+                    />
+                  </ControlGroup>
+                  {(agents.length > 0 ||
+                    roles.length > 0 ||
+                    weapons.length > 0 ||
+                    sides.length > 0) && (
+                    <ControlGroup label=" ">
+                      <button
+                        type="button"
+                        className="linkbtn"
+                        onClick={() => {
+                          setAgents([])
+                          setRoles([])
+                          setWeapons([])
+                          setSides([])
+                        }}
+                      >
+                        Clear filters
+                      </button>
+                    </ControlGroup>
+                  )}
                 </ControlBar>
 
                 <div className="aggmap__canvas">
@@ -317,7 +462,7 @@ export function PlayerView() {
                     // Green for kills, red for deaths, so the colour means
                     // the same thing here as in the combined view.
                     ramp={aggRole === 'killer' ? 'toxic' : 'duel'}
-                    radius={30}
+                    radius={PLAYER_RADIUS}
                     intensity={1}
                     // Plot where the player was: their own position is the
                     // kill end when they got the kill, the death end when
@@ -435,7 +580,7 @@ export function PlayerView() {
                 mode={mode}
                 // Same convention as the career view above.
                 ramp={role === 'killer' ? 'toxic' : 'duel'}
-                radius={26}
+                radius={PLAYER_RADIUS}
                 intensity={1}
                 anchor={role === 'killer' ? 'killer' : 'victim'}
                 player={role === 'either' ? player?.puuid : undefined}

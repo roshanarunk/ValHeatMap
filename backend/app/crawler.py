@@ -52,6 +52,11 @@ DEFAULT_MODES = ("competitive", "unrated")
 # recomputes the whole thing mid-response.
 FACET_REFRESH_MATCHES = 400
 
+# How many pages of `stored-matches` to walk for a tracked player. Measured
+# at four pages (366 matches) before the endpoint runs dry, so six leaves
+# headroom without risking an unbounded loop if it ever stops paginating.
+MAX_HISTORY_PAGES = 6
+
 
 @dataclass
 class RateLimiter:
@@ -371,6 +376,7 @@ class Crawler:
         puuid: str,
         region: str | None = None,
         size: int = 100,
+        max_pages: int = MAX_HISTORY_PAGES,
     ) -> int:
         """Fetch a tracked player's deeper history. Returns matches stored.
 
@@ -379,41 +385,54 @@ class Crawler:
         a few games per player to keep snowballing -- but it is the whole
         history for someone looking at their own stats.
 
-        `stored-matches` goes back ~100. It returns summaries rather than
-        full payloads, so each match we do not already have costs one more
-        request to fetch; matches already stored cost nothing, which is
-        what makes repeat crawls of the same player cheap.
+        `stored-matches` goes much deeper and paginates: measured at 366
+        matches over four pages for a real account, of which 205 were
+        competitive. It returns summaries rather than full payloads, so
+        each match we do not already have costs one more request to fetch;
+        matches already stored cost nothing, which is what makes repeat
+        crawls of the same player cheap.
         """
         region = (region or self.region).lower()
-        listing = await self._get(
-            client,
-            f"{HENRIK_BASE}/v1/by-puuid/stored-matches/{region}/{puuid}",
-            {"size": size},
-        )
-        rows = (listing or {}).get("data") or []
-        if not rows:
-            return 0
-
         wanted = {m.lower() for m in self.modes}
         stored = 0
-        for row in rows:
-            meta = row.get("meta") or {}
-            match_id = meta.get("id")
-            if not match_id:
-                continue
-            # Mode names here are display-cased ("Competitive"), unlike the
-            # lowercase slugs the v4 endpoint takes.
-            if wanted and str(meta.get("mode", "")).lower() not in wanted:
-                continue
-            if self.db.has_match(match_id):
-                self.skipped += 1
-                continue
-            payload = await self._get(
-                client, f"{HENRIK_BASE}/v4/match/{region}/{match_id}"
+        seen: set[str] = set()
+
+        for page in range(1, max_pages + 1):
+            listing = await self._get(
+                client,
+                f"{HENRIK_BASE}/v1/by-puuid/stored-matches/{region}/{puuid}",
+                {"size": size, "page": page},
             )
-            data = (payload or {}).get("data")
-            if data and self._store(data):
-                stored += 1
+            rows = (listing or {}).get("data") or []
+            if not rows:
+                break  # history exhausted
+
+            page_ids = set()
+            for row in rows:
+                meta = row.get("meta") or {}
+                match_id = meta.get("id")
+                if not match_id or match_id in seen:
+                    continue
+                page_ids.add(match_id)
+                seen.add(match_id)
+                # Mode names here are display-cased ("Competitive"), unlike
+                # the lowercase slugs the v4 endpoint takes.
+                if wanted and str(meta.get("mode", "")).lower() not in wanted:
+                    continue
+                if self.db.has_match(match_id):
+                    self.skipped += 1
+                    continue
+                payload = await self._get(
+                    client, f"{HENRIK_BASE}/v4/match/{region}/{match_id}"
+                )
+                data = (payload or {}).get("data")
+                if data and self._store(data):
+                    stored += 1
+
+            # A page that repeats what we already listed means the endpoint
+            # is ignoring `page`; stop rather than loop over the same rows.
+            if not page_ids:
+                break
         return stored
 
     async def crawl_tracked_players(

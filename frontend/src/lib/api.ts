@@ -77,6 +77,9 @@ export interface QueryFilters {
   ranks?: string[]
   agents?: string[]
   victim_agents?: string[]
+  /** Agent roles (Duelist, Sentinel, …), expanded to agents server-side. */
+  roles?: string[]
+  victim_roles?: string[]
   players?: string[]
   sides?: string[]
   rounds?: number[]
@@ -242,6 +245,10 @@ export const api = {
     get<{ player: PlayerSummary; matches: PlayerMatch[] }>(
       `/api/player/${encodeURIComponent(riotId)}/matches`,
       { limit },
+    ),
+  refreshPlayer: (riotId: string) =>
+    post<{ player: PlayerSummary; stored: number; new_matches: number }>(
+      `/api/player/${encodeURIComponent(riotId)}/refresh`,
     ),
   match: (matchId: string) => get<MatchDetail>(`/api/match/${encodeURIComponent(matchId)}`),
   crawl: (matches: number, region?: string, seed?: string) => {

@@ -25,8 +25,9 @@ structure is destroyed *before* it can be normalised — the result is a
 featureless white blob. Accumulating in floats preserves the full range,
 and the colour scale is then set from a high percentile of the density
 (not the maximum, which a single freak hotspot would dominate). The splat
-radius also scales with how many points are on screen, since a blur that
-suits 50 kills merges 20,000 of them into one mass.
+radius defaults to a tight 5px so neighbouring hotspots stay distinct
+rather than blurring into one mass, and is adjustable alongside the
+hotspot-focus percentile.
 
 **Trade detection** — a death counts as traded when a teammate kills the
 killer within a time window *and* near where the death happened. Both the
@@ -62,18 +63,37 @@ kill would otherwise look like an opening).
 player's matches ahead of the discovery crawl, so their history is usually
 there within a minute or two. Their kills and deaths can be plotted
 separately or together, with career totals including how often their
-deaths get traded.
+deaths get traded. A **Refresh** button pulls anything played since the
+last update without waiting for the next crawl cycle; a top-up takes
+about two seconds.
+
+History goes as deep as the API allows. The v4 matchlist returns at most
+10 matches however large `size` is, so tracked players are crawled
+through `stored-matches`, which paginates: measured at 366 matches over
+four pages for one account, 205 of them competitive, against the 11 a
+single v4 call returned.
 
 Kills render green and deaths red, and "Both" is a *diverging* field
-rather than two heatmaps stacked: colour comes from which outcome
-dominates a spot and opacity from how busy it is. Stacking two ordinary
+rather than two heatmaps stacked: a spot's colour is its win share, read
+off one continuous red -> amber -> green scale. Stacking two ordinary
 heatmaps does not work here -- the upper layer hides the lower one and
 the overlap is a muddy colour that means nothing -- whereas the question
-being asked is "at this spot, do I win or lose", which is a difference.
-20 kills against 2 deaths reads strong green, the reverse reads strong
-red, and 11 against 9 reads dim and neutral, which is the honest answer
-for a genuinely even duel. Both fields share one ceiling, since scaling
-them separately would normalise away the very imbalance being shown.
+being asked is "at this spot, do I win or lose", which is a single
+quantity. The midpoint is amber rather than grey for the same reason: a
+neutral grey reads as a *third* colour and makes the field look like
+separate red and green blobs again, while amber sits between the ends in
+hue so a spot sweeps smoothly through it. Both fields share one ceiling,
+since scaling them separately would normalise away the very imbalance
+being shown, and the share is stretched away from the centre because real
+spots are rarely lopsided enough to reach the ends unaided.
+
+Everything is filterable by agent, **role** (Duelist, Sentinel, …),
+weapon and side. Roles are expanded to their agents at query time rather
+than stored per kill, so a Riot rework that changes an agent's role is
+picked up without touching old rows. On the player page the agent and
+role filters describe the *opponent* -- who you killed when viewing your
+kills, who killed you when viewing your deaths -- since "how do I do
+against Jett" is the question worth asking.
 
 This needs identity that the aggregate schema deliberately dropped: kills
 stored *which agent* but not *who played them*, and two Jett players in a
@@ -274,10 +294,11 @@ cd backend && python -m pytest
 cd frontend && npm run check:colours
 ```
 
-127 tests covering both source adapters, the coordinate transform, trade
+142 tests covering both source adapters, the coordinate transform, trade
 detection windows and radii, plant clustering, filtering, mode awareness,
 persistence, crawler dedup and rate-limit handling, player attribution,
-schema migration, and the deploy script's carry-over merge. They run
+role expansion, history pagination, schema migration, and the deploy
+script's carry-over merge. They run
 against temporary databases with no network access.
 
 Several exist because something broke in production and the test is how

@@ -82,6 +82,12 @@ class Filters:
     player: str = ""
     player_role: str = "killer"
     match_id: str = ""                  # single-match review
+    # Agent roles (Duelist, Sentinel, ...). Expanded to their agents at
+    # query time rather than stored per kill: role membership comes from
+    # reference data and changes when Riot reworks an agent, so deriving
+    # it keeps old rows correct.
+    roles: list[str] = field(default_factory=list)
+    victim_roles: list[str] = field(default_factory=list)
     ranks: list[str] = field(default_factory=list)      # band names
     tier_min: int | None = None
     tier_max: int | None = None
@@ -149,6 +155,8 @@ class Filters:
                 else "killer"
             ),
             match_id=str(params.get("match_id") or ""),
+            roles=lst("roles"),
+            victim_roles=lst("victim_roles"),
             ranks=lst("ranks"),
             tier_min=num("tier_min"),
             tier_max=num("tier_max"),
@@ -194,6 +202,25 @@ class QueryEngine:
     def invalidate(self) -> None:
         """Drop cached dimension maps after an ingest adds new names."""
         self._dims.clear()
+
+    def _role_agent_ids(self, roles: list[str]) -> list[int] | None:
+        """Agent ids belonging to any of `roles`, or None if none resolve.
+
+        Returning None rather than an empty list matters for the same
+        reason it does in `_resolve`: an unrecognised role has to match
+        nothing, not silently drop the filter and return everything.
+        """
+        from .reference import agents_by_id
+
+        wanted = {r.strip().lower() for r in roles if r.strip()}
+        if not wanted:
+            return None
+        names = {
+            a.name for a in agents_by_id().values() if (a.role or "").lower() in wanted
+        }
+        if not names:
+            return None
+        return self._resolve("agent", sorted(names))
 
     def _resolve(self, kind: str, names: list[str]) -> list[int] | None:
         """Names to ids. Returns None when *nothing* resolved.
@@ -278,6 +305,20 @@ class QueryEngine:
                 args.extend(ids)
             if f.victim_agents:
                 ids = self._resolve("agent", f.victim_agents)
+                if ids is None:
+                    return "1=0", []
+                clauses.append(f"va_id IN ({','.join('?' * len(ids))})")
+                args.extend(ids)
+            # Roles narrow the same columns as the agent filters, so
+            # selecting Duelist *and* Jett means Jett, not both sets.
+            if f.roles:
+                ids = self._role_agent_ids(f.roles)
+                if ids is None:
+                    return "1=0", []
+                clauses.append(f"ka_id IN ({','.join('?' * len(ids))})")
+                args.extend(ids)
+            if f.victim_roles:
+                ids = self._role_agent_ids(f.victim_roles)
                 if ids is None:
                     return "1=0", []
                 clauses.append(f"va_id IN ({','.join('?' * len(ids))})")

@@ -682,3 +682,64 @@ def test_mine_flag_follows_the_named_player(db: AnalyticsDB):
     assert sum(1 for p in atk["points"] if p["mine"]) == sum(
         1 for p in dfn["points"] if not p["mine"]
     )
+
+
+# --- role filter --------------------------------------------------------
+def test_role_filter_expands_to_that_role_s_agents(engine: QueryEngine):
+    """Roles are resolved from reference data, not stored per kill.
+
+    The fixture has Jett (Duelist) killing and Sage (Sentinel) killing, so
+    each role picks out exactly one side of the alternating kills.
+    """
+    duelist = engine.summary(Filters(map_name="Ascent", roles=["Duelist"]))
+    sentinel = engine.summary(Filters(map_name="Ascent", roles=["Sentinel"]))
+    every = engine.summary(Filters(map_name="Ascent"))
+
+    assert duelist["total"] > 0
+    assert sentinel["total"] > 0
+    assert duelist["total"] + sentinel["total"] == every["total"]
+
+
+def test_role_filter_is_case_insensitive(engine: QueryEngine):
+    """The UI sends display casing; a URL might not."""
+    a = engine.summary(Filters(map_name="Ascent", roles=["Duelist"]))["total"]
+    b = engine.summary(Filters(map_name="Ascent", roles=["duelist"]))["total"]
+    assert a == b > 0
+
+
+def test_unknown_role_matches_nothing(engine: QueryEngine):
+    """Same rule as every other filter: never silently widen the result."""
+    assert engine.summary(Filters(map_name="Ascent", roles=["Tactician"]))["total"] == 0
+
+
+def test_role_and_agent_filters_intersect(engine: QueryEngine):
+    """Selecting Duelist *and* Sage must match nothing, not both sets.
+
+    They narrow the same column, so an OR here would quietly return more
+    rows than either filter alone.
+    """
+    both = engine.summary(Filters(map_name="Ascent", roles=["Duelist"], agents=["Sage"]))
+    assert both["total"] == 0
+
+    agreeing = engine.summary(
+        Filters(map_name="Ascent", roles=["Duelist"], agents=["Jett"])
+    )
+    assert agreeing["total"] == engine.summary(
+        Filters(map_name="Ascent", agents=["Jett"])
+    )["total"]
+
+
+def test_victim_role_filters_the_other_end(engine: QueryEngine):
+    """`roles` is the killer's; `victim_roles` is who they killed."""
+    killed_sentinels = engine.summary(
+        Filters(map_name="Ascent", victim_roles=["Sentinel"])
+    )
+    as_sentinel = engine.summary(Filters(map_name="Ascent", roles=["Sentinel"]))
+    assert killed_sentinels["total"] > 0
+    assert as_sentinel["total"] > 0
+    # In the fixture Jett kills Sage and Sage kills Jett, so the two are
+    # disjoint halves rather than the same rows read twice.
+    assert (
+        killed_sentinels["total"]
+        == engine.summary(Filters(map_name="Ascent", victim_agents=["Sage"]))["total"]
+    )

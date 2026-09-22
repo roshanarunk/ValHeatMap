@@ -290,6 +290,8 @@ export interface Facets {
   agents: FacetAgent[]
   abilities: FacetAbility[]
   weapons: { weapon: string; kills: number }[]
+  /** Agent roles present in the data, busiest first. */
+  roles: { role: string; kills: number }[]
   ranks: RankBand[]
   tier_range: [number, number]
   stats: { matches: number; kills: number; plants: number; generated_at: string | null }

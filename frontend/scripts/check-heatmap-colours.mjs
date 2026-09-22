@@ -115,14 +115,43 @@ check('kill-dominated spot is green, death-dominated is red', () => {
   assert(loss.r > loss.g, `losing spot should be red, got rgb(${loss.r},${loss.g},${loss.b})`)
 })
 
-check('evenly contested spot reads neutral', () => {
+check('evenly contested spot sits mid-gradient', () => {
+  // The midpoint is amber -- on the ramp between the two ends, not a
+  // third colour. A grey midpoint made the field look like separate red
+  // and green layers rather than one scale.
   const at = render(cluster(0.5, 0.5, 10), cluster(0.5, 0.5, 10))
   const even = at(0.5, 0.5)
+  const mid = divergingStops(3)[1].match(/\d+/g).map(Number)
+  const dist = Math.hypot(even.r - mid[0], even.g - mid[1], even.b - mid[2])
   assert(
-    Math.abs(even.r - even.g) < 40,
-    `10 kills vs 10 deaths should be neutral, got rgb(${even.r},${even.g},${even.b})`,
+    dist < 40,
+    `10 kills vs 10 deaths should match the legend midpoint rgb(${mid}), ` +
+      `got rgb(${even.r},${even.g},${even.b})`,
   )
   assert(even.a > 0, 'a busy contested spot should still be drawn')
+})
+
+check('colour moves monotonically from losing to winning', () => {
+  // The scale has to be readable as an ordering: more wins at a spot must
+  // never make it look *more* like a loss.
+  const ratios = [0, 0.25, 0.5, 0.75, 1]
+  const greenness = ratios.map((share) => {
+    const wins = Math.round(20 * share)
+    const losses = 20 - wins
+    const at = render(
+      wins ? cluster(0.5, 0.5, wins) : [{ x: 0.9, y: 0.9 }],
+      losses ? cluster(0.5, 0.5, losses) : [{ x: 0.1, y: 0.1 }],
+    )
+    const p = at(0.5, 0.5)
+    return p.g - p.r
+  })
+  for (let i = 1; i < greenness.length; i++) {
+    assert(
+      greenness[i] >= greenness[i - 1],
+      `win share ${ratios[i]} should be at least as green as ${ratios[i - 1]} ` +
+        `(g-r: ${greenness.join(', ')})`,
+    )
+  }
 })
 
 check('one shared ceiling, so imbalance is not normalised away', () => {

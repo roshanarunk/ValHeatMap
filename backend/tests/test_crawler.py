@@ -91,27 +91,36 @@ def test_players_needing_crawl_puts_new_registrations_first(tmp_path: Path):
 
 
 class _HistoryClient:
-    """Serves a stored-matches listing, then one payload per match.
+    """Serves a paginated stored-matches listing, then one payload each.
 
-    Mirrors the two-step shape of the real deep-history fetch: a listing
-    of summaries, then a full payload per match id we do not already have.
+    Mirrors the two-step shape of the real deep-history fetch: pages of
+    summaries, then a full payload per match id we do not already have.
+    Pagination is real here, because the crawler stops when a page repeats
+    what it has already seen -- a stub that ignores `page` would look like
+    an endpoint that does not paginate.
     """
 
-    def __init__(self, ids: list[str], mode: str = "Competitive") -> None:
+    def __init__(
+        self, ids: list[str], mode: str = "Competitive", page_size: int = 100
+    ) -> None:
         self.ids = ids
         self.mode = mode
+        self.page_size = page_size
         self.listing_calls = 0
         self.match_calls: list[str] = []
 
     async def get(self, url: str, headers=None, params=None):
         if "stored-matches" in url:
             self.listing_calls += 1
+            page = int((params or {}).get("page", 1))
+            size = int((params or {}).get("size", self.page_size))
+            chunk = self.ids[(page - 1) * size : page * size]
             return _FakeResponse(
                 200,
                 {
                     "data": [
                         {"meta": {"id": i, "mode": self.mode, "map": {"name": "Ascent"}}}
-                        for i in self.ids
+                        for i in chunk
                     ]
                 },
             )
@@ -136,9 +145,50 @@ def test_history_fetches_every_match_in_the_listing(tmp_path: Path):
     client = _HistoryClient([f"m{i}" for i in range(40)])
     got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na"))
 
-    assert client.listing_calls == 1, "one listing request, then one per match"
+    # One full page then an empty one, which is how it learns it is done.
+    assert client.listing_calls == 2
     assert got == 40
     assert len(stored) == 40
+
+
+def test_history_walks_every_page(tmp_path: Path):
+    """Deep history paginates: 366 matches over four pages for a real account.
+
+    A single page would cap a tracked player's history at 100 matches,
+    which is most of the reason this exists.
+    """
+    db = AnalyticsDB(tmp_path / "pages.db")
+    crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
+    crawler._store = lambda raw: True
+
+    client = _HistoryClient([f"m{i}" for i in range(250)], page_size=100)
+    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na"))
+
+    assert got == 250, "every page should be walked, not just the first"
+    assert client.listing_calls == 4  # 100 + 100 + 50 + empty
+
+
+def test_history_stops_if_the_endpoint_ignores_pagination(tmp_path: Path):
+    """A listing that repeats itself must not loop until max_pages.
+
+    Guards against burning a few hundred requests re-listing the same
+    rows if the upstream ever drops `page` support.
+    """
+    db = AnalyticsDB(tmp_path / "loop.db")
+    crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
+    crawler._store = lambda raw: True
+
+    class _NoPagination(_HistoryClient):
+        async def get(self, url, headers=None, params=None):
+            if "stored-matches" in url and params:
+                params = {**params, "page": 1}  # always serve page 1
+            return await super().get(url, headers, params)
+
+    client = _NoPagination([f"m{i}" for i in range(20)])
+    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na"))
+
+    assert got == 20
+    assert client.listing_calls == 2, "should stop once a page adds nothing new"
 
 
 def test_history_skips_matches_already_stored(tmp_path: Path):

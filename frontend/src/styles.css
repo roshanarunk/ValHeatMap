@@ -852,3 +852,21 @@ input:focus, select:focus { outline: none; border-color: rgba(255, 70, 85, 0.55)
      map taller than the viewport. */
   max-width: 720px;
 }
+
+.playerhead { justify-content: space-between; }
+.playerhead__refresh {
+  flex: none;
+  padding: 8px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-input);
+  color: var(--text-dim);
+  font: 600 13px/1 var(--font);
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+}
+.playerhead__refresh:hover:not(:disabled) {
+  color: var(--text);
+  border-color: #2c3852;
+}
+.playerhead__refresh:disabled { opacity: 0.55; cursor: progress; }

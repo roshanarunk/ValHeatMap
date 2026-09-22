@@ -27,6 +27,10 @@ import type {
 type View = 'kills' | 'utility' | 'plants' | 'insights' | 'player'
 
 const ROUND_MAX_MS = 120_000
+/** Splat radius in px. Tight by default so hotspots stay distinct. */
+const DEFAULT_RADIUS = 5
+/** "Balanced" on the hotspot-focus scale. */
+const DEFAULT_PERCENTILE = 0.985
 const VIEWS: { id: View; label: string }[] = [
   { id: 'kills', label: 'Kills' },
   { id: 'utility', label: 'Utility' },
@@ -58,6 +62,7 @@ export default function App() {
   const [act, setAct] = useState('')
   const [rank, setRank] = useState('')
   const [agent, setAgent] = useState('')
+  const [roles, setRoles] = useState<string[]>([])
   const [ability, setAbility] = useState('')
   const [weapons, setWeapons] = useState<string[]>([])
   // Zone cross-filter: the box constrains one end of each duel and the map
@@ -78,7 +83,7 @@ export default function App() {
   const [ramp, setRamp] = useState<RampName>('inferno')
   const [radiusOverride, setRadiusOverride] = useState<number | null>(null)
   const [intensity, setIntensity] = useState(0.95)
-  const [percentile, setPercentile] = useState(0.985)
+  const [percentile, setPercentile] = useState(DEFAULT_PERCENTILE)
   const [rotation, setRotation] = useState(0)
   const [showCallouts, setShowCallouts] = useState(false)
   const [clusterRadius, setClusterRadius] = useState(800)
@@ -108,6 +113,7 @@ export default function App() {
       acts: act ? [act] : [],
       ranks: rank ? [rank] : [],
       agents: agent ? [agent] : [],
+      roles,
       abilities: ability ? [ability] : [],
       weapons,
       sides,
@@ -123,8 +129,8 @@ export default function App() {
       post_plant_only: postPlantOnly,
     }),
     [
-      mapName, act, rank, agent, ability, weapons, sides, timeRange, zone, anchor,
-      tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly,
+      mapName, act, rank, agent, roles, ability, weapons, sides, timeRange, zone,
+      anchor, tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly,
     ],
   )
 
@@ -180,23 +186,16 @@ export default function App() {
   const activeMap =
     view === 'plants' ? plants?.map : view === 'utility' ? utility?.map : kills?.map
 
-  // The right blur depends on how much data is on screen: a wide splat
-  // that suits 50 points merges 20,000 into one shapeless mass.
-  const autoRadius = useMemo(() => {
-    const n = shownKills.length
-    if (n === 0) return 14
-    if (n < 60) return 24
-    if (n < 250) return 18
-    if (n < 1200) return 14
-    if (n < 5000) return 11
-    return 9
-  }, [shownKills.length])
-  const radius = radiusOverride ?? autoRadius
+  // Fixed 5px rather than scaling with point count: a tight splat keeps
+  // individual positions readable instead of blurring neighbouring spots
+  // into one mass, which is what the auto sizing did on busy maps.
+  const radius = radiusOverride ?? DEFAULT_RADIUS
 
   const resetFilters = useCallback(() => {
     setAct('')
     setRank('')
     setAgent('')
+    setRoles([])
     setAbility('')
     setWeapons([])
     setSides([])
@@ -209,7 +208,8 @@ export default function App() {
   }, [])
 
   const activeFilters =
-    (act ? 1 : 0) + (rank ? 1 : 0) + (agent ? 1 : 0) + (ability ? 1 : 0) + (weapons.length ? 1 : 0) +
+    (act ? 1 : 0) + (rank ? 1 : 0) + (agent ? 1 : 0) + roles.length +
+    (ability ? 1 : 0) + (weapons.length ? 1 : 0) +
     (zone ? 1 : 0) + sides.length +
     (timeRange[0] > 0 || timeRange[1] < ROUND_MAX_MS ? 1 : 0) +
     [tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly].filter(Boolean).length
@@ -358,6 +358,21 @@ export default function App() {
                     label: a.agent,
                   }))}
                   onChange={setAgent}
+                />
+              </ControlGroup>
+            )}
+
+            {!isPlants && (
+              <ControlGroup label="Role">
+                <MultiSelect
+                  values={roles}
+                  placeholder="All roles"
+                  options={(facets?.roles ?? []).map((r) => ({
+                    value: r.role,
+                    label: r.role,
+                    hint: num(r.kills),
+                  }))}
+                  onChange={setRoles}
                 />
               </ControlGroup>
             )}
@@ -630,7 +645,7 @@ export default function App() {
                 max={40}
                 value={radius}
                 onChange={setRadiusOverride}
-                format={(v) => (radiusOverride === null ? `${v}px · auto` : `${v}px`)}
+                format={(v) => `${v}px`}
               />
               <Slider
                 label="Hotspot focus"
@@ -650,9 +665,16 @@ export default function App() {
                 onChange={setIntensity}
                 format={(v) => `${Math.round(v * 100)}%`}
               />
-              {radiusOverride !== null && (
-                <button type="button" className="linkbtn" onClick={() => setRadiusOverride(null)}>
-                  Back to auto size
+              {(radiusOverride !== null || percentile !== DEFAULT_PERCENTILE) && (
+                <button
+                  type="button"
+                  className="linkbtn"
+                  onClick={() => {
+                    setRadiusOverride(null)
+                    setPercentile(DEFAULT_PERCENTILE)
+                  }}
+                >
+                  Reset to defaults
                 </button>
               )}
             </Panel>

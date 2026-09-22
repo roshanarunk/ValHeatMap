@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -151,6 +152,18 @@ async def facets() -> dict[str, Any]:
         info = agent_meta.get(row["agent"])
         row["icon"] = info.icon if info else ""
         row["role"] = info.role if info else ""
+    # Agent roles present in the data, with how many kills each accounts
+    # for. Derived from the agent rows rather than stored, so a Riot
+    # rework that changes an agent's role is picked up automatically.
+    role_kills: dict[str, int] = {}
+    for row in data["agents"]:
+        role = row.get("role") or ""
+        if role:
+            role_kills[role] = role_kills.get(role, 0) + row.get("kills", 0)
+    data["roles"] = [
+        {"role": role, "kills": kills}
+        for role, kills in sorted(role_kills.items(), key=lambda kv: -kv[1])
+    ]
     # Rank bands, highest first -- these mirror queries.TIER_BANDS.
     data["ranks"] = [
         {"id": "radiant", "name": "Radiant", "tiers": [27, 27]},
@@ -341,6 +354,54 @@ def _player_payload(puuid: str) -> dict[str, Any]:
         # has data rather than making them guess.
         "maps": _engine.player_maps(puuid),
         **summary,
+    }
+
+
+@app.post("/api/player/{riot_id:path}/refresh")
+async def refresh_player(riot_id: str) -> dict[str, Any]:
+    """Pull this player's latest matches now, rather than on the next cycle.
+
+    Runs the fetch inline instead of only requeuing: the caller is a
+    person waiting on a button, and telling them "queued" when the
+    crawler is mid-batch would mean an indeterminate wait.
+    """
+    if _READ_ONLY:
+        raise HTTPException(409, "This deployment is read-only.")
+    name, tag = _split_riot_id(riot_id)
+    record = _db.tracked_player(name, tag)
+    if record is None:
+        raise HTTPException(404, f"{name}#{tag} is not being tracked yet.")
+
+    from .crawler import Crawler
+
+    key = clients.henrik_key()
+    if not key:
+        raise HTTPException(400, "HENRIK_API_KEY is not set on the server.")
+
+    crawler = Crawler(api_key=key, analytics=_db, region=record.get("region") or "na")
+    before = _engine.player_summary(record["puuid"]).get("matches", 0)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(40.0, connect=10.0)) as client:
+            # Never crawled: go deep. Otherwise just top up the recent ones,
+            # which is a handful of requests rather than a few hundred.
+            if record.get("crawled_at"):
+                stored = await crawler.crawl_player(
+                    client, record["puuid"], size=10, region=record.get("region")
+                )
+            else:
+                stored = await crawler.crawl_player_history(
+                    client, record["puuid"], region=record.get("region")
+                )
+    except Exception as exc:
+        raise HTTPException(502, f"Refresh failed: {exc}") from exc
+
+    _db.mark_player_crawled(record["puuid"], stored)
+    _engine.invalidate()
+    payload = _player_payload(record["puuid"])
+    return {
+        "player": payload,
+        "stored": stored,
+        "new_matches": max(0, payload.get("matches", 0) - before),
     }
 
 
