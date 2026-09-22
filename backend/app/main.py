@@ -13,14 +13,15 @@ is what makes cold starts viable on a serverless host, where re-reading the
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import os
 import threading
 import time
-from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
-import anyio.to_thread
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,29 +39,58 @@ from .sources import clients
 
 load_env()
 
-# Plain `def` route handlers (see below) run on Starlette's thread pool,
-# which defaults to 40 threads. AnalyticsDB caches one SQLite connection
-# per thread via threading.local(), so 40 threads means up to 40 live
-# connections -- each with its own WAL-mode page cache -- instead of the
-# one the API used to open and keep forever. Measured on production: 23
-# open connections to the database file after a burst of My Stats
-# traffic, API process RSS climbing from ~104MB to ~172MB, and a load
-# average of 7.99 on this machine's one shared vCPU, all from opening and
-# warming that many connections at once rather than from any query being
-# slow. A handful of threads is already a large improvement over fully
-# serialized (the state before this file's sync/async split); it is not
-# worth another 30+ connections on top of it.
-THREAD_POOL_SIZE = 6
+# Every read-only query endpoint runs its sync DB work through this fixed
+# pool rather than as a plain `def` handler.
+#
+# The first attempt at this used a plain `def` and let Starlette's own
+# anyio-managed thread pool handle it, capped via
+# anyio.to_thread.current_default_thread_limiter().total_tokens = 6. That
+# bounds *concurrency* -- at most 6 can run at once -- but not the total
+# number of distinct worker threads created over the process's life:
+# anyio spins up a new persistent worker whenever none are idle, reusing
+# idle ones for up to 10s before pruning them. AnalyticsDB caches one
+# SQLite connection per thread forever via threading.local(), so every
+# worker thread that has ever run a query keeps its own open connection
+# even after the concurrency cap would refuse it more work. Measured on
+# production after that fix: load average down from 7.99 to 1.82 and RSS
+# down from 172MB to 117MB (real improvements), but still 17 open
+# database file descriptors from one API process, and the health check
+# was still failing intermittently.
+#
+# A ThreadPoolExecutor we own outright has a fixed, known set of worker
+# threads -- exactly POOL_SIZE of them, created once, reused for the life
+# of the process, never pruned or replaced. That makes the number of
+# cached connections a hard, verifiable ceiling instead of a function of
+# traffic pattern and GC timing.
+POOL_SIZE = 6
+_pool = ThreadPoolExecutor(max_workers=POOL_SIZE, thread_name_prefix="query")
+
+T = TypeVar("T")
 
 
-@asynccontextmanager
-async def _lifespan(_: FastAPI):
-    limiter = anyio.to_thread.current_default_thread_limiter()
-    limiter.total_tokens = THREAD_POOL_SIZE
-    yield
+def pooled(fn: Callable[..., T]) -> Callable[..., Any]:
+    """Route a plain `def` handler's call through the fixed pool.
+
+    Keeps the handler itself a normal sync function -- easiest to read
+    and to unit test directly -- while FastAPI sees an `async def` with
+    the *original* signature attached via `__signature__`, so its
+    dependency injection (path/query params, Query(), Request, ...)
+    still works exactly as it does on any other route. Verified: a
+    decorated route's path and query params bind correctly, and the
+    call genuinely executes on a `query_N` pool thread, not the request
+    that reached the route.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_pool, functools.partial(fn, *args, **kwargs))
+
+    wrapper.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
+    return wrapper
 
 
-app = FastAPI(title="ValHeatMap API", version="2.0.0", lifespan=_lifespan)
+app = FastAPI(title="ValHeatMap API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -180,6 +210,7 @@ async def health() -> dict[str, Any]:
 
 
 @app.get("/api/facets")
+@pooled
 def facets() -> dict[str, Any]:
     """Everything the UI needs to populate its filter controls."""
     data = _db.facets()
@@ -217,6 +248,7 @@ def facets() -> dict[str, Any]:
 
 
 @app.get("/api/reference")
+@pooled
 def reference() -> dict[str, Any]:
     return {
         "agents": [a.as_dict() for a in sorted(agents_by_id().values(), key=lambda a: a.name)],
@@ -225,6 +257,7 @@ def reference() -> dict[str, Any]:
 
 
 @app.get("/api/maps/{map_name}")
+@pooled
 def map_detail(map_name: str) -> dict[str, Any]:
     info = get_map(map_name)
     if info is None:
@@ -234,6 +267,7 @@ def map_detail(map_name: str) -> dict[str, Any]:
 
 # --- core analytics -----------------------------------------------------
 @app.get("/api/kills")
+@pooled
 def kills_endpoint(request: Request) -> dict[str, Any]:
     """Filtered kill points in minimap space, plus headline stats.
 
@@ -254,6 +288,7 @@ def kills_endpoint(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/utility")
+@pooled
 def utility_endpoint(request: Request) -> dict[str, Any]:
     """Kills finished by damaging abilities."""
     f = _filters(request)
@@ -271,6 +306,7 @@ def utility_endpoint(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/plants")
+@pooled
 def plants_endpoint(
     request: Request,
     cluster_radius: float = Query(plant_analytics.CLUSTER_RADIUS, ge=100, le=4000),
@@ -323,6 +359,7 @@ def plants_endpoint(
 
 
 @app.get("/api/insights")
+@pooled
 def insights_endpoint(request: Request) -> dict[str, Any]:
     """Aggregate breakdowns for the current selection."""
     f = _filters(request)
@@ -452,6 +489,7 @@ async def refresh_player(riot_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/player/{riot_id:path}/matches")
+@pooled
 def player_matches(
     riot_id: str, request: Request, limit: int = 20
 ) -> dict[str, Any]:
@@ -467,6 +505,7 @@ def player_matches(
 
 
 @app.get("/api/player/{riot_id:path}")
+@pooled
 def player_detail(riot_id: str, request: Request) -> dict[str, Any]:
     """Headline stats for a tracked player, narrowed by any filters given."""
     name, tag = _split_riot_id(riot_id)
@@ -544,6 +583,7 @@ async def import_upload(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 
 @app.get("/api/dataset")
+@pooled
 def dataset_stats() -> dict[str, Any]:
     return {**_db.stats(), "read_only": _READ_ONLY}
 
