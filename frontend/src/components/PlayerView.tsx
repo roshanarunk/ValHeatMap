@@ -8,7 +8,7 @@ import {
   SegmentedControl,
   Select,
 } from './MapControls'
-import { Empty, Panel, StatTile } from './Controls'
+import { Empty, Panel, Slider, StatTile, Toggle } from './Controls'
 import { DivergingLegend, HeatLegend } from './HeatLegend'
 import { TimeSlider } from './TimeSlider'
 import {
@@ -18,11 +18,15 @@ import {
   type PlayerMatch,
   type PlayerSummary,
 } from '../lib/api'
+import type { QueryFilters } from '../lib/api'
+import type { RampName } from '../lib/heatmap'
 import type { Facets, KillPoint, KillsResponseV2 } from '../lib/types'
 
 const ROUND_MAX_MS = 120_000
 /** Matches the main view's default: tight splats keep spots distinct. */
 const PLAYER_RADIUS = 5
+/** "Balanced" on the hotspot-focus scale, matching the global views. */
+const DEFAULT_PERCENTILE = 0.985
 const STORAGE_KEY = 'valheatmap.riot_id'
 
 type Role = 'killer' | 'victim' | 'either'
@@ -111,7 +115,19 @@ export function PlayerView() {
   const [roles, setRoles] = useState<string[]>([])
   const [weapons, setWeapons] = useState<string[]>([])
   const [sides, setSides] = useState<string[]>([])
+  // Outcome filters, matching the global views. Traded/untraded are
+  // mutually exclusive, so selecting one clears the other.
+  const [tradedOnly, setTradedOnly] = useState(false)
+  const [untradedOnly, setUntradedOnly] = useState(false)
+  const [firstBloodOnly, setFirstBloodOnly] = useState(false)
+  const [postPlantOnly, setPostPlantOnly] = useState(false)
   const [facets, setFacets] = useState<Facets | null>(null)
+
+  // Rendering, same controls as the global views.
+  const [ramp, setRamp] = useState<RampName>('inferno')
+  const [radius, setRadius] = useState(PLAYER_RADIUS)
+  const [percentile, setPercentile] = useState(DEFAULT_PERCENTILE)
+  const [intensity, setIntensity] = useState(0.95)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshNote, setRefreshNote] = useState('')
 
@@ -191,28 +207,59 @@ export function PlayerView() {
     }
   }, [player])
 
+  // Everything narrowing the selection, in one place so the heatmap, the
+  // stat tiles and the match list cannot drift out of step.
+  const filters: QueryFilters = useMemo(() => {
+    // Which end the agent/role filters apply to is the mirror of the
+    // player's own: showing your kills they describe your victim, showing
+    // your deaths they describe your killer.
+    const opponentIsVictim = aggRole === 'killer'
+    return {
+      map_name: aggMap || undefined,
+      time_start: aggTime[0] > 0 ? aggTime[0] : undefined,
+      time_end: aggTime[1] < ROUND_MAX_MS ? aggTime[1] : undefined,
+      sides,
+      ...(opponentIsVictim
+        ? { victim_agents: agents, victim_roles: roles }
+        : { agents, roles }),
+      weapons,
+      traded_only: tradedOnly,
+      untraded_only: untradedOnly,
+      first_blood_only: firstBloodOnly,
+      post_plant_only: postPlantOnly,
+    }
+  }, [
+    aggMap, aggRole, aggTime, sides, agents, roles, weapons,
+    tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly,
+  ])
+
+  // Re-read the headline numbers whenever the selection changes, so the
+  // tiles describe what is on screen. Keyed on riot_id rather than the
+  // whole player object, which this effect itself replaces.
+  const riotIdKey = player?.riot_id ?? ''
+  useEffect(() => {
+    if (!riotIdKey || !aggMap) return
+    let cancelled = false
+    api
+      .player(riotIdKey, filters)
+      .then((p) => !cancelled && setPlayer((cur) => (cur ? { ...cur, ...p } : p)))
+      .catch(() => {
+        /* the heatmap request surfaces any error */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [riotIdKey, aggMap, filters])
+
   useEffect(() => {
     if (!player || !aggMap) return
     let cancelled = false
     setAggBusy(true)
-    // Which end the filters apply to is the mirror of the player's own:
-    // showing your kills, the agent/weapon filters describe your victim;
-    // showing your deaths, they describe your killer. "Both" cannot mean
-    // one fixed end, so it filters the killer side, which is who beat you
-    // or who you beat depending on the row.
-    const opponentIsVictim = aggRole === 'killer'
     api
       .killsV2({
-        map_name: aggMap,
+        ...filters,
         player: player.puuid,
         player_role: aggRole,
-        time_start: aggTime[0],
-        time_end: aggTime[1],
-        sides,
-        ...(opponentIsVictim
-          ? { victim_agents: agents, victim_roles: roles }
-          : { agents, roles }),
-        weapons,
       })
       .then((res) => !cancelled && setAgg(res))
       .catch((err) => !cancelled && setError(err instanceof Error ? err.message : String(err)))
@@ -220,7 +267,7 @@ export function PlayerView() {
     return () => {
       cancelled = true
     }
-  }, [player, aggMap, aggRole, aggTime, agents, roles, weapons, sides])
+  }, [player, aggMap, aggRole, filters])
 
   useEffect(() => {
     if (!selected) {
@@ -257,6 +304,31 @@ export function PlayerView() {
     if (roundFilter !== '') rows = rows.filter((k) => k.round === roundFilter)
     return rows.filter((k) => k.t >= timeRange[0] && k.t <= timeRange[1])
   }, [detail, player, role, roundFilter, timeRange])
+
+  const activeFilters =
+    agents.length + roles.length + weapons.length + sides.length +
+    [tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly].filter(Boolean).length +
+    (aggTime[0] > 0 || aggTime[1] < ROUND_MAX_MS ? 1 : 0)
+
+  const clearFilters = useCallback(() => {
+    setAgents([])
+    setRoles([])
+    setWeapons([])
+    setSides([])
+    setTradedOnly(false)
+    setUntradedOnly(false)
+    setFirstBloodOnly(false)
+    setPostPlantOnly(false)
+    setAggTime([0, ROUND_MAX_MS])
+  }, [])
+
+  // The ramp follows the view -- green for kills, red for deaths -- until
+  // the user picks one, after which their choice sticks.
+  const [rampTouched, setRampTouched] = useState(false)
+  useEffect(() => {
+    if (rampTouched) return
+    setRamp(aggRole === 'killer' ? 'toxic' : aggRole === 'victim' ? 'duel' : 'inferno')
+  }, [aggRole, rampTouched])
 
   // The agent/role filters describe the other player in the duel, and
   // which one that is flips with the view.
@@ -321,16 +393,57 @@ export function PlayerView() {
             </Empty>
           ) : (
             <>
-              <div className="statgrid">
-                <StatTile label="Kills" value={num(player.kills)} />
+              {activeFilters > 0 && (
+                <p className="statgrid__scope">
+                  Showing {aggMap || 'all maps'} · {activeFilters} filter
+                  {activeFilters === 1 ? '' : 's'} applied
+                </p>
+              )}
+              <div className="statgrid statgrid--wide">
+                <StatTile
+                  label="Kills"
+                  value={num(player.kills)}
+                  sub={`${num(player.matches)} matches`}
+                />
                 <StatTile label="Deaths" value={num(player.deaths)} />
-                <StatTile label="K/D" value={player.kd.toFixed(2)} />
-                <StatTile label="First bloods" value={num(player.first_bloods)} />
-                <StatTile label="First deaths" value={num(player.first_deaths)} />
+                <StatTile
+                  label="K/D"
+                  value={player.kd.toFixed(2)}
+                  tone={player.kd >= 1 ? 'good' : 'neutral'}
+                />
+                <StatTile
+                  label="Opening duels"
+                  value={`${Math.round(player.opening_win_rate * 100)}%`}
+                  sub={`${num(player.first_bloods)} won · ${num(player.first_deaths)} lost`}
+                  tone={player.opening_win_rate >= 0.5 ? 'good' : 'warn'}
+                />
                 <StatTile
                   label="Deaths traded"
                   value={`${Math.round(player.trade_rate * 100)}%`}
-                  sub="a team-mate answered"
+                  sub={`${num(player.untraded_deaths)} went unanswered`}
+                  tone={player.trade_rate >= 0.5 ? 'good' : 'neutral'}
+                />
+                <StatTile
+                  label="Trade kills"
+                  value={num(player.trade_kills)}
+                  sub="you avenged a team-mate"
+                />
+                <StatTile
+                  label="Rounds won with a kill"
+                  value={`${Math.round(player.kill_round_win_rate * 100)}%`}
+                  sub={`${num(player.rounds_won_with_kill)} of ${num(player.kills)} kills`}
+                  tone={player.kill_round_win_rate >= 0.5 ? 'good' : 'neutral'}
+                />
+                <StatTile
+                  label="Multi-kill rounds"
+                  value={num(player.multi_kill_rounds)}
+                  sub={player.best_round >= 2 ? `best: ${player.best_round}K` : ''}
+                  tone={player.best_round >= 5 ? 'hot' : 'neutral'}
+                />
+                <StatTile
+                  label="Post-plant"
+                  value={`${num(player.post_plant_kills)} / ${num(player.post_plant_deaths)}`}
+                  sub="kills / deaths after the spike"
                 />
               </div>
 
@@ -433,37 +546,57 @@ export function PlayerView() {
                       onChange={setWeapons}
                     />
                   </ControlGroup>
-                  {(agents.length > 0 ||
-                    roles.length > 0 ||
-                    weapons.length > 0 ||
-                    sides.length > 0) && (
-                    <ControlGroup label=" ">
-                      <button
-                        type="button"
-                        className="linkbtn"
-                        onClick={() => {
-                          setAgents([])
-                          setRoles([])
-                          setWeapons([])
-                          setSides([])
+                  <ControlGroup label="Filter">
+                    <div className="togglerow">
+                      <Toggle
+                        label="Traded"
+                        checked={tradedOnly}
+                        onChange={(v) => {
+                          setTradedOnly(v)
+                          if (v) setUntradedOnly(false)
                         }}
-                      >
-                        Clear filters
+                      />
+                      <Toggle
+                        label="Untraded"
+                        checked={untradedOnly}
+                        onChange={(v) => {
+                          setUntradedOnly(v)
+                          if (v) setTradedOnly(false)
+                        }}
+                      />
+                      <Toggle
+                        label="Openings"
+                        checked={firstBloodOnly}
+                        onChange={setFirstBloodOnly}
+                      />
+                      <Toggle
+                        label="Post-plant"
+                        checked={postPlantOnly}
+                        onChange={setPostPlantOnly}
+                      />
+                    </div>
+                  </ControlGroup>
+                  {activeFilters > 0 && (
+                    <ControlGroup label=" ">
+                      <button type="button" className="linkbtn" onClick={clearFilters}>
+                        Clear {activeFilters} filter{activeFilters === 1 ? '' : 's'}
                       </button>
                     </ControlGroup>
                   )}
                 </ControlBar>
 
-                <div className="aggmap__canvas">
+                <div className="aggmap__layout">
+                  <div className="aggmap__canvas">
                   <MapCanvas
                     map={agg?.map ?? null}
                     kills={agg?.points ?? []}
                     mode={aggMode}
                     // Green for kills, red for deaths, so the colour means
                     // the same thing here as in the combined view.
-                    ramp={aggRole === 'killer' ? 'toxic' : 'duel'}
-                    radius={PLAYER_RADIUS}
-                    intensity={1}
+                    ramp={ramp}
+                    radius={radius}
+                    intensity={intensity}
+                    percentile={percentile}
                     // Plot where the player was: their own position is the
                     // kill end when they got the kill, the death end when
                     // they died.
@@ -485,7 +618,7 @@ export function PlayerView() {
                       <DivergingLegend />
                     ) : (
                       <HeatLegend
-                        ramp={aggRole === 'killer' ? 'toxic' : 'duel'}
+                        ramp={ramp}
                         label={aggRole === 'killer' ? 'Your kills' : 'Your deaths'}
                       />
                     ))}
@@ -495,6 +628,72 @@ export function PlayerView() {
                       {agg.sampled ? ` · showing ${num(agg.points.length)}` : ''}
                     </p>
                   )}
+                  </div>
+
+                  <Panel title="Rendering">
+                    {/* The diverging view uses its own fixed scale, so a
+                        ramp picker there would do nothing. */}
+                    {aggRole !== 'either' && (
+                      <SegmentedControl
+                        size="sm"
+                        value={ramp}
+                        options={(['inferno', 'ice', 'toxic', 'duel'] as RampName[]).map(
+                          (r) => ({
+                            value: r,
+                            label:
+                              r === 'duel' ? 'Blood' : r[0].toUpperCase() + r.slice(1),
+                          }),
+                        )}
+                        onChange={(v) => {
+                          setRamp(v as RampName)
+                          setRampTouched(true)
+                        }}
+                      />
+                    )}
+                    <Slider
+                      label="Spot size"
+                      min={5}
+                      max={40}
+                      value={radius}
+                      onChange={setRadius}
+                      format={(v) => `${v}px`}
+                    />
+                    <Slider
+                      label="Hotspot focus"
+                      min={0.9}
+                      max={1}
+                      step={0.005}
+                      value={percentile}
+                      onChange={setPercentile}
+                      format={(v) =>
+                        v >= 0.999 ? 'Peaks' : v >= 0.985 ? 'Balanced' : 'Broad'
+                      }
+                    />
+                    <Slider
+                      label="Opacity"
+                      min={0.3}
+                      max={1}
+                      step={0.05}
+                      value={intensity}
+                      onChange={setIntensity}
+                      format={(v) => `${Math.round(v * 100)}%`}
+                    />
+                    {(radius !== PLAYER_RADIUS ||
+                      percentile !== DEFAULT_PERCENTILE ||
+                      intensity !== 0.95) && (
+                      <button
+                        type="button"
+                        className="linkbtn"
+                        onClick={() => {
+                          setRadius(PLAYER_RADIUS)
+                          setPercentile(DEFAULT_PERCENTILE)
+                          setIntensity(0.95)
+                        }}
+                      >
+                        Reset to defaults
+                      </button>
+                    )}
+                  </Panel>
                 </div>
               </section>
 

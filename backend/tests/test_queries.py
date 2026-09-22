@@ -743,3 +743,81 @@ def test_victim_role_filters_the_other_end(engine: QueryEngine):
         killed_sentinels["total"]
         == engine.summary(Filters(map_name="Ascent", victim_agents=["Sage"]))["total"]
     )
+
+
+# --- advanced player stats ----------------------------------------------
+def test_player_summary_respects_filters(db: AnalyticsDB):
+    """Tiles describe the current selection, not always a career total."""
+    engine = QueryEngine(db)
+    career = engine.player_summary("atk")
+    one_act = engine.player_summary("atk", Filters(map_name="Ascent", acts=["e11a5"]))
+
+    assert career["kills"] > one_act["kills"] > 0
+    assert career["matches"] == 6
+    assert one_act["matches"] == 4
+
+
+def test_filtered_sides_partition_the_totals(db: AnalyticsDB):
+    """A partition of the data must partition the numbers derived from it."""
+    engine = QueryEngine(db)
+    whole = engine.player_summary("atk", Filters(map_name="Ascent"))
+    atk = engine.player_summary("atk", Filters(map_name="Ascent", sides=["attack"]))
+    dfn = engine.player_summary("atk", Filters(map_name="Ascent", sides=["defense"]))
+
+    assert atk["kills"] + dfn["kills"] == whole["kills"]
+    assert atk["deaths"] + dfn["deaths"] == whole["deaths"]
+
+
+def test_opening_duels_are_first_bloods_plus_first_deaths(db: AnalyticsDB):
+    """The rate is over duels taken, not over every kill."""
+    s = QueryEngine(db).player_summary("atk")
+    assert s["opening_duels"] == s["first_bloods"] + s["first_deaths"]
+    if s["opening_duels"]:
+        assert s["opening_win_rate"] == round(
+            s["first_bloods"] / s["opening_duels"], 4
+        )
+
+
+def test_traded_and_untraded_deaths_sum_to_deaths(db: AnalyticsDB):
+    s = QueryEngine(db).player_summary("atk")
+    assert s["traded_deaths"] + s["untraded_deaths"] == s["deaths"]
+
+
+def test_kill_round_win_rate_is_bounded(db: AnalyticsDB):
+    """You cannot win more rounds with a kill than you have kills."""
+    s = QueryEngine(db).player_summary("atk")
+    assert 0 <= s["rounds_won_with_kill"] <= s["kills"]
+    assert 0.0 <= s["kill_round_win_rate"] <= 1.0
+
+
+def test_best_round_is_at_least_two_when_multi_kill_rounds_exist(db: AnalyticsDB):
+    """`best_round` counts a single round, so it cannot be below the
+    threshold that defines a multi-kill round."""
+    s = QueryEngine(db).player_summary("atk")
+    if s["multi_kill_rounds"] > 0:
+        assert s["best_round"] >= 2
+
+
+def test_untracked_player_gets_zeroed_advanced_stats(db: AnalyticsDB):
+    """Every key must be present, or the UI reads undefined."""
+    known = QueryEngine(db).player_summary("atk")
+    unknown = QueryEngine(db).player_summary("nobody")
+    assert set(unknown) == set(known)
+    assert unknown["tracked"] is False
+    assert unknown["opening_win_rate"] == 0.0
+    assert unknown["best_round"] == 0
+
+
+def test_player_summary_ignores_the_player_filter_on_f(db: AnalyticsDB):
+    """`f` may carry player/player_role from the shared filter object.
+
+    Honouring them would constrain to one end of the duel and make
+    "deaths" always zero, so they are stripped.
+    """
+    engine = QueryEngine(db)
+    plain = engine.player_summary("atk", Filters(map_name="Ascent"))
+    with_player = engine.player_summary(
+        "atk", Filters(map_name="Ascent", player="atk", player_role="killer")
+    )
+    assert plain == with_player
+    assert plain["deaths"] > 0

@@ -870,3 +870,21 @@ input:focus, select:focus { outline: none; border-color: rgba(255, 70, 85, 0.55)
   border-color: #2c3852;
 }
 .playerhead__refresh:disabled { opacity: 0.55; cursor: progress; }
+
+/* Map beside its rendering controls, mirroring the global stage. */
+.aggmap__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 16px;
+  align-items: start;
+}
+.aggmap__layout .aggmap__canvas { max-width: none; }
+.statgrid__scope {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .aggmap__layout { grid-template-columns: minmax(0, 1fr); }
+}

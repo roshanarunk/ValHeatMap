@@ -134,6 +134,20 @@ export interface PlayerSummary {
   trade_rate: number
   first_bloods: number
   first_deaths: number
+  untraded_deaths: number
+  /** First bloods + first deaths: the duels that opened a round. */
+  opening_duels: number
+  opening_win_rate: number
+  /** Kills that avenged a team-mate. */
+  trade_kills: number
+  rounds_won_with_kill: number
+  /** Of rounds you got a kill in, the share your team won. */
+  kill_round_win_rate: number
+  post_plant_kills: number
+  post_plant_deaths: number
+  /** Rounds with 2+ kills, and the best single round. */
+  multi_kill_rounds: number
+  best_round: number
   tracked: boolean
 }
 
@@ -240,11 +254,17 @@ export const api = {
     }),
   // The Riot ID goes in the path, so the # must be encoded or it reads as
   // a URL fragment and never reaches the server.
-  player: (riotId: string) => get<PlayerSummary>(`/api/player/${encodeURIComponent(riotId)}`),
-  playerMatches: (riotId: string, limit = 20) =>
+  // Filters narrow the headline numbers to the current selection, so the
+  // stat tiles describe what is on screen rather than always a career.
+  player: (riotId: string, f: QueryFilters = {}) =>
+    get<PlayerSummary>(
+      `/api/player/${encodeURIComponent(riotId)}`,
+      f as Record<string, unknown>,
+    ),
+  playerMatches: (riotId: string, limit = 20, f: QueryFilters = {}) =>
     get<{ player: PlayerSummary; matches: PlayerMatch[] }>(
       `/api/player/${encodeURIComponent(riotId)}/matches`,
-      { limit },
+      { ...(f as Record<string, unknown>), limit },
     ),
   refreshPlayer: (riotId: string) =>
     post<{ player: PlayerSummary; stored: number; new_matches: number }>(

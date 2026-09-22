@@ -87,8 +87,20 @@ since scaling them separately would normalise away the very imbalance
 being shown, and the share is stretched away from the centre because real
 spots are rarely lopsided enough to reach the ends unaided.
 
+The headline tiles go beyond K/D: opening-duel win rate (first bloods
+over the duels that opened a round, which is a different skill from
+overall K/D), how often your deaths get traded and how many went
+unanswered, kills that avenged a team-mate, the share of your kills that
+land in rounds your team won, multi-kill rounds with your best, and
+post-plant kills against post-plant deaths.
+
+Every tile respects the current filters, so they describe what is on
+screen rather than always a career. Rendering controls — ramp, spot
+size, hotspot focus, opacity — sit beside the map as they do on the
+global views.
+
 Everything is filterable by agent, **role** (Duelist, Sentinel, …),
-weapon and side. Roles are expanded to their agents at query time rather
+weapon, side, and outcome (traded, untraded, openings, post-plant). Roles are expanded to their agents at query time rather
 than stored per kill, so a Riot rework that changes an agent's role is
 picked up without touching old rows. On the player page the agent and
 role filters describe the *opponent* -- who you killed when viewing your
@@ -294,11 +306,11 @@ cd backend && python -m pytest
 cd frontend && npm run check:colours
 ```
 
-142 tests covering both source adapters, the coordinate transform, trade
+150 tests covering both source adapters, the coordinate transform, trade
 detection windows and radii, plant clustering, filtering, mode awareness,
 persistence, crawler dedup and rate-limit handling, player attribution,
-role expansion, history pagination, schema migration, and the deploy
-script's carry-over merge. They run
+role expansion, history pagination, filtered player stats, schema
+migration, and the deploy script's carry-over merge. They run
 against temporary databases with no network access.
 
 Several exist because something broke in production and the test is how

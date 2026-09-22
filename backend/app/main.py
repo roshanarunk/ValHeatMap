@@ -338,10 +338,16 @@ async def register_player(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
     return {"player": _player_payload(record["puuid"]), "new": True}
 
 
-def _player_payload(puuid: str) -> dict[str, Any]:
-    """Everything the player tab needs about one tracked player."""
+def _player_payload(puuid: str, f: Filters | None = None) -> dict[str, Any]:
+    """Everything the player tab needs about one tracked player.
+
+    `f` narrows the headline numbers to the current selection, so the
+    tiles describe what is on screen rather than always a career total.
+    The map list stays unfiltered: it is the picker, and filtering it by
+    the selected map would leave one entry.
+    """
     record = _db.tracked_by_puuid(puuid) or {}
-    summary = _engine.player_summary(puuid)
+    summary = _engine.player_summary(puuid, f)
     return {
         "puuid": puuid,
         "name": record.get("name", ""),
@@ -406,28 +412,30 @@ async def refresh_player(riot_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/player/{riot_id:path}/matches")
-async def player_matches(riot_id: str, limit: int = 20) -> dict[str, Any]:
+async def player_matches(
+    riot_id: str, request: Request, limit: int = 20
+) -> dict[str, Any]:
     """A tracked player's matches, newest first, for the review list."""
     name, tag = _split_riot_id(riot_id)
     record = _db.tracked_player(name, tag)
     if record is None:
         raise HTTPException(404, f"{name}#{tag} is not being tracked yet.")
     return {
-        "player": _player_payload(record["puuid"]),
+        "player": _player_payload(record["puuid"], _filters(request)),
         "matches": _engine.player_matches(record["puuid"], limit=limit),
     }
 
 
 @app.get("/api/player/{riot_id:path}")
-async def player_detail(riot_id: str) -> dict[str, Any]:
-    """Headline stats for a tracked player."""
+async def player_detail(riot_id: str, request: Request) -> dict[str, Any]:
+    """Headline stats for a tracked player, narrowed by any filters given."""
     name, tag = _split_riot_id(riot_id)
     record = _db.tracked_player(name, tag)
     if record is None:
         raise HTTPException(404, f"{name}#{tag} is not being tracked yet.")
     # Touch it: the crawler uses last_seen_at to keep active players fresh.
     _db.track_player(record["puuid"], record["name"], record["tag"], record.get("region"))
-    return _player_payload(record["puuid"])
+    return _player_payload(record["puuid"], _filters(request))
 
 
 @app.get("/api/match/{match_id}")

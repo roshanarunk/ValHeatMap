@@ -8,7 +8,7 @@ navigate: pick a map first, then narrow.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .analytics_db import (
@@ -18,6 +18,7 @@ from .analytics_db import (
     FLAG_FIRST_BLOOD,
     FLAG_POST_PLANT,
     FLAG_ROUND_WON,
+    FLAG_TRADE_KILL,
     FLAG_TRADED,
     SIDE_NAME,
     AnalyticsDB,
@@ -547,19 +548,39 @@ class QueryEngine:
         return [{"weapon": weapons.get(r["weapon_id"], "?"), "kills": r["kills"]} for r in rows]
 
     # --- personal stats -------------------------------------------------
-    def player_summary(self, puuid: str) -> dict[str, Any]:
-        """Career totals for one player across everything we have.
+    def player_summary(
+        self, puuid: str, f: "Filters | None" = None
+    ) -> dict[str, Any]:
+        """Totals for one player, optionally within a filtered selection.
 
         Kills and deaths come from the same rows read from both ends, so
         a single pass answers both rather than two filtered queries.
+
+        When `f` is given its clauses are applied, letting the tiles
+        describe the current selection rather than only a career. The
+        player and role fields on `f` are ignored here: this reads both
+        ends deliberately, and constraining to one would make "deaths"
+        always zero.
         """
         pid = self._ids("player").get(puuid)
         if pid is None:
             return {
                 "kills": 0, "deaths": 0, "kd": 0.0, "matches": 0,
                 "traded_deaths": 0, "trade_rate": 0.0,
-                "first_bloods": 0, "first_deaths": 0, "tracked": False,
+                "first_bloods": 0, "first_deaths": 0,
+                "opening_duels": 0, "opening_win_rate": 0.0,
+                "trade_kills": 0, "untraded_deaths": 0,
+                "rounds_won_with_kill": 0, "kill_round_win_rate": 0.0,
+                "post_plant_kills": 0, "post_plant_deaths": 0,
+                "multi_kill_rounds": 0, "best_round": 0,
+                "tracked": False,
             }
+
+        where, args = "1=1", []
+        if f is not None:
+            scoped = replace(f, player="", player_role="killer")
+            where, args = self._where(scoped)
+
         with self.db.connect() as conn:
             row = conn.execute(
                 f"""SELECT
@@ -568,14 +589,43 @@ class QueryEngine:
                         SUM(victim_pid = ? AND (flags & {FLAG_TRADED}) != 0) traded_deaths,
                         SUM(killer_pid = ? AND (flags & {FLAG_FIRST_BLOOD}) != 0) first_bloods,
                         SUM(victim_pid = ? AND (flags & {FLAG_FIRST_BLOOD}) != 0) first_deaths,
+                        SUM(killer_pid = ? AND (flags & {FLAG_TRADE_KILL}) != 0) trade_kills,
+                        SUM(killer_pid = ? AND (flags & {FLAG_ROUND_WON}) != 0) kills_in_won,
+                        SUM(killer_pid = ? AND (flags & {FLAG_POST_PLANT}) != 0) pp_kills,
+                        SUM(victim_pid = ? AND (flags & {FLAG_POST_PLANT}) != 0) pp_deaths,
                         COUNT(DISTINCT m) matches
                     FROM kills
-                    WHERE killer_pid = ? OR victim_pid = ?""",
-                [pid] * 7,
+                    WHERE (killer_pid = ? OR victim_pid = ?) AND {where}""",
+                [pid] * 11 + args,
             ).fetchone()
+
+            # Rounds where they got two or more kills. Grouped per round
+            # within a match, since round numbers repeat across matches.
+            multi = conn.execute(
+                f"""SELECT COUNT(*) rounds, COALESCE(MAX(n), 0) best FROM (
+                        SELECT COUNT(*) n FROM kills
+                        WHERE killer_pid = ? AND {where}
+                        GROUP BY m, round_num
+                        HAVING n >= 2
+                    )""",
+                [pid] + args,
+            ).fetchone()
+            best = conn.execute(
+                f"""SELECT COALESCE(MAX(n), 0) best FROM (
+                        SELECT COUNT(*) n FROM kills
+                        WHERE killer_pid = ? AND {where}
+                        GROUP BY m, round_num
+                    )""",
+                [pid] + args,
+            ).fetchone()
+
         kills = row["kills"] or 0
         deaths = row["deaths"] or 0
         traded = row["traded_deaths"] or 0
+        first_bloods = row["first_bloods"] or 0
+        first_deaths = row["first_deaths"] or 0
+        openings = first_bloods + first_deaths
+        kills_in_won = row["kills_in_won"] or 0
         return {
             "kills": kills,
             "deaths": deaths,
@@ -587,8 +637,23 @@ class QueryEngine:
             # How often a team-mate answered your death: the one number
             # here that says something about the team, not the player.
             "trade_rate": round(traded / deaths, 4) if deaths else 0.0,
-            "first_bloods": row["first_bloods"] or 0,
-            "first_deaths": row["first_deaths"] or 0,
+            "untraded_deaths": deaths - traded,
+            "first_bloods": first_bloods,
+            "first_deaths": first_deaths,
+            # Opening duels are the ones you chose to take; winning them
+            # is a different skill from overall K/D.
+            "opening_duels": openings,
+            "opening_win_rate": round(first_bloods / openings, 4) if openings else 0.0,
+            "trade_kills": row["trade_kills"] or 0,
+            # Of the rounds you got a kill in, how many did your team win.
+            # Not "your win rate" -- it says whether your kills land in
+            # rounds that matter.
+            "rounds_won_with_kill": kills_in_won,
+            "kill_round_win_rate": round(kills_in_won / kills, 4) if kills else 0.0,
+            "post_plant_kills": row["pp_kills"] or 0,
+            "post_plant_deaths": row["pp_deaths"] or 0,
+            "multi_kill_rounds": multi["rounds"] or 0,
+            "best_round": best["best"] or 0,
             "tracked": True,
         }
 
