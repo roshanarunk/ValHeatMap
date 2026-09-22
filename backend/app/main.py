@@ -127,7 +127,7 @@ async def _source_error(_: Request, exc: clients.SourceError) -> JSONResponse:
 
 # --- meta ---------------------------------------------------------------
 @app.get("/api/health")
-async def health() -> dict[str, Any]:
+def health() -> dict[str, Any]:
     stats = _db.stats()
     return {
         "status": "ok",
@@ -140,7 +140,7 @@ async def health() -> dict[str, Any]:
 
 
 @app.get("/api/facets")
-async def facets() -> dict[str, Any]:
+def facets() -> dict[str, Any]:
     """Everything the UI needs to populate its filter controls."""
     data = _db.facets()
     for row in data["maps"]:
@@ -177,7 +177,7 @@ async def facets() -> dict[str, Any]:
 
 
 @app.get("/api/reference")
-async def reference() -> dict[str, Any]:
+def reference() -> dict[str, Any]:
     return {
         "agents": [a.as_dict() for a in sorted(agents_by_id().values(), key=lambda a: a.name)],
         "weapons": [w.as_dict() for w in sorted(weapons_by_id().values(), key=lambda w: w.name)],
@@ -185,7 +185,7 @@ async def reference() -> dict[str, Any]:
 
 
 @app.get("/api/maps/{map_name}")
-async def map_detail(map_name: str) -> dict[str, Any]:
+def map_detail(map_name: str) -> dict[str, Any]:
     info = get_map(map_name)
     if info is None:
         raise HTTPException(404, "Unknown map.")
@@ -194,7 +194,7 @@ async def map_detail(map_name: str) -> dict[str, Any]:
 
 # --- core analytics -----------------------------------------------------
 @app.get("/api/kills")
-async def kills_endpoint(request: Request) -> dict[str, Any]:
+def kills_endpoint(request: Request) -> dict[str, Any]:
     """Filtered kill points in minimap space, plus headline stats.
 
     Filters arrive as query parameters, e.g.
@@ -214,7 +214,7 @@ async def kills_endpoint(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/utility")
-async def utility_endpoint(request: Request) -> dict[str, Any]:
+def utility_endpoint(request: Request) -> dict[str, Any]:
     """Kills finished by damaging abilities."""
     f = _filters(request)
     f.utility_only = True
@@ -231,7 +231,7 @@ async def utility_endpoint(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/plants")
-async def plants_endpoint(
+def plants_endpoint(
     request: Request,
     cluster_radius: float = Query(plant_analytics.CLUSTER_RADIUS, ge=100, le=4000),
     min_sample: int = Query(plant_analytics.MIN_SAMPLE, ge=1, le=500),
@@ -283,7 +283,7 @@ async def plants_endpoint(
 
 
 @app.get("/api/insights")
-async def insights_endpoint(request: Request) -> dict[str, Any]:
+def insights_endpoint(request: Request) -> dict[str, Any]:
     """Aggregate breakdowns for the current selection."""
     f = _filters(request)
     _require_map(f)
@@ -412,7 +412,7 @@ async def refresh_player(riot_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/player/{riot_id:path}/matches")
-async def player_matches(
+def player_matches(
     riot_id: str, request: Request, limit: int = 20
 ) -> dict[str, Any]:
     """A tracked player's matches, newest first, for the review list."""
@@ -427,7 +427,7 @@ async def player_matches(
 
 
 @app.get("/api/player/{riot_id:path}")
-async def player_detail(riot_id: str, request: Request) -> dict[str, Any]:
+def player_detail(riot_id: str, request: Request) -> dict[str, Any]:
     """Headline stats for a tracked player, narrowed by any filters given."""
     name, tag = _split_riot_id(riot_id)
     record = _db.tracked_player(name, tag)
@@ -504,7 +504,7 @@ async def import_upload(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 
 @app.get("/api/dataset")
-async def dataset_stats() -> dict[str, Any]:
+def dataset_stats() -> dict[str, Any]:
     return {**_db.stats(), "read_only": _READ_ONLY}
 
 

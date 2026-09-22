@@ -35,6 +35,7 @@ from typing import Any
 
 import httpx
 
+from . import load
 from .analytics.kills import enrich
 from .analytics_db import AnalyticsDB
 from .config import load_env
@@ -565,6 +566,20 @@ async def run_forever(
         cycle += 1
         if control is not None:
             control.cycle = cycle
+
+        # Yield more of the shared vCPU to whatever else is running --
+        # chiefly the API process -- when the machine is already busy.
+        # This machine has one shared vCPU and no swap; a batch of 200
+        # matches is not itself expensive, but it is one more thing
+        # competing for the same core as a My Stats request that just
+        # asked for several ad-hoc aggregates. A short extra sleep here
+        # costs nothing when the machine is idle and buys the busy case
+        # real headroom, at the cost of the crawler falling a little
+        # further behind -- which it always catches back up on.
+        if load.is_busy():
+            crawler.log("  · machine busy, pausing 15s before this batch")
+            await asyncio.sleep(15)
+
         before = crawler.stored
         try:
             await crawler.run(target_matches=before + batch)
@@ -614,21 +629,31 @@ async def run_forever(
             and since_facets >= FACET_REFRESH_MATCHES
             and (facet_task is None or facet_task.done())
         ):
-            since_facets = 0
+            # Even on a worker thread this is real CPU and disk time --
+            # 21s measured on the production database after indexing the
+            # group-by columns, down from 139s unindexed, but still enough
+            # to matter on one shared vCPU with a My Stats request also
+            # in flight. Deferring leaves since_facets where it is, so the
+            # next cycle tries again rather than resetting the counter and
+            # letting the cache go stale for another 400 matches.
+            if load.is_busy():
+                crawler.log("  · machine busy, deferring facet cache rebuild")
+            else:
+                since_facets = 0
 
-            async def _rebuild(analytics: AnalyticsDB) -> None:
-                started = time.monotonic()
-                try:
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, analytics.rebuild_facet_cache
-                    )
-                    crawler.log(
-                        f"  · facet cache rebuilt in {time.monotonic() - started:.0f}s"
-                    )
-                except Exception as exc:  # a stale cache is not worth stopping over
-                    crawler.log(f"  ! facet cache rebuild failed: {exc}")
+                async def _rebuild(analytics: AnalyticsDB) -> None:
+                    started = time.monotonic()
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            None, analytics.rebuild_facet_cache
+                        )
+                        crawler.log(
+                            f"  · facet cache rebuilt in {time.monotonic() - started:.0f}s"
+                        )
+                    except Exception as exc:  # a stale cache is not worth stopping over
+                        crawler.log(f"  ! facet cache rebuild failed: {exc}")
 
-            facet_task = asyncio.ensure_future(_rebuild(crawler.analytics))
+                facet_task = asyncio.ensure_future(_rebuild(crawler.analytics))
 
         if gained == 0:
             # Frontier exhausted or upstream unhappy; back off rather than spin.

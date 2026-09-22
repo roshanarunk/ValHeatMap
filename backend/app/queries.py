@@ -185,6 +185,16 @@ class Filters:
 
 
 class QueryEngine:
+    """One instance is shared across every request, now including
+    concurrent ones on Starlette's thread pool (route handlers with no
+    `await` run as plain `def` so they don't block the event loop; see
+    main.py). `_dims` is a plain dict with a check-then-set pattern that
+    is not atomic as a whole, so two threads can race to fill the same
+    key -- harmless, since both would compute the same value and dict
+    item assignment is itself safe under the GIL. Nothing here iterates
+    `_dims`, which is the case that would actually be unsafe.
+    """
+
     def __init__(self, db: AnalyticsDB) -> None:
         self.db = db
         self._dims: dict[str, dict[str, int]] = {}
