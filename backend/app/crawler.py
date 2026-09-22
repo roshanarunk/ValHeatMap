@@ -567,18 +567,30 @@ async def run_forever(
         if control is not None:
             control.cycle = cycle
 
-        # Yield more of the shared vCPU to whatever else is running --
-        # chiefly the API process -- when the machine is already busy.
-        # This machine has one shared vCPU and no swap; a batch of 200
-        # matches is not itself expensive, but it is one more thing
-        # competing for the same core as a My Stats request that just
-        # asked for several ad-hoc aggregates. A short extra sleep here
-        # costs nothing when the machine is idle and buys the busy case
-        # real headroom, at the cost of the crawler falling a little
-        # further behind -- which it always catches back up on.
-        if load.is_busy():
-            crawler.log("  · machine busy, pausing 15s before this batch")
-            await asyncio.sleep(15)
+        # Yield more of the shared vCPU and disk I/O to whatever else is
+        # running -- chiefly the API process -- when the machine is
+        # already busy, or unconditionally during hours real people are
+        # likely to be using the site.
+        #
+        # The reactive checks (load average, free memory, and now real
+        # query latency) exist because each one caught an incident the
+        # others missed -- but an incident where a plain COUNT(*) on the
+        # kills table took 4.8-13s, from disk I/O contention between this
+        # process's writes and the API's reads, was invisible to load
+        # average and free memory both. A fixed quiet window is a floor
+        # under those signals, not a replacement: it throttles even when
+        # everything *looks* idle, because "looks idle by these metrics"
+        # is exactly what that incident did right up until a real request
+        # hung. Longer pause during quiet hours (60s vs 15s) for the same
+        # reason -- reacting after the fact was not enough; the point is
+        # to leave more headroom before it is needed.
+        db_path = str(crawler.analytics.path) if crawler.analytics is not None else None
+        quiet = load.in_quiet_hours()
+        if quiet or load.is_busy(db_path):
+            wait = 60 if quiet else 15
+            reason = "quiet hours" if quiet else "machine busy"
+            crawler.log(f"  · {reason}, pausing {wait}s before this batch")
+            await asyncio.sleep(wait)
 
         before = crawler.stored
         try:
@@ -635,9 +647,14 @@ async def run_forever(
             # to matter on one shared vCPU with a My Stats request also
             # in flight. Deferring leaves since_facets where it is, so the
             # next cycle tries again rather than resetting the counter and
-            # letting the cache go stale for another 400 matches.
-            if load.is_busy():
-                crawler.log("  · machine busy, deferring facet cache rebuild")
+            # letting the cache go stale for another 400 matches. Deferred
+            # unconditionally during quiet hours too, same reasoning as
+            # the batch pause above: this is disk-and-CPU-heavy work that
+            # can wait, and "machine looks idle" was already shown not to
+            # mean "the disk has headroom right now."
+            if quiet or load.is_busy(db_path):
+                reason = "quiet hours" if quiet else "machine busy"
+                crawler.log(f"  · {reason}, deferring facet cache rebuild")
             else:
                 since_facets = 0
 
