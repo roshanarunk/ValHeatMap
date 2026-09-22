@@ -44,9 +44,16 @@ function when(ts: number | null): string {
   return new Date(ms).toLocaleDateString()
 }
 
-/** A match's kills, in the shape MapCanvas already knows how to draw. */
-function toKillPoints(detail: MatchDetail): KillPoint[] {
+/**
+ * A match's kills, in the shape MapCanvas already knows how to draw.
+ *
+ * `mine` is set here rather than left to the canvas: match review carries
+ * real puuids, while the aggregate endpoint sends the flag directly, and
+ * having one field means the canvas never has to know the difference.
+ */
+function toKillPoints(detail: MatchDetail, puuid?: string): KillPoint[] {
   return detail.kills.map((k) => ({
+    ...(puuid ? { mine: k.killer === puuid } : {}),
     round: k.round,
     t: k.t_ms,
     killer: k.killer,
@@ -180,7 +187,7 @@ export function PlayerView() {
   // The kills drawn on the map, after the review filters.
   const points = useMemo(() => {
     if (!detail) return []
-    let rows = toKillPoints(detail)
+    let rows = toKillPoints(detail, player?.puuid)
     if (player) {
       if (role === 'killer') rows = rows.filter((k) => k.killer === player.puuid)
       else if (role === 'victim') rows = rows.filter((k) => k.victim === player.puuid)

@@ -351,7 +351,7 @@ class QueryEngine:
 
             rows = conn.execute(
                 f"""SELECT t_ms, side, ka_id, va_id, weapon_id, ability_id, dmg_type,
-                           vx, vy, kx, ky, flags, round_num
+                           vx, vy, kx, ky, flags, round_num, killer_pid, victim_pid
                     FROM kills WHERE {where}{sample_sql}""",
                 args,
             ).fetchall()
@@ -359,10 +359,20 @@ class QueryEngine:
         agents = self._names("agent")
         weapons = self._names("weapon")
         abilities = self._names("ability")
+        # When the caller asked about one player, say which end of each duel
+        # they were on. A boolean rather than the puuid: the client only
+        # needs "was this mine", and repeating a 36-byte id on every point
+        # would be most of the payload.
+        subject_pid = self._ids("player").get(f.player) if f.player else None
         points = [
             {
                 "t": r["t_ms"],
                 "round": r["round_num"],
+                **(
+                    {"mine": r["killer_pid"] == subject_pid}
+                    if subject_pid is not None
+                    else {}
+                ),
                 "side": SIDE_NAME.get(r["side"], "none"),
                 "killer_agent": agents.get(r["ka_id"], ""),
                 "victim_agent": agents.get(r["va_id"], ""),

@@ -643,3 +643,42 @@ def test_match_filter_restricts_to_one_match(engine: QueryEngine):
     every = engine.summary(Filters(map_name="Ascent"))
     assert one["total"] == 4
     assert every["total"] > one["total"]
+
+
+def test_kill_points_say_which_end_the_subject_was_on(db: AnalyticsDB):
+    """The combined heatmap needs to know whose kill each point was.
+
+    It previously matched on puuid client-side, but kill points carry
+    agent names, not player ids -- so every duel fell through to "death"
+    and the whole map rendered red. The server sets the flag instead.
+    """
+    engine = QueryEngine(db)
+    res = engine.kill_points(Filters(map_name="Ascent", player="atk", player_role="either"))
+    flags = [p.get("mine") for p in res["points"]]
+
+    assert all(f is not None for f in flags), "every point needs the flag"
+    assert any(flags) and not all(flags), "the fixture has both kills and deaths"
+
+    # It must agree with the dedicated single-role queries.
+    kills = engine.summary(Filters(map_name="Ascent", player="atk", player_role="killer"))
+    deaths = engine.summary(Filters(map_name="Ascent", player="atk", player_role="victim"))
+    assert sum(1 for f in flags if f) == kills["total"]
+    assert sum(1 for f in flags if not f) == deaths["total"]
+
+
+def test_kill_points_omit_the_flag_when_no_player_is_named(engine: QueryEngine):
+    """The global views have no subject, so the field would be meaningless."""
+    res = engine.kill_points(Filters(map_name="Ascent"))
+    assert res["points"]
+    assert all("mine" not in p for p in res["points"])
+
+
+def test_mine_flag_follows_the_named_player(db: AnalyticsDB):
+    """Two players in the same duels must get opposite flags."""
+    engine = QueryEngine(db)
+    atk = engine.kill_points(Filters(map_name="Ascent", player="atk", player_role="either"))
+    dfn = engine.kill_points(Filters(map_name="Ascent", player="def", player_role="either"))
+
+    assert sum(1 for p in atk["points"] if p["mine"]) == sum(
+        1 for p in dfn["points"] if not p["mine"]
+    )

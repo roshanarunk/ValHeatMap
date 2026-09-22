@@ -160,11 +160,16 @@ export function MapCanvas({
     const wins: Vec2[] = []
     const losses: Vec2[] = []
     for (const k of kills) {
-      if (k.killer === player) {
+      // `mine` is set by the server, which knows the subject's id. Matching
+      // on puuid here does not work: the kill points carry agent names, not
+      // player ids, so every duel fell through to "loss" and the whole map
+      // drew red.
+      const won = k.mine ?? (k.killer !== '' && k.killer === player)
+      if (won) {
         const p = k.killer_pos ?? k.victim_pos
         if (p) wins.push(p)
-      } else if (k.victim === player) {
-        if (k.victim_pos) losses.push(k.victim_pos)
+      } else if (k.victim_pos) {
+        losses.push(k.victim_pos)
       }
     }
     // Only worth diverging when both outcomes are present; one-sided data
@@ -246,8 +251,9 @@ export function MapCanvas({
       for (const k of kills) {
         // With a player set, plot where *they* stood: the killer end when
         // they got the kill, the victim end when they died.
+        const won = k.mine ?? false
         const p = player
-          ? k.killer === player
+          ? won
             ? (k.killer_pos ?? k.victim_pos)
             : k.victim_pos
           : anchor === 'killer'
@@ -262,7 +268,7 @@ export function MapCanvas({
         ctx.fillStyle = traded
           ? 'rgba(96, 224, 168, 0.9)'
           : player
-            ? k.killer === player
+            ? won
               ? 'rgba(64, 220, 130, 0.85)'
               : 'rgba(255, 72, 88, 0.85)'
             : k.side === 'attack'

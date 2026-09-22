@@ -38,6 +38,12 @@ export interface KillPoint {
   round_won: boolean
   victim_pos: Vec2
   killer_pos?: Vec2
+  /**
+   * Set only when the query named a player: true if they got this kill,
+   * false if they died in it. The server decides, since the point payload
+   * carries agent names rather than player ids.
+   */
+  mine?: boolean
 }
 
 export interface KillStats {
