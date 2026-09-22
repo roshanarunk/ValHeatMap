@@ -12,12 +12,15 @@ is what makes cold starts viable on a serverless host, where re-reading the
 
 from __future__ import annotations
 
+import asyncio
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+import anyio.to_thread
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,7 +38,29 @@ from .sources import clients
 
 load_env()
 
-app = FastAPI(title="ValHeatMap API", version="2.0.0")
+# Plain `def` route handlers (see below) run on Starlette's thread pool,
+# which defaults to 40 threads. AnalyticsDB caches one SQLite connection
+# per thread via threading.local(), so 40 threads means up to 40 live
+# connections -- each with its own WAL-mode page cache -- instead of the
+# one the API used to open and keep forever. Measured on production: 23
+# open connections to the database file after a burst of My Stats
+# traffic, API process RSS climbing from ~104MB to ~172MB, and a load
+# average of 7.99 on this machine's one shared vCPU, all from opening and
+# warming that many connections at once rather than from any query being
+# slow. A handful of threads is already a large improvement over fully
+# serialized (the state before this file's sync/async split); it is not
+# worth another 30+ connections on top of it.
+THREAD_POOL_SIZE = 6
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = THREAD_POOL_SIZE
+    yield
+
+
+app = FastAPI(title="ValHeatMap API", version="2.0.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -126,8 +151,7 @@ async def _source_error(_: Request, exc: clients.SourceError) -> JSONResponse:
 
 
 # --- meta ---------------------------------------------------------------
-@app.get("/api/health")
-def health() -> dict[str, Any]:
+def _health_payload() -> dict[str, Any]:
     stats = _db.stats()
     return {
         "status": "ok",
@@ -137,6 +161,22 @@ def health() -> dict[str, Any]:
         "read_only": _READ_ONLY,
         "live_sources": clients.available_sources(),
     }
+
+
+@app.get("/api/health")
+async def health() -> dict[str, Any]:
+    """Fly polls this every 30s and pulls the machine out of rotation on
+    a 5s timeout, so it must never wait behind the same pool as the
+    heavier player/kills queries. Everything else in this file that does
+    sync DB work is a plain `def`, which Starlette runs on its (now
+    6-thread) pool -- deliberately capped, so a burst of those can still
+    fill it and make anything else waiting on that same pool queue. This
+    one instead uses asyncio's own default executor via run_in_executor,
+    which is a second, separate pool that nothing else here touches, so
+    it is never behind whatever the shared one is doing.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _health_payload)
 
 
 @app.get("/api/facets")
