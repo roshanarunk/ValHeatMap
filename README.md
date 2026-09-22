@@ -64,6 +64,17 @@ there within a minute or two. Their kills and deaths can be plotted
 separately or together, with career totals including how often their
 deaths get traded.
 
+Kills render green and deaths red, and "Both" is a *diverging* field
+rather than two heatmaps stacked: colour comes from which outcome
+dominates a spot and opacity from how busy it is. Stacking two ordinary
+heatmaps does not work here -- the upper layer hides the lower one and
+the overlap is a muddy colour that means nothing -- whereas the question
+being asked is "at this spot, do I win or lose", which is a difference.
+20 kills against 2 deaths reads strong green, the reverse reads strong
+red, and 11 against 9 reads dim and neutral, which is the honest answer
+for a genuinely even duel. Both fields share one ceiling, since scaling
+them separately would normalise away the very imbalance being shown.
+
 This needs identity that the aggregate schema deliberately dropped: kills
 stored *which agent* but not *who played them*, and two Jett players in a
 match are indistinguishable by agent. The puuids were in the raw payloads
@@ -260,6 +271,7 @@ are pub games where deaths often go unpunished — not a bug.
 
 ```bash
 cd backend && python -m pytest
+cd frontend && npm run check:colours
 ```
 
 127 tests covering both source adapters, the coordinate transform, trade
@@ -273,6 +285,13 @@ it stays fixed: that the crawler refreshes the facet cache before a
 request finds it stale, that a rolled-back transaction cannot leave a
 stale id in the dimension cache, and that a tracked player is crawled on
 their own region rather than the crawler's default.
+
+`check:colours` covers the diverging heatmap, whose correctness is a
+claim about pixels: it renders into a stub canvas and reads the output
+back, asserting that a kill-dominated spot really is green, a
+death-dominated one red, and an evenly contested one neither. It needs no
+test runner — it compiles the module with the TypeScript already
+installed and runs it under Node.
 
 ## Reference data
 

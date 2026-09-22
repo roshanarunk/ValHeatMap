@@ -120,6 +120,57 @@ function getDensity(len: number): Float32Array {
   return densityBuf
 }
 
+/** Splat every point into `density`, a `gw` x `gh` grid. */
+function accumulate(
+  density: Float32Array,
+  points: Vec2[],
+  gw: number,
+  gh: number,
+  radius: number,
+): void {
+  const k = getKernel(radius)
+  const ksize = radius * 2 + 1
+  for (let i = 0; i < points.length; i++) {
+    const px = Math.round(points[i].x * gw)
+    const py = Math.round(points[i].y * gh)
+    if (px < -radius || py < -radius || px > gw + radius || py > gh + radius) continue
+
+    const x0 = Math.max(0, px - radius)
+    const x1 = Math.min(gw - 1, px + radius)
+    const y0 = Math.max(0, py - radius)
+    const y1 = Math.min(gh - 1, py + radius)
+
+    for (let y = y0; y <= y1; y++) {
+      const krow = (y - py + radius) * ksize
+      const drow = y * gw
+      for (let x = x0; x <= x1; x++) {
+        const w = k[krow + (x - px + radius)]
+        if (w > 0) density[drow + x] += w
+      }
+    }
+  }
+}
+
+/**
+ * A high percentile of the non-empty cells, used as "full heat".
+ *
+ * Deliberately not the maximum: one freak hotspot would then flatten
+ * everything else to nothing.
+ */
+function ceilingOf(density: Float32Array, percentile: number): number {
+  const sample: number[] = []
+  // Stride-sample for speed; the field is smooth so this is representative.
+  const stride = Math.max(1, Math.floor(density.length / 40000))
+  for (let i = 0; i < density.length; i += stride) {
+    if (density[i] > 0) sample.push(density[i])
+  }
+  if (sample.length === 0) return 0
+  sample.sort((a, b) => a - b)
+  const c = sample[Math.min(sample.length - 1, Math.floor(sample.length * percentile))]
+  // Guard against a degenerate field where everything is equal.
+  return c > 0 ? c : sample[sample.length - 1] || 1
+}
+
 /**
  * Precomputed radial kernel: weight by squared distance, so a splat falls
  * off smoothly to zero at its edge. Cached per radius.
@@ -164,48 +215,13 @@ export function renderHeatmap(
   const radius = Math.max(1, Math.round(opts.radius / scaleDown))
 
   const density = getDensity(gw * gh)
-  const k = getKernel(radius)
-  const ksize = radius * 2 + 1
 
   // --- pass 1: accumulate ------------------------------------------------
-  for (let i = 0; i < points.length; i++) {
-    const px = Math.round(points[i].x * gw)
-    const py = Math.round(points[i].y * gh)
-    if (px < -radius || py < -radius || px > gw + radius || py > gh + radius) continue
-
-    const x0 = Math.max(0, px - radius)
-    const x1 = Math.min(gw - 1, px + radius)
-    const y0 = Math.max(0, py - radius)
-    const y1 = Math.min(gh - 1, py + radius)
-
-    for (let y = y0; y <= y1; y++) {
-      const krow = (y - py + radius) * ksize
-      const drow = y * gw
-      for (let x = x0; x <= x1; x++) {
-        const w = k[krow + (x - px + radius)]
-        if (w > 0) density[drow + x] += w
-      }
-    }
-  }
+  accumulate(density, points, gw, gh, radius)
 
   // --- pass 2: choose a ceiling -----------------------------------------
-  // Sampling a high percentile of *non-empty* cells keeps the scale tied to
-  // typical hotspot density rather than to the single hottest pixel.
-  const percentile = opts.percentile ?? 0.995
-  let ceiling = 0
-  {
-    const sample: number[] = []
-    // Stride-sample for speed; the field is smooth so this is representative.
-    const stride = Math.max(1, Math.floor(density.length / 40000))
-    for (let i = 0; i < density.length; i += stride) {
-      if (density[i] > 0) sample.push(density[i])
-    }
-    if (sample.length === 0) return
-    sample.sort((a, b) => a - b)
-    ceiling = sample[Math.min(sample.length - 1, Math.floor(sample.length * percentile))]
-    // Guard against a degenerate field where everything is equal.
-    if (!(ceiling > 0)) ceiling = sample[sample.length - 1] || 1
-  }
+  const ceiling = ceilingOf(density, opts.percentile ?? 0.995)
+  if (ceiling <= 0) return
 
   // --- pass 3: colourise -------------------------------------------------
   if (!imageCanvas) imageCanvas = document.createElement('canvas')
@@ -249,6 +265,132 @@ export function renderHeatmap(
   ctx.imageSmoothingQuality = 'high'
   ctx.drawImage(imageCanvas, 0, 0, gw, gh, 0, 0, width, height)
   ctx.restore()
+}
+
+/** Two fields on one map: green where you win, red where you lose. */
+export interface DivergingOptions {
+  /** Where the player got their kills. */
+  wins: Vec2[]
+  /** Where the player died. */
+  losses: Vec2[]
+  radius: number
+  intensity: number
+  percentile?: number
+  floor?: number
+}
+
+// Endpoints of the diverging scale. Green and red are the convention for
+// good/bad; the neutral midpoint is a desaturated slate rather than white
+// so an even spot reads as "contested" instead of "intense".
+const WIN_RGB: [number, number, number] = [64, 220, 130]
+const LOSS_RGB: [number, number, number] = [255, 72, 88]
+const EVEN_RGB: [number, number, number] = [150, 158, 178]
+
+/**
+ * Render kills and deaths as one field, coloured by which dominates.
+ *
+ * Drawing two ordinary heatmaps on top of each other does not work: the
+ * upper layer hides the lower one, and where they overlap the blend is a
+ * muddy colour that means nothing. The question a combined view has to
+ * answer is "at this spot, do I win or lose more", which is a *difference*
+ * rather than two densities.
+ *
+ * So hue comes from the balance between the two fields and opacity from
+ * their combined weight. A spot with 20 kills and 2 deaths reads strong
+ * green; 2 and 20 reads strong red; 11 and 9 reads dim and neutral, which
+ * is the honest answer for a genuinely even duel.
+ */
+export function renderDivergingHeatmap(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  opts: DivergingOptions,
+): void {
+  const { wins, losses, intensity } = opts
+  if (width <= 0 || height <= 0) return
+  if (wins.length === 0 && losses.length === 0) return
+
+  const scaleDown = 2
+  const gw = Math.max(1, Math.ceil(width / scaleDown))
+  const gh = Math.max(1, Math.ceil(height / scaleDown))
+  const radius = Math.max(1, Math.round(opts.radius / scaleDown))
+  const cells = gw * gh
+
+  // Two grids. The shared buffer is reserved for `renderHeatmap`, so these
+  // are allocated per call; at half resolution that is well under a
+  // megabyte and only happens on redraw.
+  const winField = new Float32Array(cells)
+  const lossField = new Float32Array(cells)
+  accumulate(winField, wins, gw, gh, radius)
+  accumulate(lossField, losses, gw, gh, radius)
+
+  // One ceiling for both fields, from their sum. Scaling each independently
+  // would normalise away the very imbalance being visualised -- 2 deaths
+  // would look as emphatic as 40 kills.
+  const total = new Float32Array(cells)
+  for (let i = 0; i < cells; i++) total[i] = winField[i] + lossField[i]
+  const ceiling = ceilingOf(total, opts.percentile ?? 0.995)
+  if (ceiling <= 0) return
+
+  if (!imageCanvas) imageCanvas = document.createElement('canvas')
+  if (imageCanvas.width !== gw || imageCanvas.height !== gh) {
+    imageCanvas.width = gw
+    imageCanvas.height = gh
+  }
+  const ictx = imageCanvas.getContext('2d')
+  if (!ictx) return
+  const img = ictx.createImageData(gw, gh)
+  const data = img.data
+  const floor = opts.floor ?? 0.04
+
+  for (let i = 0; i < cells; i++) {
+    const sum = total[i]
+    if (sum <= 0) continue
+    let t = sum / ceiling
+    if (t > 1) t = 1
+    if (t < floor) continue
+
+    // -1 (all deaths) .. 0 (even) .. +1 (all kills)
+    const balance = (winField[i] - lossField[i]) / sum
+    const strength = Math.abs(balance)
+    const target = balance >= 0 ? WIN_RGB : LOSS_RGB
+
+    // Ease the mix so a slight edge still shows some colour; a linear
+    // ramp leaves most of the map washed out around the midpoint.
+    const mix = Math.sqrt(strength)
+    const p = i * 4
+    data[p] = EVEN_RGB[0] + (target[0] - EVEN_RGB[0]) * mix
+    data[p + 1] = EVEN_RGB[1] + (target[1] - EVEN_RGB[1]) * mix
+    data[p + 2] = EVEN_RGB[2] + (target[2] - EVEN_RGB[2]) * mix
+
+    // Same perceptual curve as the single-field renderer, so the two views
+    // have comparable weight.
+    const shaped = Math.sqrt(t)
+    const alpha = Math.min(1, shaped * 1.35) * intensity
+    data[p + 3] = (alpha * 235) | 0
+  }
+  ictx.putImageData(img, 0, 0)
+
+  ctx.save()
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(imageCanvas, 0, 0, gw, gh, 0, 0, width, height)
+  ctx.restore()
+}
+
+/** CSS colours for the diverging legend, losses -> even -> wins. */
+export function divergingStops(steps = 9): string[] {
+  const out: string[] = []
+  for (let i = 0; i < steps; i++) {
+    const balance = (i / (steps - 1)) * 2 - 1
+    const target = balance >= 0 ? WIN_RGB : LOSS_RGB
+    const mix = Math.sqrt(Math.abs(balance))
+    const r = Math.round(EVEN_RGB[0] + (target[0] - EVEN_RGB[0]) * mix)
+    const g = Math.round(EVEN_RGB[1] + (target[1] - EVEN_RGB[1]) * mix)
+    const b = Math.round(EVEN_RGB[2] + (target[2] - EVEN_RGB[2]) * mix)
+    out.push(`rgb(${r}, ${g}, ${b})`)
+  }
+  return out
 }
 
 /** Discrete point rendering, used for the "duel"/scatter views. */

@@ -8,6 +8,7 @@ import {
   Select,
 } from './MapControls'
 import { Empty, Panel, StatTile } from './Controls'
+import { DivergingLegend, HeatLegend } from './HeatLegend'
 import { TimeSlider } from './TimeSlider'
 import {
   api,
@@ -306,13 +307,18 @@ export function PlayerView() {
                     map={agg?.map ?? null}
                     kills={agg?.points ?? []}
                     mode={aggMode}
-                    ramp="inferno"
+                    // Green for kills, red for deaths, so the colour means
+                    // the same thing here as in the combined view.
+                    ramp={aggRole === 'killer' ? 'toxic' : 'duel'}
                     radius={30}
                     intensity={1}
                     // Plot where the player was: their own position is the
                     // kill end when they got the kill, the death end when
                     // they died.
                     anchor={aggRole === 'killer' ? 'killer' : 'victim'}
+                    // In "Both", this splits the field into wins and losses
+                    // so a spot reads green or red rather than merely busy.
+                    player={aggRole === 'either' ? player.puuid : undefined}
                     rotation={rotation}
                     loading={aggBusy}
                   />
@@ -322,6 +328,15 @@ export function PlayerView() {
                     histogram={agg?.histogram}
                     onChange={setAggTime}
                   />
+                  {aggMode === 'heatmap' &&
+                    (aggRole === 'either' ? (
+                      <DivergingLegend />
+                    ) : (
+                      <HeatLegend
+                        ramp={aggRole === 'killer' ? 'toxic' : 'duel'}
+                        label={aggRole === 'killer' ? 'Your kills' : 'Your deaths'}
+                      />
+                    ))}
                   {agg && (
                     <p className="review__count">
                       {num(agg.total)} duels
@@ -411,10 +426,12 @@ export function PlayerView() {
                 map={detail?.map ?? null}
                 kills={points}
                 mode={mode}
-                ramp="inferno"
+                // Same convention as the career view above.
+                ramp={role === 'killer' ? 'toxic' : 'duel'}
                 radius={26}
                 intensity={1}
-                anchor="victim"
+                anchor={role === 'killer' ? 'killer' : 'victim'}
+                player={role === 'either' ? player?.puuid : undefined}
                 rotation={rotation}
                 loading={detailBusy}
               />

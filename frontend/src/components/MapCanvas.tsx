@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   drawDuelLines,
+  renderDivergingHeatmap,
   renderHeatmap,
   type DuelLine,
   type RampName,
@@ -21,6 +22,12 @@ export interface MapCanvasProps {
   radius: number
   intensity: number
   anchor: 'victim' | 'killer'
+  /**
+   * A puuid. When set and the heatmap holds both their kills and their
+   * deaths, the field is drawn diverging -- green where they win, red
+   * where they lose -- instead of as one undifferentiated density.
+   */
+  player?: string
   percentile?: number
   /** Map rotation in degrees, so a user can orient to their own side. */
   rotation?: number
@@ -71,6 +78,7 @@ export function MapCanvas({
   radius,
   intensity,
   anchor,
+  player,
   percentile = 0.99,
   rotation = 0,
   showCallouts = false,
@@ -140,6 +148,31 @@ export function MapCanvas({
       .filter((p): p is Vec2 => !!p)
   }, [kills, plants, anchor])
 
+  /**
+   * The player's own position in each duel, split by outcome.
+   *
+   * Their position is the *killer* end when they got the kill and the
+   * *victim* end when they died, so this cannot use a single anchor --
+   * that is exactly what makes the combined view worth drawing.
+   */
+  const divergingPoints = useMemo(() => {
+    if (!player) return null
+    const wins: Vec2[] = []
+    const losses: Vec2[] = []
+    for (const k of kills) {
+      if (k.killer === player) {
+        const p = k.killer_pos ?? k.victim_pos
+        if (p) wins.push(p)
+      } else if (k.victim === player) {
+        if (k.victim_pos) losses.push(k.victim_pos)
+      }
+    }
+    // Only worth diverging when both outcomes are present; one-sided data
+    // is clearer as an ordinary single-hue heatmap.
+    if (wins.length === 0 || losses.length === 0) return null
+    return { wins, losses }
+  }, [kills, player])
+
   const duelLines: DuelLine[] = useMemo(() => {
     if (mode !== 'lines') return []
     const out: DuelLine[] = []
@@ -187,7 +220,15 @@ export function MapCanvas({
     ctx.fillStyle = 'rgba(6, 10, 20, 0.35)'
     ctx.fillRect(0, 0, px, px)
 
-    if (mode === 'heatmap' && heatPoints.length > 0) {
+    if (mode === 'heatmap' && divergingPoints) {
+      renderDivergingHeatmap(ctx, px, px, {
+        wins: divergingPoints.wins,
+        losses: divergingPoints.losses,
+        radius: radius * dpr,
+        intensity,
+        percentile,
+      })
+    } else if (mode === 'heatmap' && heatPoints.length > 0) {
       renderHeatmap(ctx, px, px, {
         points: heatPoints,
         radius: radius * dpr,
@@ -203,16 +244,30 @@ export function MapCanvas({
 
     if (mode === 'points') {
       for (const k of kills) {
-        const p = anchor === 'killer' ? k.killer_pos : k.victim_pos
+        // With a player set, plot where *they* stood: the killer end when
+        // they got the kill, the victim end when they died.
+        const p = player
+          ? k.killer === player
+            ? (k.killer_pos ?? k.victim_pos)
+            : k.victim_pos
+          : anchor === 'killer'
+            ? k.killer_pos
+            : k.victim_pos
         if (!p) continue
         const traded = highlightTraded && k.traded
         ctx.beginPath()
         ctx.arc(p.x * px, p.y * px, Math.max(1.5, 2.6 * dpr), 0, Math.PI * 2)
+        // In the player view, colour is outcome (green won, red lost) to
+        // match the heatmap. Elsewhere it stays attacker/defender.
         ctx.fillStyle = traded
           ? 'rgba(96, 224, 168, 0.9)'
-          : k.side === 'attack'
-            ? 'rgba(255, 90, 100, 0.8)'
-            : 'rgba(90, 170, 255, 0.8)'
+          : player
+            ? k.killer === player
+              ? 'rgba(64, 220, 130, 0.85)'
+              : 'rgba(255, 72, 88, 0.85)'
+            : k.side === 'attack'
+              ? 'rgba(255, 90, 100, 0.8)'
+              : 'rgba(90, 170, 255, 0.8)'
         ctx.fill()
       }
     }
@@ -315,9 +370,9 @@ export function MapCanvas({
 
     ctx.restore()
   }, [
-    size, heatPoints, duelLines, mode, ramp, radius, intensity, percentile,
-    kills, plants, spots, anchor, showCallouts, showSpots, highlightTraded,
-    map, imageReady, radians, selectedSpot, zone, draft,
+    size, heatPoints, divergingPoints, duelLines, mode, ramp, radius, intensity,
+    percentile, kills, plants, spots, anchor, showCallouts, showSpots,
+    highlightTraded, map, imageReady, radians, selectedSpot, zone, draft,
   ])
 
   useEffect(() => {
