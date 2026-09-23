@@ -120,21 +120,27 @@ def spot_payload(
     spots: Sequence[PlantSpot],
     map_info: MapInfo,
     min_sample: int = MIN_SAMPLE,
+    is_minimap_coords: bool = False,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for idx, spot in enumerate(spots):
         cx, cy = spot.centroid
-        mx, my = map_info.to_minimap(cx, cy)
+        if is_minimap_coords:
+            mx, my = cx, cy
+            mult = 1.0
+        else:
+            mx, my = map_info.to_minimap(cx, cy)
+            mult = abs(map_info.x_multiplier)
         # Spread: how tight the cluster is, in minimap units, for sizing.
         spread = 0.0
         if len(spot.plants) > 1:
             dists = [_distance(spot.plants[0].location, p.location) for p in spot.plants]
-            spread = max(dists) * abs(map_info.x_multiplier)
+            spread = max(dists) * mult
         out.append(
             {
                 "id": idx,
                 "site": spot.site,
-                "position": {"x": mx, "y": my},
+                "position": {"x": round(mx, 4), "y": round(my, 4)},
                 "plants": len(spot.plants),
                 "wins": spot.wins,
                 "losses": len(spot.plants) - spot.wins,

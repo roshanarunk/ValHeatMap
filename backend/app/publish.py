@@ -63,6 +63,71 @@ def _signing_key(secret: str, date: str, region: str, service: str) -> bytes:
     return _sign(k, "aws4_request")
 
 
+def put_object_file(
+    endpoint: str,
+    bucket: str,
+    key: str,
+    file_path: Path,
+    access_key: str,
+    secret_key: str,
+    region: str = "auto",
+    content_type: str = "application/gzip",
+    cache_control: str = CACHE_CONTROL,
+) -> None:
+    """Stream a file upload via SigV4 PUT without loading it in memory in full."""
+    host = endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+    url = f"https://{host}/{bucket}/{key}"
+    now = dt.datetime.now(dt.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+
+    file_size = file_path.stat().st_size
+    h = hashlib.sha256()
+    with file_path.open("rb") as f:
+        while chunk := f.read(1024 * 1024):
+            h.update(chunk)
+    payload_hash = h.hexdigest()
+
+    canonical_headers = (
+        f"cache-control:{cache_control}\n"
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    signed_headers = "cache-control;host;x-amz-content-sha256;x-amz-date"
+    canonical_request = (
+        f"PUT\n/{bucket}/{key}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+    scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = (
+        "AWS4-HMAC-SHA256\n"
+        f"{amz_date}\n{scope}\n"
+        f"{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
+    signature = hmac.new(
+        _signing_key(secret_key, date_stamp, region, "s3"),
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    with file_path.open("rb") as f:
+        request = urllib.request.Request(url, data=f, method="PUT")
+        request.add_header("Host", host)
+        request.add_header("x-amz-date", amz_date)
+        request.add_header("x-amz-content-sha256", payload_hash)
+        request.add_header("Content-Type", content_type)
+        request.add_header("Content-Length", str(file_size))
+        request.add_header("Cache-Control", cache_control)
+        request.add_header(
+            "Authorization",
+            f"AWS4-HMAC-SHA256 Credential={access_key}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}",
+        )
+        with urllib.request.urlopen(request, timeout=600) as resp:
+            if resp.status not in (200, 201):
+                raise RuntimeError(f"upload failed: HTTP {resp.status}")
+
+
 def put_object(
     endpoint: str,
     bucket: str,
@@ -177,11 +242,11 @@ def publish(
         print(f"  -> {size / 1e6:.0f} MB gzipped", flush=True)
         print("uploading ...", flush=True)
 
-    put_object(
+    put_object_file(
         endpoint=f"{account}.r2.cloudflarestorage.com",
         bucket=bucket,
         key=OBJECT_KEY,
-        body=gz.read_bytes(),
+        file_path=gz,
         access_key=access_key,
         secret_key=secret_key,
     )

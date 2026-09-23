@@ -11,8 +11,8 @@
   --line-soft: #161d2b;
 
   --text: #e8edf7;
-  --text-dim: #93a1bb;
-  --text-faint: #64718c;
+  --text-dim: #a5b5d1;
+  --text-faint: #8e9cb5;
 
   --accent: #ff4655;      /* Valorant red */
   --accent-soft: #ff8892;
@@ -49,6 +49,19 @@ body {
 h1, h2, h3 { margin: 0; font-weight: 650; letter-spacing: -0.015em; }
 p { margin: 0; }
 button { font: inherit; color: inherit; cursor: pointer; }
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+.segmented button:focus-visible,
+.chip:focus-visible,
+.mapchip:focus-visible,
+.spotrow:focus-visible,
+.matchrow:focus-visible,
+.toggle:focus-visible,
+.linkbtn:focus-visible {
+  outline: 2px solid var(--info);
+  outline-offset: 2px;
+}
 code { font-family: var(--mono); font-size: 0.92em; color: var(--accent-soft); }
 
 /* --- shell ----------------------------------------------------------- */

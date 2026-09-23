@@ -27,7 +27,11 @@ const fmt = (ms: number) => {
 export function TimeSlider({ max, value, onChange, histogram = [], disabled }: TimeSliderProps) {
   const trackRef = useRef<HTMLDivElement | null>(null)
   const [dragging, setDragging] = useState<'start' | 'end' | null>(null)
-  const [start, end] = value
+  const [draftRange, setDraftRange] = useState<[number, number] | null>(null)
+  const draftRef = useRef<[number, number] | null>(null)
+  draftRef.current = draftRange
+
+  const [start, end] = draftRange ?? value
 
   const peak = useMemo(
     () => histogram.reduce((acc, b) => Math.max(acc, b.count), 0),
@@ -49,17 +53,31 @@ export function TimeSlider({ max, value, onChange, histogram = [], disabled }: T
     if (!dragging) return
     const move = (e: PointerEvent) => {
       const t = posFromEvent(e.clientX)
-      if (dragging === 'start') onChange([Math.min(t, end), end])
-      else onChange([start, Math.max(t, start)])
+      const currentVal = draftRef.current ?? value
+      let next: [number, number]
+      if (dragging === 'start') {
+        next = [Math.min(t, currentVal[1]), currentVal[1]]
+      } else {
+        next = [currentVal[0], Math.max(t, currentVal[0])]
+      }
+      draftRef.current = next
+      setDraftRange(next)
     }
-    const up = () => setDragging(null)
+    const up = () => {
+      if (draftRef.current) {
+        onChange(draftRef.current)
+      }
+      draftRef.current = null
+      setDraftRange(null)
+      setDragging(null)
+    }
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
     return () => {
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
     }
-  }, [dragging, posFromEvent, onChange, start, end])
+  }, [dragging, posFromEvent, onChange, value])
 
   const startPct = max > 0 ? (start / max) * 100 : 0
   const endPct = max > 0 ? (end / max) * 100 : 100
@@ -67,6 +85,9 @@ export function TimeSlider({ max, value, onChange, histogram = [], disabled }: T
   const grab = (handle: 'start' | 'end') => (e: React.PointerEvent) => {
     if (disabled) return
     e.preventDefault()
+    e.stopPropagation()
+    draftRef.current = value
+    setDraftRange(value)
     setDragging(handle)
   }
 
@@ -74,13 +95,18 @@ export function TimeSlider({ max, value, onChange, histogram = [], disabled }: T
   const onTrackDown = (e: React.PointerEvent) => {
     if (disabled) return
     const t = posFromEvent(e.clientX)
-    if (Math.abs(t - start) <= Math.abs(t - end)) {
-      onChange([Math.min(t, end), end])
-      setDragging('start')
+    let next: [number, number]
+    let handle: 'start' | 'end'
+    if (Math.abs(t - value[0]) <= Math.abs(t - value[1])) {
+      next = [Math.min(t, value[1]), value[1]]
+      handle = 'start'
     } else {
-      onChange([start, Math.max(t, start)])
-      setDragging('end')
+      next = [value[0], Math.max(t, value[0])]
+      handle = 'end'
     }
+    draftRef.current = next
+    setDraftRange(next)
+    setDragging(handle)
   }
 
   const nudge = (handle: 'start' | 'end', delta: number) => {

@@ -13,12 +13,15 @@ have already paid for in rate limit.
 
 from __future__ import annotations
 
+import gzip
 import itertools
 import json
 import os
+import re
 import sqlite3
 import time
 import threading
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,6 +94,7 @@ class Database:
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         with self.connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
 
     def _conn(self) -> sqlite3.Connection:
@@ -98,8 +102,6 @@ class Database:
         if conn is None:
             conn = sqlite3.connect(self.path, timeout=30)
             conn.row_factory = sqlite3.Row
-            # WAL lets the crawler write while the API reads.
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             self._local.conn = conn
         return conn
@@ -183,13 +185,232 @@ class Database:
             )
         return path
 
+    @staticmethod
+    def _read_file_payload(path: Path) -> dict[str, Any] | None:
+        try:
+            if path.suffix == ".gz":
+                with gzip.open(path, "rt", encoding="utf-8") as fh:
+                    return json.load(fh)
+            with path.open(encoding="utf-8") as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def get_payload(self, match_id: str) -> dict[str, Any] | None:
+        """Load the raw JSON payload for a match from loose file or zip archive."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_path FROM matches WHERE match_id = ?", (match_id,)
+            ).fetchone()
+
+        payload_path = row["payload_path"] if row else None
+
+        # 1. Stored in a zip archive (e.g. "archive_0001.zip:match_id.json")
+        if payload_path and (":" in payload_path or payload_path.endswith(".zip")):
+            zip_name, _, member_name = payload_path.partition(":")
+            member = member_name or f"{match_id}.json"
+            zip_file = self.raw_dir / zip_name
+            if zip_file.is_file():
+                try:
+                    with zipfile.ZipFile(zip_file, "r") as zf:
+                        return json.loads(zf.read(member).decode("utf-8"))
+                except (KeyError, zipfile.BadZipFile, json.JSONDecodeError, OSError):
+                    pass
+
+        # 2. Stored as loose file
+        if payload_path:
+            p = self.raw_dir / payload_path
+            if p.is_file():
+                return self._read_file_payload(p)
+
+        # 3. Fallbacks: check common paths in raw_dir
+        for candidate in (
+            self.raw_dir / f"{match_id}.json",
+            self.raw_dir / f"{match_id}.json.gz",
+        ):
+            if candidate.is_file():
+                return self._read_file_payload(candidate)
+
+        return None
+
     def iter_payload_paths(self, limit: int | None = None) -> list[Path]:
         sql = "SELECT payload_path FROM matches ORDER BY started_at DESC"
         if limit:
             sql += f" LIMIT {int(limit)}"
         with self.connect() as conn:
             rows = conn.execute(sql).fetchall()
-        return [self.raw_dir / r["payload_path"] for r in rows]
+        paths = []
+        for r in rows:
+            pp = r["payload_path"]
+            if ":" in pp or pp.endswith(".zip"):
+                zip_name, _, _ = pp.partition(":")
+                paths.append(self.raw_dir / zip_name)
+            else:
+                paths.append(self.raw_dir / pp)
+        return paths
+
+    def iter_payloads(
+        self, limit: int | None = None
+    ) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Yield (match_id, payload_dict) efficiently, keeping zip handles open."""
+        sql = "SELECT match_id, payload_path FROM matches ORDER BY started_at DESC"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        with self.connect() as conn:
+            rows = conn.execute(sql).fetchall()
+
+        current_zip_name: str | None = None
+        current_zf: zipfile.ZipFile | None = None
+
+        try:
+            for r in rows:
+                mid = r["match_id"]
+                ppath = r["payload_path"]
+                if ":" in ppath or ppath.endswith(".zip"):
+                    zip_name, _, member_name = ppath.partition(":")
+                    member = member_name or f"{mid}.json"
+                    if zip_name != current_zip_name:
+                        if current_zf is not None:
+                            current_zf.close()
+                            current_zf = None
+                        current_zip_name = zip_name
+                        z_path = self.raw_dir / zip_name
+                        if z_path.is_file():
+                            try:
+                                current_zf = zipfile.ZipFile(z_path, "r")
+                            except (zipfile.BadZipFile, OSError):
+                                current_zf = None
+
+                    if current_zf is not None:
+                        try:
+                            payload = json.loads(current_zf.read(member).decode("utf-8"))
+                            yield mid, payload
+                            continue
+                        except (KeyError, json.JSONDecodeError):
+                            pass
+                else:
+                    if current_zf is not None:
+                        current_zf.close()
+                        current_zf = None
+                        current_zip_name = None
+
+                    p = self.raw_dir / ppath
+                    payload = self._read_file_payload(p)
+                    if payload is not None:
+                        yield mid, payload
+        finally:
+            if current_zf is not None:
+                current_zf.close()
+
+    def archive_raw(
+        self, chunk_size: int = 1000, max_chunks: int | None = None
+    ) -> dict[str, Any]:
+        """Pack loose match files into sequence-numbered zip archives.
+
+        Matches are bundled into `archive_NNNN.zip` files (e.g. 1000 per zip),
+        the SQLite `payload_path` index is updated, and loose files are removed.
+        Each zip part can be independently extracted or inspected.
+        """
+        # Find matches with loose payload paths (not already in a zip)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT match_id, payload_path FROM matches "
+                "WHERE payload_path NOT LIKE '%.zip%' "
+                "ORDER BY started_at ASC"
+            ).fetchall()
+
+        if not rows:
+            return {"archived": 0, "archives_created": 0, "bytes_freed": 0}
+
+        # Determine next archive sequence number
+        existing_nums = []
+        for p in self.raw_dir.glob("archive_*.zip"):
+            m = re.search(r"archive_(\d+)\.zip$", p.name)
+            if m:
+                existing_nums.append(int(m.group(1)))
+        next_idx = (max(existing_nums) + 1) if existing_nums else 1
+
+        archived_total = 0
+        archives_created = 0
+        bytes_freed = 0
+
+        # Process in chunks
+        for i in range(0, len(rows), chunk_size):
+            if max_chunks is not None and archives_created >= max_chunks:
+                break
+
+            batch = rows[i : i + chunk_size]
+            zip_name = f"archive_{next_idx:04d}.zip"
+            zip_path = self.raw_dir / zip_name
+            tmp_zip = self.raw_dir / f"{zip_name}.tmp.{os.getpid()}"
+
+            batch_success: list[tuple[str, Path]] = []
+            try:
+                with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                    for r in batch:
+                        mid = r["match_id"]
+                        p_rel = r["payload_path"]
+                        src_path = self.raw_dir / p_rel
+                        if not src_path.is_file():
+                            if (self.raw_dir / f"{mid}.json").is_file():
+                                src_path = self.raw_dir / f"{mid}.json"
+                            elif (self.raw_dir / f"{mid}.json.gz").is_file():
+                                src_path = self.raw_dir / f"{mid}.json.gz"
+                            else:
+                                continue
+
+                        if src_path.suffix == ".gz":
+                            with gzip.open(src_path, "rb") as gz_in:
+                                content = gz_in.read()
+                        else:
+                            content = src_path.read_bytes()
+
+                        zf.writestr(f"{mid}.json", content)
+                        batch_success.append((mid, src_path))
+
+                if not batch_success:
+                    tmp_zip.unlink(missing_ok=True)
+                    continue
+
+                # Verify zip integrity before committing
+                with zipfile.ZipFile(tmp_zip, "r") as zf:
+                    if zf.testzip() is not None:
+                        raise RuntimeError(f"Corrupted zip generated: {tmp_zip}")
+
+                os.replace(tmp_zip, zip_path)
+
+                # Update DB in one transaction
+                updates = [
+                    (f"{zip_name}:{mid}.json", mid)
+                    for mid, _ in batch_success
+                ]
+                with self.connect() as conn:
+                    conn.executemany(
+                        "UPDATE matches SET payload_path = ? WHERE match_id = ?",
+                        updates,
+                    )
+
+                # Delete loose files
+                for _, src_file in batch_success:
+                    try:
+                        bytes_freed += src_file.stat().st_size
+                        src_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+                archived_total += len(batch_success)
+                archives_created += 1
+                next_idx += 1
+
+            except Exception:
+                tmp_zip.unlink(missing_ok=True)
+                raise
+
+        return {
+            "archived": archived_total,
+            "archives_created": archives_created,
+            "bytes_freed": bytes_freed,
+        }
 
     def match_count(self) -> int:
         with self.connect() as conn:

@@ -81,21 +81,20 @@ def available_mb() -> float | None:
 
 
 def probe_latency(db_path: str) -> float | None:
-    """Time one small, real read against the table that was actually slow.
+    """Time one small, real read to measure connection and seek latency.
 
     A fresh connection each call, deliberately: the point is to measure
     what a *new* query experiences right now, the same way a real
     request would, not to reuse a connection that might itself be primed
     or blocked in some unrepresentative way. `timeout=3` bounds the worst
     case -- if even opening the connection or running the probe takes
-    that long, the answer is unambiguously "busy" and finding out
-    precisely how much busier is not worth extending the outage to learn.
+    that long, the answer is unambiguously "busy".
     """
     try:
         t0 = time.monotonic()
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
         try:
-            conn.execute("SELECT COUNT(*) FROM kills WHERE map_id = 1").fetchone()
+            conn.execute("SELECT 1 FROM kills LIMIT 1").fetchone()
         finally:
             conn.close()
         return time.monotonic() - t0

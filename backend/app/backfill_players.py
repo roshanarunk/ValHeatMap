@@ -41,14 +41,7 @@ BATCH = 250
 
 def _payload_for(match_id: str) -> dict | None:
     """The stored raw payload for a match, if we still have it."""
-    path = raw_db.raw_dir / f"{match_id}.json"
-    if not path.exists():
-        return None
-    try:
-        with path.open(encoding="utf-8") as fh:
-            return json.load(fh)
-    except (json.JSONDecodeError, OSError):
-        return None
+    return raw_db.get_payload(match_id)
 
 
 def pending_matches(conn: sqlite3.Connection, limit: int | None = None) -> list[tuple[int, str]]:

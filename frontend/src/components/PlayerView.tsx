@@ -239,56 +239,76 @@ export function PlayerView() {
   const riotIdKey = player?.riot_id ?? ''
   useEffect(() => {
     if (!riotIdKey || !aggMap) return
-    let cancelled = false
+    const controller = new AbortController()
     api
-      .player(riotIdKey, filters)
-      .then((p) => !cancelled && setPlayer((cur) => (cur ? { ...cur, ...p } : p)))
+      .player(riotIdKey, filters, { signal: controller.signal })
+      .then((p) => {
+        if (!controller.signal.aborted) {
+          setPlayer((cur) => (cur ? { ...cur, ...p } : p))
+        }
+      })
       .catch(() => {
         /* the heatmap request surfaces any error */
       })
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [riotIdKey, aggMap, filters])
 
+  const playerPuuid = player?.puuid
   useEffect(() => {
-    if (!player || !aggMap) return
-    let cancelled = false
+    if (!playerPuuid || !aggMap) return
+    const controller = new AbortController()
     setAggBusy(true)
     api
-      .killsV2({
-        ...filters,
-        player: player.puuid,
-        player_role: aggRole,
+      .killsV2(
+        {
+          ...filters,
+          player: playerPuuid,
+          player_role: aggRole,
+        },
+        { signal: controller.signal },
+      )
+      .then((res) => {
+        if (!controller.signal.aborted) setAgg(res)
       })
-      .then((res) => !cancelled && setAgg(res))
-      .catch((err) => !cancelled && setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => !cancelled && setAggBusy(false))
+      .catch((err) => {
+        if (controller.signal.aborted) return
+        setError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setAggBusy(false)
+      })
     return () => {
-      cancelled = true
+      controller.abort()
     }
-  }, [player, aggMap, aggRole, filters])
+  }, [playerPuuid, aggMap, aggRole, filters])
 
   useEffect(() => {
     if (!selected) {
       setDetail(null)
       return
     }
-    let cancelled = false
+    const controller = new AbortController()
     setDetailBusy(true)
     api
-      .match(selected)
+      .match(selected, { signal: controller.signal })
       .then((d) => {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           setDetail(d)
           setRoundFilter('')
           setTimeRange([0, ROUND_MAX_MS])
         }
       })
-      .catch((err) => !cancelled && setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => !cancelled && setDetailBusy(false))
+      .catch((err) => {
+        if (controller.signal.aborted) return
+        setError(err instanceof Error ? err.message : String(err))
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDetailBusy(false)
+      })
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [selected])
 

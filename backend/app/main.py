@@ -25,7 +25,7 @@ from typing import Any, Callable, TypeVar
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .analytics import plants as plant_analytics
@@ -100,6 +100,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def add_cache_headers(request: Request, call_next: Callable[..., Any]) -> Response:
+    response: Response = await call_next(request)
+    if request.method == "GET" and request.url.path.startswith("/api/"):
+        if request.url.path == "/api/health":
+            response.headers["Cache-Control"] = "no-cache, no-store"
+        elif "cache-control" not in response.headers:
+            response.headers["Cache-Control"] = "public, max-age=60"
+    return response
+
 # On serverless this downloads a published snapshot into the writable temp
 # dir; locally it is just the file on disk.
 _DB_PATH = ensure_local_db()
@@ -158,7 +169,11 @@ def _maybe_refresh() -> None:
 
 @app.middleware("http")
 async def _refresh_middleware(request: Request, call_next):
-    _maybe_refresh()
+    if _READ_ONLY:
+        now = time.monotonic()
+        if now - _last_refresh_check >= REFRESH_INTERVAL_S:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, _maybe_refresh)
     return await call_next(request)
 
 
@@ -182,7 +197,8 @@ async def _source_error(_: Request, exc: clients.SourceError) -> JSONResponse:
 
 # --- meta ---------------------------------------------------------------
 def _health_payload() -> dict[str, Any]:
-    stats = _db.stats()
+    _db.ping()
+    stats = _db.stats(max_age_s=300.0)
     return {
         "status": "ok",
         "matches": stats["matches"],
@@ -282,8 +298,8 @@ def kills_endpoint(request: Request) -> dict[str, Any]:
         "points": result["points"],
         "total": result["total"],
         "sampled": result["sampled"],
-        "stats": _engine.summary(f),
-        "histogram": _engine.histogram(f),
+        "stats": result["stats"],
+        "histogram": result["histogram"],
     }
 
 
@@ -300,7 +316,7 @@ def utility_endpoint(request: Request) -> dict[str, Any]:
         "points": result["points"],
         "total": result["total"],
         "sampled": result["sampled"],
-        "stats": _engine.summary(f),
+        "stats": result["stats"],
         "abilities": _engine.ability_breakdown(f),
     }
 
@@ -336,12 +352,9 @@ def plants_endpoint(
         for p in raw
     ]
     spots = plant_analytics.cluster(plants, radius=cluster_radius * scale)
-    payload = plant_analytics.spot_payload(spots, info, min_sample=min_sample)
-    # spot_payload projects centroids through to_minimap(); these are
-    # already in minimap space, so put the raw centroid back.
-    for row, spot in zip(payload, spots):
-        cx, cy = spot.centroid
-        row["position"] = {"x": round(cx, 4), "y": round(cy, 4)}
+    payload = plant_analytics.spot_payload(
+        spots, info, min_sample=min_sample, is_minimap_coords=True
+    )
 
     wins = sum(1 for p in raw if p["won"])
     return {
@@ -524,16 +537,17 @@ async def match_detail(match_id: str, request: Request) -> dict[str, Any]:
     Fetches and stores the match if we do not have it, so a game finished
     minutes ago can be reviewed without waiting for the crawler.
     """
-    row_id = _db.match_row_id(match_id)
+    loop = asyncio.get_running_loop()
+    row_id = await loop.run_in_executor(_pool, _db.match_row_id, match_id)
     if row_id is None:
         if _READ_ONLY:
             raise HTTPException(404, "Match not in the dataset.")
         await _ingest_match(match_id)
-        row_id = _db.match_row_id(match_id)
+        row_id = await loop.run_in_executor(_pool, _db.match_row_id, match_id)
         if row_id is None:
             raise HTTPException(404, "Match could not be ingested.")
 
-    detail = _engine.match_detail(match_id)
+    detail = await loop.run_in_executor(_pool, _engine.match_detail, match_id)
     if detail is None:
         raise HTTPException(404, "Match not in the dataset.")
     # The map's calibration and callouts travel with the match: the client
@@ -656,8 +670,9 @@ async def debug_reindex() -> dict[str, Any]:
 
     from .slim import ensure_indexes
 
+    loop = asyncio.get_running_loop()
     before = Path(_DB_PATH).stat().st_size if Path(_DB_PATH).exists() else 0
-    elapsed = ensure_indexes(Path(_DB_PATH))
+    elapsed = await loop.run_in_executor(None, ensure_indexes, Path(_DB_PATH))
     after = Path(_DB_PATH).stat().st_size
 
     with sqlite3.connect(f"file:{_DB_PATH}?immutable=1", uri=True) as conn:

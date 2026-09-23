@@ -31,10 +31,6 @@ def build(
     limit: int | None = None,
     verbose: bool = True,
 ) -> dict[str, int]:
-    paths = raw_db.iter_payload_paths()
-    if limit:
-        paths = paths[:limit]
-
     if rebuild:
         with analytics.connect() as conn:
             conn.executescript(
@@ -43,18 +39,15 @@ def build(
 
     stored = skipped = failed = kills = 0
     started = time.monotonic()
+    total_est = raw_db.match_count()
+    if limit:
+        total_est = min(total_est, limit)
 
-    for i, path in enumerate(paths):
-        if not path.exists():
-            failed += 1
-            continue
-        match_id = path.stem
+    for i, (match_id, payload) in enumerate(raw_db.iter_payloads(limit=limit)):
         if not rebuild and analytics.has_match(match_id):
             skipped += 1
             continue
         try:
-            with path.open(encoding="utf-8") as fh:
-                payload = json.load(fh)
             match = parse_any(payload)
             if not match.meta.match_id:
                 match.meta.match_id = match_id
@@ -71,13 +64,14 @@ def build(
         if verbose and (i + 1) % 250 == 0:
             rate = (i + 1) / max(0.001, time.monotonic() - started)
             print(
-                f"  {i + 1}/{len(paths)}  stored={stored} skipped={skipped} "
+                f"  {i + 1}/{total_est}  stored={stored} skipped={skipped} "
                 f"failed={failed}  ({rate:.0f}/s)",
                 flush=True,
             )
 
+    processed = stored + skipped + failed
     analytics.set_meta("generated_at", datetime.now(timezone.utc).isoformat(timespec="seconds"))
-    analytics.set_meta("source_matches", str(len(paths)))
+    analytics.set_meta("source_matches", str(processed))
     return {
         "stored": stored,
         "skipped": skipped,

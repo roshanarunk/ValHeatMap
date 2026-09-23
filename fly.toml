@@ -33,7 +33,7 @@ primary_region = 'iad'
 
   [[http_service.checks]]
     interval = '30s'
-    timeout = '5s'
+    timeout = '15s'
     # Generous: on boot the API opens a ~540 MB database before answering.
     grace_period = '1m0s'
     method = 'GET'

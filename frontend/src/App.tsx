@@ -138,26 +138,29 @@ export default function App() {
     // The player tab fetches its own data and has no map selected, so it
     // must not fall through to the insights request below.
     if (!mapName || view === 'player') return
-    let cancelled = false
+    const controller = new AbortController()
     setLoading(true)
     setError(null)
     const run = async () => {
       try {
         if (view === 'kills') {
-          const res = await api.killsV2(filters)
-          if (!cancelled) setKills(res)
+          const res = await api.killsV2(filters, { signal: controller.signal })
+          setKills(res)
         } else if (view === 'utility') {
-          const res = await api.utilityV2(filters)
-          if (!cancelled) setUtility(res)
+          const res = await api.utilityV2(filters, { signal: controller.signal })
+          setUtility(res)
         } else if (view === 'plants') {
-          const res = await api.plants({ ...filters, cluster_radius: clusterRadius })
-          if (!cancelled) setPlants(res)
+          const res = await api.plants(
+            { ...filters, cluster_radius: clusterRadius },
+            { signal: controller.signal },
+          )
+          setPlants(res)
         } else {
-          const res = await api.insightsV2(filters)
-          if (!cancelled) setInsights(res)
+          const res = await api.insightsV2(filters, { signal: controller.signal })
+          setInsights(res)
         }
       } catch (e) {
-        if (cancelled) return
+        if (controller.signal.aborted) return
         setError(
           e instanceof ApiError && e.status === 404
             ? 'No data for this selection.'
@@ -166,12 +169,12 @@ export default function App() {
               : String(e),
         )
       } finally {
-        if (!cancelled) setLoading(false)
+        if (!controller.signal.aborted) setLoading(false)
       }
     }
     run()
     return () => {
-      cancelled = true
+      controller.abort()
     }
   }, [view, filters, mapName, clusterRadius])
 

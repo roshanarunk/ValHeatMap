@@ -849,3 +849,48 @@ def test_player_summary_ignores_the_player_filter_on_f(db: AnalyticsDB):
     )
     assert plain == with_player
     assert plain["deaths"] > 0
+
+
+def test_ping_returns_true(db: AnalyticsDB):
+    assert db.ping() is True
+
+
+def test_stats_caching_and_invalidation(db: AnalyticsDB):
+    # First call primes cache
+    stats1 = db.stats()
+    assert stats1["matches"] > 0
+    # Modifying cached object does not affect next read
+    stats1["matches"] = 999999
+    stats2 = db.stats()
+    assert stats2["matches"] != 999999
+
+    # Live call returns a fresh dict
+    stats_live = db.stats(live=True)
+    assert stats_live["matches"] == stats2["matches"]
+
+
+def test_weapon_filter_does_not_hijack_player_query_index(db: AnalyticsDB):
+    """When a query filters by player and weapon, SQLite must use idx_k_killer/idx_k_victim,
+    NOT idx_k_weapon (which would scan millions of rows)."""
+    engine = QueryEngine(db)
+    where, args = engine._where(Filters(map_name="Ascent", player="atk", weapons=["Vandal"]))
+    with db.connect() as conn:
+        plan = conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT * FROM kills WHERE {where}", args
+        ).fetchall()
+    plan_str = " ".join(row["detail"] for row in plan)
+    assert "idx_k_weapon" not in plan_str
+    assert "idx_k_killer" in plan_str or "idx_k_main" in plan_str
+
+
+def test_weapon_filter_does_not_hijack_map_query_index(db: AnalyticsDB):
+    """When a query filters by map and weapon, SQLite must not scan idx_k_weapon."""
+    engine = QueryEngine(db)
+    where, args = engine._where(Filters(map_name="Ascent", weapons=["Vandal"]))
+    with db.connect() as conn:
+        plan = conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT * FROM kills WHERE {where}", args
+        ).fetchall()
+    plan_str = " ".join(row["detail"] for row in plan)
+    assert "idx_k_weapon" not in plan_str
+

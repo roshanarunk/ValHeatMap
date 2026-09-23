@@ -8,6 +8,7 @@ navigate: pick a map first, then narrow.
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -26,7 +27,7 @@ from .analytics_db import (
 
 # Returning every point is wasteful: the heatmap bins them anyway, and the
 # payload has to cross the network. Above this we sample deterministically.
-MAX_POINTS = 40_000
+MAX_POINTS = 15_000
 
 # Competitive tier ids, for the rank filter.
 TIER_BANDS = {
@@ -198,6 +199,9 @@ class QueryEngine:
     def __init__(self, db: AnalyticsDB) -> None:
         self.db = db
         self._dims: dict[str, dict[str, int]] = {}
+        self._query_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._cache_lock = threading.Lock()
+        self._cache_max_entries = 32
 
     def _ids(self, kind: str) -> dict[str, int]:
         if kind not in self._dims:
@@ -211,8 +215,10 @@ class QueryEngine:
         return self._dims[key]  # type: ignore[return-value]
 
     def invalidate(self) -> None:
-        """Drop cached dimension maps after an ingest adds new names."""
+        """Drop cached dimension maps and query results after an ingest adds new names."""
         self._dims.clear()
+        with self._cache_lock:
+            self._query_cache.clear()
 
     def _role_agent_ids(self, roles: list[str]) -> list[int] | None:
         """Agent ids belonging to any of `roles`, or None if none resolve.
@@ -245,7 +251,9 @@ class QueryEngine:
         return ids or None
 
     # --- SQL building ---------------------------------------------------
-    def _where(self, f: Filters, table: str = "kills") -> tuple[str, list[Any]]:
+    def _where(
+        self, f: Filters, table: str = "kills", is_player: bool = False
+    ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         args: list[Any] = []
 
@@ -308,17 +316,26 @@ class QueryEngine:
                 args.append(pid)
 
         if table == "kills":
+            # ka_id, va_id, and weapon_id have single-column indexes (idx_k_agent,
+            # idx_k_weapon) that exist solely for the unconstrained facet-cache GROUP BY.
+            # In all filtered queries (by map, player, etc.), SQLite's planner must use
+            # the primary selective index (idx_k_main, idx_k_killer, idx_k_vpos, etc.)
+            # rather than scanning millions of rows across all maps via idx_k_weapon/idx_k_agent.
+            # We suppress index usage on these secondary filters using SQLite unary plus `+`.
+            pfx = "+"
+            ability_pfx = "" if f.utility_only else "+"
+
             if f.agents:
                 ids = self._resolve("agent", f.agents)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"ka_id IN ({','.join('?' * len(ids))})")
+                clauses.append(f"{pfx}ka_id IN ({','.join('?' * len(ids))})")
                 args.extend(ids)
             if f.victim_agents:
                 ids = self._resolve("agent", f.victim_agents)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"va_id IN ({','.join('?' * len(ids))})")
+                clauses.append(f"{pfx}va_id IN ({','.join('?' * len(ids))})")
                 args.extend(ids)
             # Roles narrow the same columns as the agent filters, so
             # selecting Duelist *and* Jett means Jett, not both sets.
@@ -326,25 +343,25 @@ class QueryEngine:
                 ids = self._role_agent_ids(f.roles)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"ka_id IN ({','.join('?' * len(ids))})")
+                clauses.append(f"{pfx}ka_id IN ({','.join('?' * len(ids))})")
                 args.extend(ids)
             if f.victim_roles:
                 ids = self._role_agent_ids(f.victim_roles)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"va_id IN ({','.join('?' * len(ids))})")
+                clauses.append(f"{pfx}va_id IN ({','.join('?' * len(ids))})")
                 args.extend(ids)
             if f.weapons:
                 ids = self._resolve("weapon", f.weapons)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"weapon_id IN ({','.join('?' * len(ids))})")
+                clauses.append(f"{pfx}weapon_id IN ({','.join('?' * len(ids))})")
                 args.extend(ids)
             if f.abilities:
                 ids = self._resolve("ability", f.abilities)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"ability_id IN ({','.join('?' * len(ids))})")
+                clauses.append(f"{ability_pfx}ability_id IN ({','.join('?' * len(ids))})")
                 args.extend(ids)
             if f.zone:
                 # The box constrains one end of the duel; the caller plots
@@ -388,6 +405,12 @@ class QueryEngine:
     # --- public queries -------------------------------------------------
     def kill_points(self, f: Filters) -> dict[str, Any]:
         where, args = self._where(f)
+        cache_key = (where, tuple(args), f.limit, f.player)
+        with self._cache_lock:
+            cached = self._query_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         with self.db.connect() as conn:
             total = conn.execute(
                 f"SELECT COUNT(*) n FROM kills WHERE {where}", args
@@ -400,9 +423,11 @@ class QueryEngine:
             if total > f.limit and f.limit > 0:
                 stride = math.ceil(total / f.limit)
                 sample_sql = f" AND (rowid % {stride}) = 0"
+            elif f.limit > 0 and not sample_sql:
+                sample_sql = f" LIMIT {int(f.limit)}"
 
             rows = conn.execute(
-                f"""SELECT t_ms, side, ka_id, va_id, weapon_id, ability_id, dmg_type,
+                f"""SELECT m, t_ms, side, ka_id, va_id, weapon_id, ability_id, dmg_type,
                            vx, vy, kx, ky, flags, round_num, killer_pid, victim_pid
                     FROM kills WHERE {where}{sample_sql}""",
                 args,
@@ -443,11 +468,63 @@ class QueryEngine:
             }
             for r in rows
         ]
-        return {
+
+        # Compute summary stats and histogram in a single pass from the rows
+        n_sample = len(rows)
+        scale = (total / n_sample) if (n_sample and total > n_sample) else 1.0
+
+        traded_cnt = 0
+        fb_cnt = 0
+        pp_cnt = 0
+        util_cnt = 0
+        matches_set: set[int] = set()
+        hist_buckets: dict[int, int] = {}
+
+        for r in rows:
+            fl = r["flags"]
+            if fl & FLAG_TRADED:
+                traded_cnt += 1
+            if fl & FLAG_FIRST_BLOOD:
+                fb_cnt += 1
+            if fl & FLAG_POST_PLANT:
+                pp_cnt += 1
+            if r["dmg_type"] == 1:
+                util_cnt += 1
+            matches_set.add(r["m"])
+            t_bin = (r["t_ms"] // 5000) * 5000
+            hist_buckets[t_bin] = hist_buckets.get(t_bin, 0) + 1
+
+        stats = {
+            "total": total,
+            "matches": round(len(matches_set) * scale) if total > n_sample else len(matches_set),
+            "traded": round(traded_cnt * scale),
+            "trade_rate": round(traded_cnt / n_sample, 4) if n_sample else 0.0,
+            "first_bloods": round(fb_cnt * scale),
+            "post_plant": round(pp_cnt * scale),
+            "utility": round(util_cnt * scale),
+            "utility_rate": round(util_cnt / n_sample, 4) if n_sample else 0.0,
+        }
+
+        histogram = [
+            {"t": t, "count": round(hist_buckets.get(t, 0) * scale)}
+            for t in sorted(hist_buckets)
+        ]
+
+        result = {
             "points": points,
             "total": total,
             "sampled": len(points) < total,
+            "stats": stats,
+            "histogram": histogram,
         }
+
+        with self._cache_lock:
+            if len(self._query_cache) >= self._cache_max_entries:
+                oldest = next(iter(self._query_cache))
+                self._query_cache.pop(oldest, None)
+            self._query_cache[cache_key] = result
+
+        return result
 
     def summary(self, f: Filters) -> dict[str, Any]:
         where, args = self._where(f)
@@ -589,7 +666,7 @@ class QueryEngine:
         where, args = "1=1", []
         if f is not None:
             scoped = replace(f, player="", player_role="killer")
-            where, args = self._where(scoped)
+            where, args = self._where(scoped, is_player=True)
 
         with self.db.connect() as conn:
             row = conn.execute(

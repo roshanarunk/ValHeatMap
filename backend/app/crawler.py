@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import os
 import sys
 import threading
@@ -545,6 +546,7 @@ async def run_forever(
     control = control or crawler.control
     since_publish = 0
     since_facets = 0
+    since_archive = 0
     facet_task: asyncio.Task[None] | None = None
     cycle = 0
 
@@ -671,6 +673,24 @@ async def run_forever(
                         crawler.log(f"  ! facet cache rebuild failed: {exc}")
 
                 facet_task = asyncio.ensure_future(_rebuild(crawler.analytics))
+
+        # Periodically compact loose JSON files into parted zip archives so
+        # the persistent volume does not exhaust inodes or hit disk capacity.
+        since_archive += gained
+        if crawler.db is not None and since_archive >= 1000:
+            loop = asyncio.get_running_loop()
+            try:
+                res = await loop.run_in_executor(
+                    None, functools.partial(crawler.db.archive_raw, chunk_size=1000)
+                )
+                if res.get("archived", 0) > 0:
+                    crawler.log(
+                        f"  · archived {res['archived']} matches into zip parts "
+                        f"(freed {res['bytes_freed'] / 1e6:.1f} MB)"
+                    )
+                    since_archive = 0
+            except Exception as exc:
+                crawler.log(f"  ! raw payload archiving failed: {exc}")
 
         if gained == 0:
             # Frontier exhausted or upstream unhappy; back off rather than spin.

@@ -23,7 +23,19 @@ export class ApiError extends Error {
   }
 }
 
-async function get<T>(path: string, params?: Record<string, unknown>): Promise<T> {
+const apiCache = new Map<string, { data: unknown; timestamp: number }>()
+const CACHE_TTL_MS = 120_000 // 2 minutes
+const CACHE_MAX_ENTRIES = 50
+
+export function clearApiCache(): void {
+  apiCache.clear()
+}
+
+async function get<T>(
+  path: string,
+  params?: Record<string, unknown>,
+  options?: { signal?: AbortSignal },
+): Promise<T> {
   const url = new URL(`${BASE}${path}`, window.location.origin)
   for (const [key, value] of Object.entries(params ?? {})) {
     if (value === undefined || value === null || value === '') continue
@@ -36,7 +48,13 @@ async function get<T>(path: string, params?: Record<string, unknown>): Promise<T
       url.searchParams.set(key, String(value))
     }
   }
-  const resp = await fetch(url.toString())
+  const cacheKey = url.toString()
+  const cached = apiCache.get(cacheKey)
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.data as T
+  }
+
+  const resp = await fetch(cacheKey, { signal: options?.signal })
   if (!resp.ok) {
     let detail = `Request failed (${resp.status})`
     try {
@@ -47,7 +65,13 @@ async function get<T>(path: string, params?: Record<string, unknown>): Promise<T
     }
     throw new ApiError(detail, resp.status)
   }
-  return (await resp.json()) as T
+  const data = (await resp.json()) as T
+  if (apiCache.size >= CACHE_MAX_ENTRIES) {
+    const oldestKey = apiCache.keys().next().value
+    if (oldestKey) apiCache.delete(oldestKey)
+  }
+  apiCache.set(cacheKey, { data, timestamp: Date.now() })
+  return data
 }
 
 async function post<T>(path: string, body?: unknown): Promise<T> {
@@ -238,13 +262,14 @@ export interface CrawlResult {
 }
 
 export const api = {
-  facets: () => get<Facets>('/api/facets'),
-  killsV2: (f: QueryFilters) => get<KillsResponseV2>('/api/kills', f as Record<string, unknown>),
-  utilityV2: (f: QueryFilters) =>
-    get<UtilityResponseV2>('/api/utility', f as Record<string, unknown>),
-  insightsV2: (f: QueryFilters) =>
-    get<InsightsResponseV2>('/api/insights', f as Record<string, unknown>),
-  dataset: () => get<DatasetStats>('/api/dataset'),
+  facets: (options?: { signal?: AbortSignal }) => get<Facets>('/api/facets', undefined, options),
+  killsV2: (f: QueryFilters, options?: { signal?: AbortSignal }) =>
+    get<KillsResponseV2>('/api/kills', f as Record<string, unknown>, options),
+  utilityV2: (f: QueryFilters, options?: { signal?: AbortSignal }) =>
+    get<UtilityResponseV2>('/api/utility', f as Record<string, unknown>, options),
+  insightsV2: (f: QueryFilters, options?: { signal?: AbortSignal }) =>
+    get<InsightsResponseV2>('/api/insights', f as Record<string, unknown>, options),
+  dataset: (options?: { signal?: AbortSignal }) => get<DatasetStats>('/api/dataset', undefined, options),
   reloadDataset: () => post<{ loaded: number }>('/api/dataset/reload'),
 
   // --- players ---
@@ -256,37 +281,57 @@ export const api = {
   // a URL fragment and never reaches the server.
   // Filters narrow the headline numbers to the current selection, so the
   // stat tiles describe what is on screen rather than always a career.
-  player: (riotId: string, f: QueryFilters = {}) =>
+  player: (riotId: string, f: QueryFilters = {}, options?: { signal?: AbortSignal }) =>
     get<PlayerSummary>(
       `/api/player/${encodeURIComponent(riotId)}`,
       f as Record<string, unknown>,
+      options,
     ),
-  playerMatches: (riotId: string, limit = 20, f: QueryFilters = {}) =>
+  playerMatches: (
+    riotId: string,
+    limit = 20,
+    f: QueryFilters = {},
+    options?: { signal?: AbortSignal },
+  ) =>
     get<{ player: PlayerSummary; matches: PlayerMatch[] }>(
       `/api/player/${encodeURIComponent(riotId)}/matches`,
       { ...(f as Record<string, unknown>), limit },
+      options,
     ),
   refreshPlayer: (riotId: string) =>
     post<{ player: PlayerSummary; stored: number; new_matches: number }>(
       `/api/player/${encodeURIComponent(riotId)}/refresh`,
     ),
-  match: (matchId: string) => get<MatchDetail>(`/api/match/${encodeURIComponent(matchId)}`),
+  match: (matchId: string, options?: { signal?: AbortSignal }) =>
+    get<MatchDetail>(`/api/match/${encodeURIComponent(matchId)}`, undefined, options),
   crawl: (matches: number, region?: string, seed?: string) => {
     const params = new URLSearchParams({ matches: String(matches) })
     if (region) params.set('region', region)
     if (seed) params.set('seed', seed)
     return post<CrawlResult>(`/api/crawl?${params.toString()}`)
   },
-  health: () => get<{ status: string; matches: number; live_sources: Record<string, boolean> }>('/api/health'),
-  maps: () => get<{ maps: MapRow[] }>('/api/maps'),
-  matches: () => get<{ matches: MatchSummary[] }>('/api/matches'),
-  reference: () => get<{ agents: AgentInfo[]; weapons: WeaponInfo[] }>('/api/reference'),
-  kills: (f: QueryFilters) => get<KillsResponse>('/api/kills', f as Record<string, unknown>),
-  utility: (f: QueryFilters) => get<UtilityResponse>('/api/utility', f as Record<string, unknown>),
-  plants: (f: QueryFilters & { cluster_radius?: number; min_sample?: number; sites?: string[] }) =>
-    get<PlantsResponse>('/api/plants', f as Record<string, unknown>),
-  insights: (f: QueryFilters & { grid?: number }) =>
-    get<InsightsResponse>('/api/insights', f as Record<string, unknown>),
+  health: (options?: { signal?: AbortSignal }) =>
+    get<{ status: string; matches: number; live_sources: Record<string, boolean> }>(
+      '/api/health',
+      undefined,
+      options,
+    ),
+  maps: (options?: { signal?: AbortSignal }) => get<{ maps: MapRow[] }>('/api/maps', undefined, options),
+  matches: (options?: { signal?: AbortSignal }) =>
+    get<{ matches: MatchSummary[] }>('/api/matches', undefined, options),
+  reference: (options?: { signal?: AbortSignal }) =>
+    get<{ agents: AgentInfo[]; weapons: WeaponInfo[] }>('/api/reference', undefined, options),
+  kills: (f: QueryFilters, options?: { signal?: AbortSignal }) =>
+    get<KillsResponse>('/api/kills', f as Record<string, unknown>, options),
+  utility: (f: QueryFilters, options?: { signal?: AbortSignal }) =>
+    get<UtilityResponse>('/api/utility', f as Record<string, unknown>, options),
+  plants: (
+    f: QueryFilters & { cluster_radius?: number; min_sample?: number; sites?: string[] },
+    options?: { signal?: AbortSignal },
+  ) =>
+    get<PlantsResponse>('/api/plants', f as Record<string, unknown>, options),
+  insights: (f: QueryFilters & { grid?: number }, options?: { signal?: AbortSignal }) =>
+    get<InsightsResponse>('/api/insights', f as Record<string, unknown>, options),
   importUpload: (payload: unknown) =>
     post<{ imported: string; match: MatchSummary }>('/api/import/upload', payload),
   importHenrik: (matchId: string, region?: string) =>

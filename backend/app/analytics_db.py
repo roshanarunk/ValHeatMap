@@ -230,6 +230,11 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
             # from the backfill, which re-reads the raw payloads.
             conn.execute(f"ALTER TABLE kills ADD COLUMN {column} INTEGER")
             applied.append(f"kills.{column}")
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(kills)")}
+    for idx_name in ("idx_k_map_weapon", "idx_k_map_agent"):
+        if idx_name in indexes:
+            conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
+            applied.append(f"DROP {idx_name}")
     return applied
 
 
@@ -241,13 +246,22 @@ class AnalyticsDB:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._dim_cache: dict[str, dict[str, int]] = {}
+        self._stats_cache: dict[str, Any] | None = None
+        self._stats_cache_time: float = 0.0
         if not read_only:
             with self.connect() as conn:
-                # Migrate first: SCHEMA creates indexes over the new
-                # columns, which fails outright on a database that predates
-                # them. On a fresh database this is a no-op.
-                _migrate(conn)
-                conn.executescript(SCHEMA)
+                conn.execute("PRAGMA journal_mode=WAL")
+                applied = _migrate(conn)
+                tables = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                # Only execute SCHEMA if new migrations were applied or core tables are absent.
+                # Avoids executing full index checks on an 8M-row database on every process boot.
+                if applied or "matches" not in tables or "kills" not in tables:
+                    conn.executescript(SCHEMA)
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -260,11 +274,20 @@ class AnalyticsDB:
                 )
             else:
                 conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-                conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
+            # 16MB page cache per thread (bounded for 512MB VM across 6 threads = ~96MB max)
+            conn.execute("PRAGMA cache_size=-16000")
+            conn.execute("PRAGMA mmap_size=0")
+            conn.execute("PRAGMA busy_timeout=15000")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return conn
+
+    def ping(self) -> bool:
+        """Fast DB liveness check in <0.5ms."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT 1").fetchone()
+            return bool(row and row[0] == 1)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -452,6 +475,7 @@ class AnalyticsDB:
                 conn.executemany(
                     "INSERT INTO plants VALUES (?,?,?,?,?,?,?,?,?,?,?)", plant_rows
                 )
+        self._stats_cache = None
         return len(kill_rows)
 
     # --- tracked players -----------------------------------------------
@@ -559,17 +583,31 @@ class AnalyticsDB:
         conn.isolation_level = previous
 
     # --- query ---------------------------------------------------------
-    def stats(self) -> dict[str, Any]:
+    def stats(self, live: bool = False, max_age_s: float = 300.0) -> dict[str, Any]:
+        """Dataset totals. Cached for up to `max_age_s` to protect health checks
+        and frequent polls from repeating multi-million-row COUNT(*) scans.
+        Pass `live=True` to bypass cache.
+        """
+        now = time.monotonic()
+        if (
+            not live
+            and self._stats_cache is not None
+            and (now - self._stats_cache_time) < max_age_s
+        ):
+            return dict(self._stats_cache)
         with self.connect() as conn:
             m = conn.execute("SELECT COUNT(*) n FROM matches").fetchone()["n"]
             k = conn.execute("SELECT COUNT(*) n FROM kills").fetchone()["n"]
             p = conn.execute("SELECT COUNT(*) n FROM plants").fetchone()["n"]
-        return {
+        res = {
             "matches": m,
             "kills": k,
             "plants": p,
             "generated_at": self.get_meta("generated_at"),
         }
+        self._stats_cache = res
+        self._stats_cache_time = now
+        return dict(res)
 
     def rebuild_facet_cache(self) -> dict[str, Any]:
         """Compute the facet payload and store it for instant reads."""
@@ -588,6 +626,7 @@ class AnalyticsDB:
         Served from the precomputed cache when present; falls back to
         computing on demand so an older database still works.
         """
+        cached_val = None
         try:
             with self.connect() as conn:
                 row = conn.execute(
@@ -595,15 +634,20 @@ class AnalyticsDB:
                 ).fetchone()
             if row:
                 cached = json.loads(row["value"])
-                # On a server the crawler writes to this same file, so the
-                # cache goes stale as matches arrive. Recompute when the
-                # match count has moved enough to matter; the counts are
-                # only used to populate filter lists, so being a little
-                # behind is fine but being thousands behind is not.
                 if not self._facets_are_stale(cached):
                     return cached
+                cached_val = cached
         except (sqlite3.Error, json.JSONDecodeError):
             pass  # missing or corrupt cache: fall through and compute
+
+        if self.read_only and cached_val is not None:
+            return cached_val
+
+        if not self.read_only:
+            try:
+                return self.rebuild_facet_cache()
+            except sqlite3.Error:
+                pass
         return self._compute_facets()
 
     def _facets_are_stale(self, cached: dict[str, Any], tolerance: int = 500) -> bool:
@@ -612,10 +656,9 @@ class AnalyticsDB:
             cached_total = sum(m.get("matches", 0) for m in cached.get("maps", []))
             if cached_total == 0:
                 return True
-            with self.connect() as conn:
-                actual = conn.execute("SELECT COUNT(*) n FROM matches").fetchone()["n"]
+            actual = self.stats().get("matches", 0)
             return abs(actual - cached_total) > tolerance
-        except sqlite3.Error:
+        except (sqlite3.Error, KeyError):
             return False
 
     def _compute_facets(self) -> dict[str, Any]:
