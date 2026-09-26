@@ -217,6 +217,32 @@ class Database:
                 except (KeyError, zipfile.BadZipFile, json.JSONDecodeError, OSError):
                     pass
 
+            # Fallback: check adjacent archives (±20 parts) in case of archive offset/interrupted re-indexing
+            m_num = re.search(r"archive_(\d+)\.zip", zip_name)
+            if m_num:
+                curr_n = int(m_num.group(1))
+                for delta in range(1, 21):
+                    for sign in (-1, 1):
+                        cand_n = curr_n + (delta * sign)
+                        if cand_n < 1:
+                            continue
+                        cand_zip = self.raw_dir / f"archive_{cand_n:04d}.zip"
+                        if cand_zip.is_file():
+                            try:
+                                with zipfile.ZipFile(cand_zip, "r") as zf:
+                                    payload_bytes = zf.read(member)
+                                    try:
+                                        with self.connect() as update_conn:
+                                            update_conn.execute(
+                                                "UPDATE matches SET payload_path = ? WHERE match_id = ?",
+                                                (f"{cand_zip.name}:{member}", match_id),
+                                            )
+                                    except Exception:
+                                        pass
+                                    return json.loads(payload_bytes.decode("utf-8"))
+                            except (KeyError, zipfile.BadZipFile, json.JSONDecodeError, OSError):
+                                pass
+
         # 2. Stored as loose file
         if payload_path:
             p = self.raw_dir / payload_path

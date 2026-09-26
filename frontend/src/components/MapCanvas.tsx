@@ -8,7 +8,12 @@ import {
   type SideKey,
 } from '../lib/heatmap'
 import { drawSiteBadge, drawSpotPin } from '../lib/markers'
-import type { KillPoint, MapInfo, PlantPoint, PlantSpot, Vec2 } from '../lib/types'
+import {
+  drawRotationGraph,
+  findHoveredTransition,
+  findHoveredZone,
+} from '../lib/rotations'
+import type { KillPoint, MapInfo, PlantPoint, PlantSpot, RotationsResponse, Vec2 } from '../lib/types'
 
 export type RenderMode = 'heatmap' | 'lines' | 'points'
 
@@ -17,6 +22,11 @@ export interface MapCanvasProps {
   kills?: KillPoint[]
   plants?: PlantPoint[]
   spots?: PlantSpot[]
+  rotations?: RotationsResponse | null
+  selectedZone?: string | null
+  selectedRoute?: { from: string; to: string } | null
+  onSelectZone?: (zoneId: string | null) => void
+  onSelectRoute?: (route: { from: string; to: string } | null) => void
   mode: RenderMode
   ramp: RampName
   radius: number
@@ -28,6 +38,13 @@ export interface MapCanvasProps {
    * where they lose -- instead of as one undifferentiated density.
    */
   player?: string
+  /**
+   * Split the field by each kill's `mine` flag without naming a player:
+   * `mine` duels count at the killer's position, the rest at the victim's.
+   * Used by the global kills view, where the "subject" is whoever matches
+   * the filters rather than one account.
+   */
+  splitOutcome?: boolean
   percentile?: number
   /** Map rotation in degrees, so a user can orient to their own side. */
   rotation?: number
@@ -73,12 +90,18 @@ export function MapCanvas({
   kills = [],
   plants = [],
   spots = [],
+  rotations = null,
+  selectedZone = null,
+  selectedRoute = null,
+  onSelectZone,
+  onSelectRoute,
   mode,
   ramp,
   radius,
   intensity,
   anchor,
   player,
+  splitOutcome = false,
   percentile = 0.99,
   rotation = 0,
   showCallouts = false,
@@ -102,7 +125,19 @@ export function MapCanvas({
   const dragRef = useRef<{ x: number; y: number } | null>(null)
   const [draft, setDraft] = useState<Zone | null>(null)
 
+  // Zoom & pan state for inspecting dense chokepoints
+  const [zoom, setZoom] = useState(1)
+  const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
+  const [, setRedrawCount] = useState(0)
+  const panDragRef = useRef<{ startX: number; startY: number; initPanX: number; initPanY: number } | null>(null)
+
   const radians = useMemo(() => (rotation * Math.PI) / 180, [rotation])
+  const split = !!player || splitOutcome
+
+  useEffect(() => {
+    setZoom(1)
+    setPan({ x: 0, y: 0 })
+  }, [map?.name])
 
   useEffect(() => {
     const el = wrapRef.current
@@ -156,7 +191,7 @@ export function MapCanvas({
    * that is exactly what makes the combined view worth drawing.
    */
   const divergingPoints = useMemo(() => {
-    if (!player) return null
+    if (!split) return null
     const wins: Vec2[] = []
     const losses: Vec2[] = []
     for (const k of kills) {
@@ -164,7 +199,7 @@ export function MapCanvas({
       // on puuid here does not work: the kill points carry agent names, not
       // player ids, so every duel fell through to "loss" and the whole map
       // drew red.
-      const won = k.mine ?? (k.killer !== '' && k.killer === player)
+      const won = k.mine ?? (!!player && k.killer !== '' && k.killer === player)
       if (won) {
         const p = k.killer_pos ?? k.victim_pos
         if (p) wins.push(p)
@@ -176,7 +211,7 @@ export function MapCanvas({
     // is clearer as an ordinary single-hue heatmap.
     if (wins.length === 0 || losses.length === 0) return null
     return { wins, losses }
-  }, [kills, player])
+  }, [kills, player, split])
 
   const duelLines: DuelLine[] = useMemo(() => {
     if (mode !== 'lines') return []
@@ -206,6 +241,11 @@ export function MapCanvas({
     // Everything inside this transform is drawn in map space, so the base
     // image and every data layer rotate together.
     ctx.save()
+    if (zoom !== 1 || pan.x !== 0 || pan.y !== 0) {
+      ctx.translate(px / 2, px / 2)
+      ctx.scale(zoom, zoom)
+      ctx.translate(-px / 2 + pan.x * px, -px / 2 + pan.y * px)
+    }
     if (radians) {
       ctx.translate(px / 2, px / 2)
       ctx.rotate(radians)
@@ -252,7 +292,7 @@ export function MapCanvas({
         // With a player set, plot where *they* stood: the killer end when
         // they got the kill, the victim end when they died.
         const won = k.mine ?? false
-        const p = player
+        const p = split
           ? won
             ? (k.killer_pos ?? k.victim_pos)
             : k.victim_pos
@@ -267,7 +307,7 @@ export function MapCanvas({
         // match the heatmap. Elsewhere it stays attacker/defender.
         ctx.fillStyle = traded
           ? 'rgba(96, 224, 168, 0.9)'
-          : player
+          : split
             ? won
               ? 'rgba(64, 220, 130, 0.85)'
               : 'rgba(255, 72, 88, 0.85)'
@@ -352,6 +392,15 @@ export function MapCanvas({
       })
     }
 
+    if (rotations && rotations.zones?.length) {
+      drawRotationGraph(ctx, px, dpr, rotations.zones, rotations.transitions, {
+        selectedZone,
+        selectedRoute,
+        side: rotations.side,
+        onNeedRedraw: () => setRedrawCount((c) => c + 1),
+      })
+    }
+
     // Zone overlay: dim everything outside the box so the selection reads
     // as a focus rather than just an outline.
     const box = draft ?? zone
@@ -378,25 +427,41 @@ export function MapCanvas({
   }, [
     size, heatPoints, divergingPoints, duelLines, mode, ramp, radius, intensity,
     percentile, kills, plants, spots, anchor, showCallouts, showSpots,
-    highlightTraded, map, imageReady, radians, selectedSpot, zone, draft,
+    highlightTraded, split, map, imageReady, radians, selectedSpot, zone, draft, zoom, pan,
+    rotations, selectedZone, selectedRoute,
   ])
 
   useEffect(() => {
     draw()
   }, [draw])
 
+  const toMapSpace = useCallback(
+    (event: React.PointerEvent | React.MouseEvent) => {
+      const canvas = canvasRef.current
+      if (!canvas) return null
+      const rect = canvas.getBoundingClientRect()
+      const sx = (event.clientX - rect.left) / rect.width
+      const sy = (event.clientY - rect.top) / rect.height
+      // Undo zoom & pan:
+      const cx = sx - 0.5
+      const cy = sy - 0.5
+      const ux = cx / zoom
+      const uy = cy / zoom
+      const px = ux - pan.x + 0.5
+      const py = uy - pan.y + 0.5
+      return rotatePoint({ x: px, y: py }, -radians)
+    },
+    [radians, zoom, pan],
+  )
+
   const onMove = useCallback(
     (event: React.MouseEvent<HTMLCanvasElement>) => {
       const canvas = canvasRef.current
       if (!canvas || size <= 0) return
-      const rect = canvas.getBoundingClientRect()
-      // Undo the rotation so hit-testing happens in map space.
-      const raw = {
-        x: (event.clientX - rect.left) / rect.width,
-        y: (event.clientY - rect.top) / rect.height,
-      }
       if (zoneMode && dragRef.current) return
-      const pt = rotatePoint(raw, -radians)
+      if (panDragRef.current) return
+      const pt = toMapSpace(event)
+      if (!pt) return
 
       const near = <T,>(items: T[], pos: (i: T) => Vec2, limit: number) => {
         let best: { item: T; dist: number } | null = null
@@ -409,7 +474,7 @@ export function MapCanvas({
       }
 
       if (showSpots && spots.length) {
-        const spot = near(spots, (s) => s.position, 0.035)
+        const spot = near(spots, (s) => s.position, 0.035 / zoom)
         if (spot) {
           const idx = spots.findIndex((s) => s.id === spot.id) + 1
           setHover({
@@ -428,19 +493,24 @@ export function MapCanvas({
       }
 
       if (kills.length && mode === 'points') {
-        const kill = near(
-          kills,
-          (k) => (anchor === 'killer' ? (k.killer_pos ?? k.victim_pos) : k.victim_pos),
-          0.02,
-        )
+        const plotted = (k: KillPoint) =>
+          (split ? (k.mine ?? false) : anchor === 'killer')
+            ? (k.killer_pos ?? k.victim_pos)
+            : k.victim_pos
+        const kill = near(kills, plotted, 0.02 / zoom)
         if (kill) {
-          const p = anchor === 'killer' ? (kill.killer_pos ?? kill.victim_pos) : kill.victim_pos
+          const p = plotted(kill)
           setHover({
             x: p.x,
             y: p.y,
             title: `${kill.killer_agent} → ${kill.victim_agent}`,
             lines: [
               kill.ability || kill.weapon || kill.type,
+              kill.victim_weapon
+                ? anchor === 'killer'
+                  ? `Enemy held: ${kill.victim_weapon}`
+                  : `Held: ${kill.victim_weapon}`
+                : '',
               `round ${kill.round + 1} · ${(kill.t / 1000).toFixed(1)}s`,
               kill.traded ? 'Traded' : '',
             ].filter(Boolean),
@@ -448,104 +518,275 @@ export function MapCanvas({
           return
         }
       }
+
+      if (rotations && rotations.zones?.length) {
+        const zone = findHoveredZone(pt.x, pt.y, rotations.zones, 0.035 / zoom)
+        if (zone) {
+          setHover({
+            x: zone.x,
+            y: zone.y,
+            title: `Zone · ${zone.name}`,
+            lines: [
+              `Departures: ${(zone.outgoing_count ?? 0).toLocaleString()}`,
+              `Arrivals: ${(zone.incoming_count ?? 0).toLocaleString()}`,
+              `Total Traffic: ${(zone.total_traffic ?? 0).toLocaleString()} rotations`,
+            ],
+          })
+          return
+        }
+
+        const ht = findHoveredTransition(
+          pt.x,
+          pt.y,
+          rotations.transitions,
+          rotations.zones,
+          0.035 / zoom,
+        )
+        if (ht) {
+          setHover({
+            x: ht.midpoint.x,
+            y: ht.midpoint.y,
+            title: `${ht.transition.from_zone} ➔ ${ht.transition.to_zone}`,
+            lines: [
+              `Volume: ${ht.transition.count.toLocaleString()} rotations`,
+              `Route Share: ${Math.round(ht.transition.outgoing_share * 100)}% of exits`,
+              `Avg Transit: ${ht.transition.avg_duration_s}s`,
+              `Round Win Rate: ${Math.round(ht.transition.win_rate * 100)}% (${ht.transition.rounds_won}/${ht.transition.count})`,
+              ...(ht.transition.agents && ht.transition.agents.length > 0
+                ? [`Agents: ${ht.transition.agents.map((a) => `${a.agent} (${a.count})`).join(', ')}`]
+                : []),
+            ],
+          })
+          return
+        }
+      }
+
       setHover(null)
     },
-    [kills, spots, size, showSpots, anchor, mode, radians, zoneMode],
-  )
-
-  const toMapSpace = useCallback(
-    (event: React.PointerEvent | React.MouseEvent) => {
-      const canvas = canvasRef.current
-      if (!canvas) return null
-      const rect = canvas.getBoundingClientRect()
-      return rotatePoint(
-        {
-          x: (event.clientX - rect.left) / rect.width,
-          y: (event.clientY - rect.top) / rect.height,
-        },
-        -radians,
-      )
-    },
-    [radians],
+    [kills, spots, size, showSpots, anchor, split, mode, zoneMode, toMapSpace, zoom, rotations],
   )
 
   const onPointerDown = useCallback(
     (event: React.PointerEvent<HTMLCanvasElement>) => {
-      if (!zoneMode) return
-      const p = toMapSpace(event)
-      if (!p) return
-      event.currentTarget.setPointerCapture(event.pointerId)
-      dragRef.current = p
-      setDraft({ x0: p.x, y0: p.y, x1: p.x, y1: p.y })
+      if (zoneMode) {
+        const p = toMapSpace(event)
+        if (!p) return
+        event.currentTarget.setPointerCapture(event.pointerId)
+        dragRef.current = p
+        setDraft({ x0: p.x, y0: p.y, x1: p.x, y1: p.y })
+        return
+      }
+      if (zoom > 1) {
+        panDragRef.current = {
+          startX: event.clientX,
+          startY: event.clientY,
+          initPanX: pan.x,
+          initPanY: pan.y,
+        }
+        event.currentTarget.setPointerCapture(event.pointerId)
+      }
     },
-    [zoneMode, toMapSpace],
+    [zoneMode, toMapSpace, zoom, pan],
   )
 
   const onPointerMove = useCallback(
     (event: React.PointerEvent<HTMLCanvasElement>) => {
-      const start = dragRef.current
-      if (!zoneMode || !start) return
-      const p = toMapSpace(event)
-      if (!p) return
-      setDraft({
-        x0: Math.min(start.x, p.x),
-        y0: Math.min(start.y, p.y),
-        x1: Math.max(start.x, p.x),
-        y1: Math.max(start.y, p.y),
-      })
+      if (zoneMode) {
+        const start = dragRef.current
+        if (!start) return
+        const p = toMapSpace(event)
+        if (!p) return
+        setDraft({
+          x0: Math.min(start.x, p.x),
+          y0: Math.min(start.y, p.y),
+          x1: Math.max(start.x, p.x),
+          y1: Math.max(start.y, p.y),
+        })
+        return
+      }
+      if (panDragRef.current && canvasRef.current) {
+        const dx = (event.clientX - panDragRef.current.startX) / canvasRef.current.clientWidth / zoom
+        const dy = (event.clientY - panDragRef.current.startY) / canvasRef.current.clientHeight / zoom
+        setPan({
+          x: Math.max(-0.45, Math.min(0.45, panDragRef.current.initPanX + dx)),
+          y: Math.max(-0.45, Math.min(0.45, panDragRef.current.initPanY + dy)),
+        })
+      }
     },
-    [zoneMode, toMapSpace],
+    [zoneMode, toMapSpace, zoom],
   )
 
   const onPointerUp = useCallback(
     (event: React.PointerEvent<HTMLCanvasElement>) => {
-      if (!zoneMode || !dragRef.current) return
-      dragRef.current = null
-      event.currentTarget.releasePointerCapture?.(event.pointerId)
-      setDraft((current) => {
-        // Ignore an accidental click: a box smaller than this selects
-        // almost nothing and is nearly always a misclick.
-        if (current && current.x1 - current.x0 > 0.01 && current.y1 - current.y0 > 0.01) {
-          onZoneChange?.(current)
-        } else {
-          onZoneChange?.(null)
-        }
-        return null
-      })
+      if (zoneMode) {
+        if (!dragRef.current) return
+        dragRef.current = null
+        event.currentTarget.releasePointerCapture?.(event.pointerId)
+        setDraft((current) => {
+          if (current && current.x1 - current.x0 > 0.01 && current.y1 - current.y0 > 0.01) {
+            onZoneChange?.(current)
+          } else {
+            onZoneChange?.(null)
+          }
+          return null
+        })
+        return
+      }
+      if (panDragRef.current) {
+        panDragRef.current = null
+        event.currentTarget.releasePointerCapture?.(event.pointerId)
+      }
     },
     [zoneMode, onZoneChange],
   )
 
-  const onClick = useCallback(() => {
-    if (!onSelectSpot || !hover) return
-    const match = spots.find(
-      (s) => Math.abs(s.position.x - hover.x) < 1e-6 && Math.abs(s.position.y - hover.y) < 1e-6,
-    )
-    onSelectSpot(match ? (selectedSpot === match.id ? null : match.id) : null)
-  }, [hover, spots, onSelectSpot, selectedSpot])
+  const onWheel = useCallback((e: React.WheelEvent<HTMLCanvasElement>) => {
+    e.preventDefault()
+    const delta = e.deltaY < 0 ? 0.25 : -0.25
+    setZoom((z) => {
+      const next = Math.max(1, Math.min(3, +(z + delta).toFixed(2)))
+      if (next === 1) setPan({ x: 0, y: 0 })
+      return next
+    })
+  }, [])
 
-  // Hover coordinates are in map space; rotate them back for positioning.
-  const hoverScreen = hover ? rotatePoint({ x: hover.x, y: hover.y }, radians) : null
-  const empty = !loading && heatPoints.length === 0 && spots.length === 0
+  const onClick = useCallback(
+    (event: React.MouseEvent<HTMLCanvasElement>) => {
+      if (rotations && rotations.zones?.length) {
+        const pt = toMapSpace(event)
+        if (pt) {
+          const zone = findHoveredZone(pt.x, pt.y, rotations.zones, 0.035 / zoom)
+          if (zone) {
+            onSelectZone?.(selectedZone === zone.id ? null : zone.id)
+            return
+          }
+          const ht = findHoveredTransition(
+            pt.x,
+            pt.y,
+            rotations.transitions,
+            rotations.zones,
+            0.035 / zoom,
+          )
+          if (ht) {
+            const isSame =
+              selectedRoute?.from === ht.transition.from_zone &&
+              selectedRoute?.to === ht.transition.to_zone
+            onSelectRoute?.(
+              isSame ? null : { from: ht.transition.from_zone, to: ht.transition.to_zone },
+            )
+            return
+          }
+          onSelectZone?.(null)
+          onSelectRoute?.(null)
+        }
+      }
+
+      if (!onSelectSpot || !hover) return
+      const match = spots.find(
+        (s) => Math.abs(s.position.x - hover.x) < 1e-6 && Math.abs(s.position.y - hover.y) < 1e-6,
+      )
+      onSelectSpot(match ? (selectedSpot === match.id ? null : match.id) : null)
+    },
+    [
+      hover,
+      spots,
+      onSelectSpot,
+      selectedSpot,
+      rotations,
+      selectedZone,
+      selectedRoute,
+      onSelectZone,
+      onSelectRoute,
+      toMapSpace,
+      zoom,
+    ],
+  )
+
+  // Hover coordinates are in map space; rotate and scale back for screen positioning.
+  const rot = hover ? rotatePoint({ x: hover.x, y: hover.y }, radians) : null
+  const hoverScreen = rot
+    ? {
+        x: 0.5 + ((rot.x - 0.5) + pan.x) * zoom,
+        y: 0.5 + ((rot.y - 0.5) + pan.y) * zoom,
+      }
+    : null
+  const isHoverVisible =
+    hoverScreen &&
+    hoverScreen.x >= 0 &&
+    hoverScreen.x <= 1 &&
+    hoverScreen.y >= 0 &&
+    hoverScreen.y <= 1
+
+  const empty =
+    !loading &&
+    heatPoints.length === 0 &&
+    spots.length === 0 &&
+    (!rotations || rotations.transitions.length === 0)
 
   return (
     <div className="map-canvas" ref={wrapRef}>
       <canvas
         ref={canvasRef}
-        style={{ width: size, height: size, cursor: zoneMode ? 'crosshair' : 'default' }}
+        style={{
+          width: size,
+          height: size,
+          cursor: zoneMode ? 'crosshair' : zoom > 1 ? 'grab' : 'default',
+        }}
         onMouseMove={onMove}
         onMouseLeave={() => setHover(null)}
         onClick={onClick}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
+        onWheel={onWheel}
       />
       {!map && <div className="map-overlay">Select a map to begin</div>}
       {loading && <div className="map-overlay map-overlay--soft">Loading…</div>}
       {empty && map && !loading && (
         <div className="map-overlay map-overlay--soft">No events match these filters</div>
       )}
-      {hover && hoverScreen && (
+      {map && (
+        <div className="map-zoom">
+          <button
+            type="button"
+            onClick={() => setZoom((z) => Math.min(3, +(z + 0.5).toFixed(1)))}
+            title="Zoom in"
+            aria-label="Zoom in"
+          >
+            +
+          </button>
+          <span>{Math.round(zoom * 100)}%</span>
+          <button
+            type="button"
+            onClick={() => {
+              setZoom((z) => {
+                const next = Math.max(1, +(z - 0.5).toFixed(1))
+                if (next === 1) setPan({ x: 0, y: 0 })
+                return next
+              })
+            }}
+            title="Zoom out"
+            aria-label="Zoom out"
+            disabled={zoom <= 1}
+          >
+            −
+          </button>
+          {zoom > 1 && (
+            <button
+              type="button"
+              className="map-zoom__reset"
+              onClick={() => {
+                setZoom(1)
+                setPan({ x: 0, y: 0 })
+              }}
+              title="Reset zoom"
+            >
+              Reset
+            </button>
+          )}
+        </div>
+      )}
+      {hover && hoverScreen && isHoverVisible && (
         <div
           className="map-tooltip"
           style={{

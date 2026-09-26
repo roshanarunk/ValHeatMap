@@ -142,13 +142,13 @@ def test_history_fetches_every_match_in_the_listing(tmp_path: Path):
     stored: list[str] = []
     crawler._store = lambda raw: (stored.append(raw["match_id"]), True)[1]
 
-    client = _HistoryClient([f"m{i}" for i in range(40)])
-    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na"))
+    client = _HistoryClient([f"m{i}" for i in range(10)], page_size=10)
+    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na", size=10))
 
     # One full page then an empty one, which is how it learns it is done.
     assert client.listing_calls == 2
-    assert got == 40
-    assert len(stored) == 40
+    assert got == 10
+    assert len(stored) == 10
 
 
 def test_history_walks_every_page(tmp_path: Path):
@@ -161,11 +161,11 @@ def test_history_walks_every_page(tmp_path: Path):
     crawler = Crawler(api_key="k", analytics=db, region="na", rate_limit=100_000)
     crawler._store = lambda raw: True
 
-    client = _HistoryClient([f"m{i}" for i in range(250)], page_size=100)
-    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na"))
+    client = _HistoryClient([f"m{i}" for i in range(25)], page_size=10)
+    got = asyncio.run(crawler.crawl_player_history(client, "puuid", region="na", size=10))
 
-    assert got == 250, "every page should be walked, not just the first"
-    assert client.listing_calls == 4  # 100 + 100 + 50 + empty
+    assert got == 25, "every page should be walked, not just the first"
+    assert client.listing_calls == 4  # 10 + 10 + 5 + empty
 
 
 def test_history_stops_if_the_endpoint_ignores_pagination(tmp_path: Path):

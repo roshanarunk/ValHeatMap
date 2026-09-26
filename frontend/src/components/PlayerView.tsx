@@ -14,13 +14,18 @@ import { TimeSlider } from './TimeSlider'
 import {
   api,
   ApiError,
+  clearApiCache,
   type MatchDetail,
   type PlayerMatch,
   type PlayerSummary,
 } from '../lib/api'
 import type { QueryFilters } from '../lib/api'
 import type { RampName } from '../lib/heatmap'
-import type { Facets, KillPoint, KillsResponseV2 } from '../lib/types'
+import type { Facets, KillPoint, KillsResponseV2, RotationsResponse } from '../lib/types'
+
+export interface PlayerViewProps {
+  onNavigateToRotations?: (params: { player?: string; agent?: string; mapName?: string; matchId?: string }) => void
+}
 
 const ROUND_MAX_MS = 120_000
 /** Matches the main view's default: tight splats keep spots distinct. */
@@ -39,9 +44,10 @@ const ROLES: { id: Role; label: string }[] = [
 
 const num = (v: number) => v.toLocaleString()
 
-// Valorant's own shop categories, matching the global filters.
+// Valorant's shop categories plus a Full Buy preset.
 const WEAPON_GROUPS: { label: string; values: string[] }[] = [
-  { label: 'Rifles', values: ['Vandal', 'Phantom', 'Bulldog', 'Guardian'] },
+  { label: 'Full Buy', values: ['Vandal', 'Phantom', 'Warden', 'Operator'] },
+  { label: 'Rifles', values: ['Vandal', 'Phantom', 'Warden', 'Bulldog', 'Guardian'] },
   { label: 'Snipers', values: ['Operator', 'Marshal', 'Outlaw'] },
   { label: 'SMGs', values: ['Spectre', 'Stinger'] },
   { label: 'Pistols', values: ['Classic', 'Shorty', 'Frenzy', 'Ghost', 'Sheriff'] },
@@ -92,21 +98,39 @@ function toKillPoints(detail: MatchDetail, puuid?: string): KillPoint[] {
   }))
 }
 
-export function PlayerView() {
+export function PlayerView({ onNavigateToRotations }: PlayerViewProps = {}) {
   const [riotId, setRiotId] = useState(() => localStorage.getItem(STORAGE_KEY) ?? '')
   const [input, setInput] = useState(riotId)
+  const [playerTab, setPlayerTab] = useState<'career' | 'matches'>('career')
   const [player, setPlayer] = useState<PlayerSummary | null>(null)
+  const [basePlayer, setBasePlayer] = useState<PlayerSummary | null>(null)
   const [matches, setMatches] = useState<PlayerMatch[]>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
   // Aggregate view: every kill/death across their whole history on one map.
   const [aggMap, setAggMap] = useState('')
+  const [lastMap, setLastMap] = useState('')
   const [aggRole, setAggRole] = useState<Role>('either')
   const [aggMode, setAggMode] = useState<RenderMode>('heatmap')
   const [agg, setAgg] = useState<KillsResponseV2 | null>(null)
   const [aggBusy, setAggBusy] = useState(false)
   const [aggTime, setAggTime] = useState<[number, number]>([0, ROUND_MAX_MS])
+
+  const heatmapMap = (aggMap === 'all' ? lastMap : aggMap) || (player?.maps?.[0]?.map_name ?? '')
+
+  const allMatches = useMemo(
+    () => basePlayer?.matches ?? (player?.maps ?? []).reduce((acc, m) => acc + (m.matches || 0), 0),
+    [basePlayer?.matches, player?.maps],
+  )
+  const allKills = useMemo(
+    () => basePlayer?.kills ?? (player?.maps ?? []).reduce((acc, m) => acc + (m.kills || 0), 0),
+    [basePlayer?.kills, player?.maps],
+  )
+  const allDeaths = useMemo(
+    () => basePlayer?.deaths ?? (player?.maps ?? []).reduce((acc, m) => acc + (m.deaths || 0), 0),
+    [basePlayer?.deaths, player?.maps],
+  )
 
   // Filters. These narrow the *opponent* in each duel: on your kills that
   // is who you killed, on your deaths who killed you -- which is the
@@ -136,10 +160,37 @@ export function PlayerView() {
   const [detail, setDetail] = useState<MatchDetail | null>(null)
   const [detailBusy, setDetailBusy] = useState(false)
   const [role, setRole] = useState<Role>('either')
-  const [mode, setMode] = useState<RenderMode>('lines')
+  const [mode, setMode] = useState<RenderMode | 'rotations'>('lines')
+  const [matchRotations, setMatchRotations] = useState<RotationsResponse | null>(null)
   const [roundFilter, setRoundFilter] = useState<number | ''>('')
   const [timeRange, setTimeRange] = useState<[number, number]>([0, ROUND_MAX_MS])
   const [rotation, setRotation] = useState(0)
+
+  useEffect(() => {
+    if (mode !== 'rotations' || !selected) {
+      setMatchRotations(null)
+      return
+    }
+    const controller = new AbortController()
+    api
+      .rotations(
+        {
+          match_id: selected,
+          round_num: roundFilter === '' ? undefined : Number(roundFilter),
+          side: role === 'killer' ? 'attack' : role === 'victim' ? 'defense' : undefined,
+        },
+        { signal: controller.signal },
+      )
+      .then((res) => {
+        if (!controller.signal.aborted) setMatchRotations(res)
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setMatchRotations(null)
+      })
+    return () => {
+      controller.abort()
+    }
+  }, [mode, selected, roundFilter, role])
 
   const load = useCallback(async (id: string) => {
     setBusy(true)
@@ -147,7 +198,9 @@ export function PlayerView() {
     try {
       const res = await api.playerMatches(id, 25)
       setPlayer(res.player)
+      setBasePlayer(res.player)
       setMatches(res.matches)
+      if (res.matches.length > 0) setSelected((prev) => prev || res.matches[0].match_id)
       setRiotId(id)
       localStorage.setItem(STORAGE_KEY, id)
     } catch (err) {
@@ -156,6 +209,7 @@ export function PlayerView() {
         try {
           const reg = await api.registerPlayer(id)
           setPlayer(reg.player)
+          setBasePlayer(reg.player)
           setMatches([])
           setRiotId(id)
           localStorage.setItem(STORAGE_KEY, id)
@@ -178,7 +232,10 @@ export function PlayerView() {
 
   // Default to the map they play most, so the tab opens on real data.
   useEffect(() => {
-    if (!aggMap && player?.maps?.length) setAggMap(player.maps[0].map_name)
+    if (!aggMap && player?.maps?.length) {
+      setAggMap(player.maps[0].map_name)
+      setLastMap(player.maps[0].map_name)
+    }
   }, [player, aggMap])
 
   // Agent, weapon and role lists for the filter controls.
@@ -186,13 +243,29 @@ export function PlayerView() {
     api.facets().then(setFacets).catch(() => setFacets(null))
   }, [])
 
+  const weaponOptions = useMemo(() => {
+    const list = (facets?.weapons ?? []).map((w) => ({
+      value: w.weapon,
+      label: w.weapon,
+    }))
+    const known = new Set(list.map((item) => item.value.toLowerCase()))
+    if (!known.has('warden')) {
+      const phantomIdx = list.findIndex((item) => item.value.toLowerCase() === 'phantom')
+      const insertAt = phantomIdx !== -1 ? phantomIdx + 1 : 2
+      list.splice(insertAt, 0, { value: 'Warden', label: 'Warden' })
+    }
+    return list
+  }, [facets?.weapons])
+
   const refresh = useCallback(async () => {
     if (!player) return
     setRefreshing(true)
     setRefreshNote('')
     try {
+      clearApiCache()
       const res = await api.refreshPlayer(player.riot_id)
       setPlayer(res.player)
+      setBasePlayer(res.player)
       setRefreshNote(
         res.new_matches > 0
           ? `Added ${res.new_matches} match${res.new_matches === 1 ? '' : 'es'}.`
@@ -210,18 +283,13 @@ export function PlayerView() {
   // Everything narrowing the selection, in one place so the heatmap, the
   // stat tiles and the match list cannot drift out of step.
   const filters: QueryFilters = useMemo(() => {
-    // Which end the agent/role filters apply to is the mirror of the
-    // player's own: showing your kills they describe your victim, showing
-    // your deaths they describe your killer.
-    const opponentIsVictim = aggRole === 'killer'
     return {
-      map_name: aggMap || undefined,
+      map_name: aggMap && aggMap !== 'all' ? aggMap : undefined,
       time_start: aggTime[0] > 0 ? aggTime[0] : undefined,
       time_end: aggTime[1] < ROUND_MAX_MS ? aggTime[1] : undefined,
       sides,
-      ...(opponentIsVictim
-        ? { victim_agents: agents, victim_roles: roles }
-        : { agents, roles }),
+      agents,
+      roles,
       weapons,
       traded_only: tradedOnly,
       untraded_only: untradedOnly,
@@ -229,7 +297,7 @@ export function PlayerView() {
       post_plant_only: postPlantOnly,
     }
   }, [
-    aggMap, aggRole, aggTime, sides, agents, roles, weapons,
+    aggMap, aggTime, sides, agents, roles, weapons,
     tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly,
   ])
 
@@ -257,13 +325,14 @@ export function PlayerView() {
 
   const playerPuuid = player?.puuid
   useEffect(() => {
-    if (!playerPuuid || !aggMap) return
+    if (!playerPuuid || !heatmapMap) return
     const controller = new AbortController()
     setAggBusy(true)
     api
       .killsV2(
         {
           ...filters,
+          map_name: heatmapMap,
           player: playerPuuid,
           player_role: aggRole,
         },
@@ -282,7 +351,7 @@ export function PlayerView() {
     return () => {
       controller.abort()
     }
-  }, [playerPuuid, aggMap, aggRole, filters])
+  }, [playerPuuid, heatmapMap, aggRole, filters])
 
   useEffect(() => {
     if (!selected) {
@@ -350,10 +419,6 @@ export function PlayerView() {
     setRamp(aggRole === 'killer' ? 'toxic' : aggRole === 'victim' ? 'duel' : 'inferno')
   }, [aggRole, rampTouched])
 
-  // The agent/role filters describe the other player in the duel, and
-  // which one that is flips with the view.
-  const opponentLabel =
-    aggRole === 'killer' ? 'Victim role' : aggRole === 'victim' ? 'Killer role' : 'Role'
 
   const rounds = useMemo(
     () => (detail ? Array.from(new Set(detail.kills.map((k) => k.round))).sort((a, b) => a - b) : []),
@@ -373,7 +438,7 @@ export function PlayerView() {
           className="playerform__input"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="YourName#TAG"
+          placeholder="Riot ID (e.g. TenZ#1337)"
           aria-label="Riot ID"
           spellCheck={false}
         />
@@ -390,7 +455,12 @@ export function PlayerView() {
             <div>
               <h2 className="playerhead__name">{player.riot_id}</h2>
               <p className="playerhead__meta">
-                {player.region?.toUpperCase()} · {num(player.matches)} matches
+                {player.region?.toUpperCase()} ·{' '}
+                {aggMap === 'all'
+                  ? `${num(player.matches)} matches across all maps`
+                  : `${num(player.matches)} matches on ${aggMap || 'selected map'}${
+                      allMatches > 0 ? ` (${num(allMatches)} total)` : ''
+                    }`}
                 {player.crawled_at ? ` · updated ${when(player.crawled_at)}` : ''}
                 {refreshNote ? ` · ${refreshNote}` : ''}
               </p>
@@ -406,7 +476,7 @@ export function PlayerView() {
             </button>
           </header>
 
-          {player.matches === 0 ? (
+          {basePlayer && basePlayer.matches === 0 && (!basePlayer.maps || basePlayer.maps.length === 0) ? (
             <Empty>
               <strong>Waiting for your matches.</strong> You are in the queue — tracked
               players are fetched first, so this usually takes a minute or two.
@@ -415,73 +485,147 @@ export function PlayerView() {
             <>
               {activeFilters > 0 && (
                 <p className="statgrid__scope">
-                  Showing {aggMap || 'all maps'} · {activeFilters} filter
+                  Showing {aggMap === 'all' ? 'all maps' : (aggMap || 'all maps')} · {activeFilters} filter
                   {activeFilters === 1 ? '' : 's'} applied
                 </p>
+              )}
+              {player.matches === 0 && activeFilters > 0 && (
+                <div className="statgrid__notice">
+                  <span>No matches found with the selected filter{activeFilters === 1 ? '' : 's'}.</span>
+                  <button type="button" className="linkbtn" onClick={clearFilters}>
+                    Clear all filters
+                  </button>
+                </div>
               )}
               <div className="statgrid statgrid--wide">
                 <StatTile
                   label="Kills"
-                  value={num(player.kills)}
-                  sub={`${num(player.matches)} matches`}
+                  value={num(player.kills || 0)}
+                  sub={`${num(player.matches || 0)} matches`}
                 />
-                <StatTile label="Deaths" value={num(player.deaths)} />
+                <StatTile label="Deaths" value={num(player.deaths || 0)} />
                 <StatTile
                   label="K/D"
-                  value={player.kd.toFixed(2)}
-                  tone={player.kd >= 1 ? 'good' : 'neutral'}
+                  value={(player.kd || 0).toFixed(2)}
+                  tone={(player.kd || 0) >= 1 ? 'good' : 'neutral'}
                 />
                 <StatTile
                   label="Opening duels"
-                  value={`${Math.round(player.opening_win_rate * 100)}%`}
-                  sub={`${num(player.first_bloods)} won · ${num(player.first_deaths)} lost`}
-                  tone={player.opening_win_rate >= 0.5 ? 'good' : 'warn'}
+                  value={`${Math.round((player.opening_win_rate || 0) * 100)}%`}
+                  sub={`${num(player.first_bloods || 0)} won · ${num(player.first_deaths || 0)} lost`}
+                  tone={(player.opening_win_rate || 0) >= 0.5 ? 'good' : 'warn'}
                 />
                 <StatTile
                   label="Deaths traded"
-                  value={`${Math.round(player.trade_rate * 100)}%`}
-                  sub={`${num(player.untraded_deaths)} went unanswered`}
-                  tone={player.trade_rate >= 0.5 ? 'good' : 'neutral'}
+                  value={`${Math.round((player.trade_rate || 0) * 100)}%`}
+                  sub={`${num(player.untraded_deaths || 0)} went unanswered`}
+                  tone={(player.trade_rate || 0) >= 0.5 ? 'good' : 'neutral'}
                 />
                 <StatTile
                   label="Trade kills"
-                  value={num(player.trade_kills)}
+                  value={num(player.trade_kills || 0)}
                   sub="you avenged a team-mate"
                 />
                 <StatTile
                   label="Rounds won with a kill"
-                  value={`${Math.round(player.kill_round_win_rate * 100)}%`}
-                  sub={`${num(player.rounds_won_with_kill)} of ${num(player.kills)} kills`}
-                  tone={player.kill_round_win_rate >= 0.5 ? 'good' : 'neutral'}
+                  value={`${Math.round((player.kill_round_win_rate || 0) * 100)}%`}
+                  sub={`${num(player.rounds_won_with_kill || 0)} of ${num(player.kills || 0)} kills`}
+                  tone={(player.kill_round_win_rate || 0) >= 0.5 ? 'good' : 'neutral'}
                 />
                 <StatTile
                   label="Multi-kill rounds"
-                  value={num(player.multi_kill_rounds)}
-                  sub={player.best_round >= 2 ? `best: ${player.best_round}K` : ''}
-                  tone={player.best_round >= 5 ? 'hot' : 'neutral'}
+                  value={num(player.multi_kill_rounds || 0)}
+                  sub={(player.best_round || 0) >= 2 ? `best: ${player.best_round}K` : ''}
+                  tone={(player.best_round || 0) >= 5 ? 'hot' : 'neutral'}
                 />
                 <StatTile
                   label="Post-plant"
-                  value={`${num(player.post_plant_kills)} / ${num(player.post_plant_deaths)}`}
+                  value={`${num(player.post_plant_kills || 0)} / ${num(player.post_plant_deaths || 0)}`}
                   sub="kills / deaths after the spike"
+                />
+                <StatTile
+                  label="Supported deaths"
+                  value={`${Math.round((player.support_rate || 0) * 100)}%`}
+                  sub={`${num(player.supported_deaths || 0)} with support · ${num(player.isolated_deaths || 0)} isolated`}
+                  tone={(player.support_rate || 0) >= 0.4 ? 'good' : 'warn'}
+                />
+                <StatTile
+                  label="Crossfire kills"
+                  value={num(player.crossfire_kills || 0)}
+                  sub="coordinated angle with a team-mate"
+                  tone={(player.crossfire_kills || 0) > 0 ? 'good' : 'neutral'}
+                />
+                <StatTile
+                  label="Advantage throws"
+                  value={num(player.advantage_deaths || 0)}
+                  sub={
+                    (player.advantage_rounds_thrown || 0) > 0
+                      ? `${Math.round((player.advantage_throw_rate || 0) * 100)}% thrown (${num(player.advantage_rounds_thrown || 0)} rnds)`
+                      : 'died during 2+ man advantage'
+                  }
+                  tone={(player.advantage_deaths || 0) > 0 ? 'warn' : 'good'}
+                />
+                <StatTile
+                  label="1vX Clutches"
+                  value={`${Math.round((player.clutch_win_rate || 0) * 100)}%`}
+                  sub={`${num(player.clutches_won || 0)} won of ${num(player.clutches_faced || 0)} faced (${num(player.clutch_kills || 0)}K)`}
+                  tone={(player.clutch_win_rate || 0) >= 0.25 ? 'hot' : 'neutral'}
+                />
+                <StatTile
+                  label="Impact kill rate"
+                  value={`${Math.round((player.impact_kill_rate || 0) * 100)}%`}
+                  sub={`${num(player.low_impact_kills || 0)} exit / low-impact kills`}
+                  tone={(player.impact_kill_rate || 0) >= 0.8 ? 'good' : 'neutral'}
                 />
               </div>
 
-              {/* Career heatmap: every duel across their whole history on
-                  one map, which is the view the match list cannot give. */}
-              <section className="aggmap">
+              <div className="playertabs">
+                <SegmentedControl
+                  size="md"
+                  options={[
+                    { value: 'career', label: 'Career Heatmap' },
+                    { value: 'matches', label: `Match Review (${matches.length})` },
+                  ]}
+                  value={playerTab}
+                  onChange={(v) => {
+                    setPlayerTab(v as 'career' | 'matches')
+                    if (v === 'matches' && !selected && matches.length > 0) {
+                      setSelected(matches[0].match_id)
+                    }
+                  }}
+                />
+              </div>
+
+              {playerTab === 'career' && (
+                <section className="aggmap">
                 <h3 className="matchlist__title">Your heatmap</h3>
                 <p className="matchlist__hint">
-                  Every duel you have played on this map, not just one game.
+                  {aggMap === 'all' && heatmapMap
+                    ? `Showing duels on ${heatmapMap} (last selected map), while headline stats above reflect all maps.`
+                    : 'Every duel you have played on this map, not just one game.'}
                 </p>
 
                 <div className="mapselect mapselect--player">
-                  {player.maps.map((m) => (
+                  <button
+                    type="button"
+                    className={`mapchip${aggMap === 'all' ? ' is-active' : ''}`}
+                    onClick={() => setAggMap('all')}
+                    title={`All maps · ${num(allMatches)} matches`}
+                  >
+                    <span>All Maps</span>
+                    <em className="mapchip__count">
+                      {num(allKills)}/{num(allDeaths)}
+                    </em>
+                  </button>
+                  {(basePlayer?.maps ?? player.maps).map((m) => (
                     <button
                       key={m.map_name}
                       type="button"
                       className={`mapchip${m.map_name === aggMap ? ' is-active' : ''}`}
-                      onClick={() => setAggMap(m.map_name)}
+                      onClick={() => {
+                        setAggMap(m.map_name)
+                        setLastMap(m.map_name)
+                      }}
                       title={`${num(m.kills)} kills · ${num(m.deaths)} deaths · ${num(
                         m.matches,
                       )} matches`}
@@ -531,7 +675,7 @@ export function PlayerView() {
                 </ControlBar>
 
                 <ControlBar>
-                  <ControlGroup label={opponentLabel}>
+                  <ControlGroup label="Role">
                     <MultiSelect
                       values={roles}
                       placeholder="Any role"
@@ -558,10 +702,7 @@ export function PlayerView() {
                     <MultiSelect
                       values={weapons}
                       placeholder="Any weapon"
-                      options={(facets?.weapons ?? []).map((w) => ({
-                        value: w.weapon,
-                        label: w.weapon,
-                      }))}
+                      options={weaponOptions}
                       groups={WEAPON_GROUPS}
                       onChange={setWeapons}
                     />
@@ -600,6 +741,23 @@ export function PlayerView() {
                     <ControlGroup label=" ">
                       <button type="button" className="linkbtn" onClick={clearFilters}>
                         Clear {activeFilters} filter{activeFilters === 1 ? '' : 's'}
+                      </button>
+                    </ControlGroup>
+                  )}
+                  {onNavigateToRotations && (aggMap || heatmapMap) && (
+                    <ControlGroup label="Rotations">
+                      <button
+                        type="button"
+                        className="linkbtn"
+                        onClick={() =>
+                          onNavigateToRotations({
+                            player: riotId,
+                            agent: agents[0] || undefined,
+                            mapName: heatmapMap || (aggMap !== 'all' ? aggMap : undefined),
+                          })
+                        }
+                      >
+                        Analyze {agents.length === 1 ? `${agents[0]} ` : ''}Rotations ➔
                       </button>
                     </ControlGroup>
                   )}
@@ -716,129 +874,170 @@ export function PlayerView() {
                   </Panel>
                 </div>
               </section>
-
-              <section className="matchlist">
-                <h3 className="matchlist__title">Recent matches</h3>
-                <p className="matchlist__hint">Pick one to review its duels on the map.</p>
-                <ul className="matchlist__rows">
-                  {matches.map((m) => (
-                    <li key={m.match_id}>
-                      <button
-                        className={
-                          m.match_id === selected
-                            ? 'matchrow matchrow--active'
-                            : 'matchrow'
-                        }
-                        onClick={() => setSelected(m.match_id === selected ? null : m.match_id)}
-                      >
-                        <span className="matchrow__map">{m.map_name}</span>
-                        <span className="matchrow__agent">{m.agent}</span>
-                        <span className="matchrow__kd">
-                          {m.kills}/{m.deaths}
-                        </span>
-                        <span
-                          className={
-                            m.kd >= 1 ? 'matchrow__ratio is-good' : 'matchrow__ratio is-bad'
-                          }
-                        >
-                          {m.kd.toFixed(2)}
-                        </span>
-                        <span className="matchrow__when">{when(m.started_at)}</span>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            </>
-          )}
-        </>
-      )}
-
-      {selected && (
-        <section className="review">
-          <ControlBar>
-            <ControlGroup label="Show">
-              <SegmentedControl
-                value={role}
-                options={ROLES.map((r) => ({ value: r.id, label: r.label }))}
-                onChange={(v) => setRole(v as Role)}
-              />
-            </ControlGroup>
-            <ControlGroup label="Draw">
-              <SegmentedControl
-                value={mode}
-                options={[
-                  { value: 'lines', label: 'Duels' },
-                  { value: 'points', label: 'Points' },
-                  { value: 'heatmap', label: 'Heat' },
-                ]}
-                onChange={(v) => setMode(v as RenderMode)}
-              />
-            </ControlGroup>
-            <ControlGroup label="Round">
-              <Select
-                value={roundFilter === '' ? '' : String(roundFilter)}
-                onChange={(v) => setRoundFilter(v === '' ? '' : Number(v))}
-                placeholder="All rounds"
-                options={rounds.map((r) => ({
-                  value: String(r),
-                  label: `Round ${r + 1}`,
-                }))}
-              />
-            </ControlGroup>
-            <ControlGroup label="Orient">
-              <RotateControl rotation={rotation} onChange={setRotation} />
-            </ControlGroup>
-          </ControlBar>
-
-          <div className="review__body">
-            <div className="review__map">
-              <MapCanvas
-                map={detail?.map ?? null}
-                kills={points}
-                mode={mode}
-                // Same convention as the career view above.
-                ramp={role === 'killer' ? 'toxic' : 'duel'}
-                radius={PLAYER_RADIUS}
-                intensity={1}
-                anchor={role === 'killer' ? 'killer' : 'victim'}
-                player={role === 'either' ? player?.puuid : undefined}
-                rotation={rotation}
-                loading={detailBusy}
-              />
-              <TimeSlider
-                value={timeRange}
-                max={ROUND_MAX_MS}
-                onChange={setTimeRange}
-              />
-            </div>
-
-            {detail && (
-              <Panel title="Scoreboard">
-                <ul className="scoreboard">
-                  {detail.scoreboard.map((p) => (
-                    <li
-                      key={p.puuid}
-                      className={
-                        p.puuid === player?.puuid ? 'scorerow scorerow--me' : 'scorerow'
-                      }
-                    >
-                      <span className="scorerow__agent">{p.agent}</span>
-                      <span className="scorerow__kd">
-                        {p.kills}/{p.deaths}
-                      </span>
-                      <span className="scorerow__ratio">{p.kd.toFixed(2)}</span>
-                    </li>
-                  ))}
-                </ul>
-                <p className="review__count">
-                  {num(points.length)} of {num(detail.kills.length)} duels shown
-                </p>
-              </Panel>
             )}
-          </div>
-        </section>
-      )}
+
+            {playerTab === 'matches' && (
+              <div className="review--split">
+                <section className="matchlist">
+                  <h3 className="matchlist__title">Recent matches</h3>
+                  <p className="matchlist__hint">Select a match to review its duels on the map.</p>
+                  <ul className="matchlist__rows">
+                    {matches.map((m) => (
+                      <li key={m.match_id}>
+                        <button
+                          type="button"
+                          className={
+                            m.match_id === selected
+                              ? 'matchrow matchrow--active'
+                              : 'matchrow'
+                          }
+                          onClick={() => setSelected(m.match_id)}
+                        >
+                          <span className="matchrow__map">{m.map_name}</span>
+                          <span className="matchrow__agent">{m.agent}</span>
+                          <span className="matchrow__kd">
+                            {m.kills}/{m.deaths}
+                          </span>
+                          <span
+                            className={
+                              m.kd >= 1 ? 'matchrow__ratio is-good' : 'matchrow__ratio is-bad'
+                            }
+                          >
+                            {m.kd.toFixed(2)}
+                          </span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+
+                <div className="review__detail">
+                  {selected ? (
+                    <section className="review">
+                      <ControlBar>
+                        <ControlGroup label="Show">
+                          <SegmentedControl
+                            value={role}
+                            options={ROLES.map((r) => ({ value: r.id, label: r.label }))}
+                            onChange={(v) => setRole(v as Role)}
+                          />
+                        </ControlGroup>
+                        <ControlGroup label="Draw">
+                          <SegmentedControl
+                            value={mode}
+                            options={[
+                              { value: 'lines', label: 'Duels' },
+                              { value: 'points', label: 'Points' },
+                              { value: 'heatmap', label: 'Heat' },
+                              { value: 'rotations', label: 'Rotations' },
+                            ]}
+                            onChange={(v) => setMode(v as RenderMode | 'rotations')}
+                          />
+                        </ControlGroup>
+                        <ControlGroup label="Round">
+                          <Select
+                            value={roundFilter === '' ? '' : String(roundFilter)}
+                            onChange={(v) => setRoundFilter(v === '' ? '' : Number(v))}
+                            placeholder="All rounds"
+                            options={rounds.map((r) => ({
+                              value: String(r),
+                              label: `Round ${r + 1}`,
+                            }))}
+                          />
+                        </ControlGroup>
+                        <ControlGroup label="Orient">
+                          <RotateControl rotation={rotation} onChange={setRotation} />
+                        </ControlGroup>
+                        {onNavigateToRotations && selected && (
+                          <ControlGroup label="Analysis">
+                            <button
+                              type="button"
+                              className="linkbtn"
+                              onClick={() =>
+                                onNavigateToRotations({
+                                  matchId: selected,
+                                  mapName: detail?.map_name,
+                                  player: player?.puuid,
+                                })
+                              }
+                            >
+                              Open Flow Graph ➔
+                            </button>
+                          </ControlGroup>
+                        )}
+                      </ControlBar>
+
+                      <div className="review__body">
+                        <div className="review__map">
+                          <MapCanvas
+                            map={detail?.map ?? null}
+                            kills={mode === 'rotations' ? [] : points}
+                            rotations={mode === 'rotations' ? matchRotations : null}
+                            mode={mode === 'rotations' ? 'lines' : mode}
+                            ramp={role === 'killer' ? 'toxic' : 'duel'}
+                            radius={PLAYER_RADIUS}
+                            intensity={1}
+                            anchor={role === 'killer' ? 'killer' : 'victim'}
+                            player={role === 'either' ? player?.puuid : undefined}
+                            rotation={rotation}
+                            loading={detailBusy}
+                          />
+                          <TimeSlider
+                            value={timeRange}
+                            max={ROUND_MAX_MS}
+                            onChange={setTimeRange}
+                          />
+                        </div>
+
+                        {detail && (
+                          <Panel title="Scoreboard">
+                            <ul className="scoreboard">
+                              {detail.scoreboard.map((p) => {
+                                const isMe = p.puuid === player?.puuid
+                                const teamLower = p.team ? p.team.toLowerCase() : ''
+                                return (
+                                  <li
+                                    key={p.puuid}
+                                    className={`scorerow ${teamLower ? `scorerow--${teamLower}` : ''} ${
+                                      isMe ? 'scorerow--me' : ''
+                                    }`}
+                                  >
+                                    <div className="scorerow__identity">
+                                      {p.icon && (
+                                        <img src={p.icon} alt={p.agent} className="scorerow__avatar" />
+                                      )}
+                                      <span className="scorerow__agent">{p.agent}</span>
+                                      {p.team && (
+                                        <span className={`scorerow__team-badge scorerow__team-badge--${teamLower}`}>
+                                          {p.team}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <span className="scorerow__kd">
+                                      {p.kills}/{p.deaths}
+                                    </span>
+                                    <span className="scorerow__ratio">{p.kd.toFixed(2)}</span>
+                                  </li>
+                                )
+                              })}
+                            </ul>
+                            <p className="review__count">
+                              {num(points.length)} of {num(detail.kills.length)} duels shown
+                            </p>
+                          </Panel>
+                        )}
+                      </div>
+                    </section>
+                  ) : (
+                    <Empty>Select a match on the left to review its duels on the map.</Empty>
+                  )}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </>
+    )}
 
       {!player && !busy && !error && (
         <Empty>

@@ -254,3 +254,25 @@ def test_subsequent_archives_increment_sequence(tmp_db: Database):
     tmp_db.archive_raw(chunk_size=2)
 
     assert (tmp_db.raw_dir / "archive_0002.zip").exists()
+
+
+def test_get_payload_finds_in_adjacent_archive_and_self_heals(tmp_db: Database):
+    """If payload_path points to archive_0002.zip but match is in archive_0001.zip, get_payload finds it and heals the path."""
+    for i in range(1, 3):
+        tmp_db.save_match(f"m-{i}", _sample_payload(f"m-{i}"), {"map_name": "Ascent", "started_at": i})
+    tmp_db.archive_raw(chunk_size=2)
+
+    # m-1 is in archive_0001.zip. Deliberately corrupt its payload_path to archive_0002.zip
+    with tmp_db.connect() as conn:
+        conn.execute("UPDATE matches SET payload_path = 'archive_0002.zip:m-1.json' WHERE match_id = 'm-1'")
+
+    # get_payload should look nearby, find it in archive_0001.zip, return it, and heal DB
+    payload = tmp_db.get_payload("m-1")
+    assert payload is not None
+    assert payload["metadata"]["match_id"] == "m-1"
+
+    # Verify that the DB payload_path was self-healed
+    with tmp_db.connect() as conn:
+        row = conn.execute("SELECT payload_path FROM matches WHERE match_id = 'm-1'").fetchone()
+        assert row["payload_path"] == "archive_0001.zip:m-1.json"
+

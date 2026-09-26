@@ -112,6 +112,8 @@ class Kill:
     damage_type: DamageType = DamageType.UNKNOWN
     weapon_id: str = ""
     weapon_name: str = ""
+    victim_weapon_id: str = ""
+    victim_weapon_name: str = ""
     ability_slot: AbilitySlot | None = None
     ability_name: str = ""          # resolved via agent + slot
     secondary_fire: bool = False

@@ -30,6 +30,7 @@ class KillFilters:
     sides: frozenset[str] = frozenset()         # "attack" / "defense"
     rounds: frozenset[int] = frozenset()
     weapons: frozenset[str] = frozenset()       # weapon display names
+    victim_weapons: frozenset[str] = frozenset() # victim weapon display names
     abilities: frozenset[str] = frozenset()     # ability display names
     damage_types: frozenset[str] = frozenset()
     time_start_ms: int | None = None
@@ -88,6 +89,7 @@ class KillFilters:
             sides=sset("sides"),
             rounds=iset("rounds"),
             weapons=sset("weapons"),
+            victim_weapons=sset("victim_weapons"),
             abilities=sset("abilities"),
             damage_types=sset("damage_types"),
             time_start_ms=num("time_start"),
@@ -116,6 +118,12 @@ class EnrichedKill:
     first_blood: bool
     post_plant: bool
     round_won: bool            # did the killer's team win this round
+    supported: bool = False    # victim had a teammate within <= 12m
+    isolated: bool = False     # victim's nearest teammate was > 25m or was alone
+    crossfire: bool = False    # killer held angle with a teammate (35-145 deg) on victim
+    advantage_death: bool = False  # victim died while team had >= 2 player advantage
+    clutch_kill: bool = False  # killer was last alive (1vX) when getting kill
+    low_impact: bool = False   # kill occurred in lost round at >= 2 deficit or post-detonate
 
 
 def _distance(a, b) -> float:
@@ -139,12 +147,28 @@ def enrich(
     # meaning there and would otherwise mark almost every kill as an opening.
     track_openings = match.is_round_based
     out: list[EnrichedKill] = []
+
+    # Map puuid -> player for fast lookup
+    player_by_puuid = {p.puuid: p for p in match.players}
+    team_counts: dict[str, int] = {}
+    for p in match.players:
+        if p.team:
+            team_counts[p.team] = team_counts.get(p.team, 0) + 1
+
     for rnd in match.rounds:
         kills = rnd.kills
         plant_ms = rnd.plant.round_time_ms if rnd.plant else None
+        alive_counts = dict(team_counts)
+
         for idx, kill in enumerate(kills):
-            killer = match.player(kill.killer_puuid)
-            victim = match.player(kill.victim_puuid)
+            killer = player_by_puuid.get(kill.killer_puuid)
+            victim = player_by_puuid.get(kill.victim_puuid)
+            k_team = (killer.team if killer else "") or kill.killer_team
+            v_team = (victim.team if victim else "") or kill.victim_team
+
+            # Pre-kill alive counts
+            k_alive = alive_counts.get(k_team, 0)
+            v_alive = alive_counts.get(v_team, 0)
 
             # Did a teammate of the victim kill this killer shortly after?
             traded = False
@@ -182,9 +206,63 @@ def enrich(
                         and _distance(ref, earlier.victim_location) > trade_radius
                     ):
                         continue
-                trade_kill = True
-                latency = dt
-                break
+                    trade_kill = True
+                    latency = dt
+                    break
+
+            # --- Support & Isolation (Victim spacing) ---
+            supported = False
+            isolated = False
+            if kill.victim_location is not None:
+                teammate_dists = [
+                    _distance(pl.location, kill.victim_location)
+                    for pl in kill.player_locations
+                    if pl.puuid != kill.victim_puuid
+                    and player_by_puuid.get(pl.puuid) is not None
+                    and player_by_puuid[pl.puuid].team == v_team
+                ]
+                if teammate_dists:
+                    min_dist = min(teammate_dists)
+                    supported = min_dist <= 1200.0  # 12m trade support
+                    isolated = min_dist > 2500.0   # 25m isolated
+                else:
+                    isolated = True  # last alive on team
+
+            # --- Crossfire Kill ---
+            crossfire = False
+            if kill.killer_location is not None and kill.victim_location is not None:
+                dx_k = kill.victim_location.x - kill.killer_location.x
+                dy_k = kill.victim_location.y - kill.killer_location.y
+                dist_k = math.hypot(dx_k, dy_k)
+                if dist_k > 100.0:
+                    for pl in kill.player_locations:
+                        if pl.puuid != kill.killer_puuid:
+                            tpl = player_by_puuid.get(pl.puuid)
+                            if tpl and tpl.team == k_team:
+                                dx_t = kill.victim_location.x - pl.location.x
+                                dy_t = kill.victim_location.y - pl.location.y
+                                dist_t = math.hypot(dx_t, dy_t)
+                                if 100.0 < dist_t <= 3500.0:  # teammate within 35m
+                                    dot = dx_k * dx_t + dy_k * dy_t
+                                    cos_a = max(-1.0, min(1.0, dot / (dist_k * dist_t)))
+                                    deg = math.degrees(math.acos(cos_a))
+                                    if 35.0 <= deg <= 145.0:
+                                        crossfire = True
+                                        break
+
+            round_won = bool(kill.killer_team) and rnd.winning_team == kill.killer_team
+            is_fb = track_openings and idx == 0
+
+            # --- Man-Advantage Casualty (Over-peek) ---
+            adv_death = bool(v_team and k_team and v_team != k_team and (v_alive - k_alive >= 2))
+
+            # --- Clutch Kill (1vX) ---
+            clutch_kill = bool(k_team and v_team and k_team != v_team and k_alive == 1 and v_alive >= 1)
+
+            # --- Low Impact Kill ---
+            # Kill in a lost round during a >= 2 deficit, excluding opening kills
+            deficit = (v_alive - k_alive >= 2) if (v_team and k_team and v_team != k_team) else False
+            low_impact = (not round_won) and (not is_fb) and deficit
 
             out.append(
                 EnrichedKill(
@@ -196,11 +274,21 @@ def enrich(
                     traded=traded,
                     trade_kill=trade_kill,
                     trade_latency_ms=latency,
-                    first_blood=track_openings and idx == 0,
+                    first_blood=is_fb,
                     post_plant=plant_ms is not None and kill.time_in_round_ms >= plant_ms,
-                    round_won=bool(kill.killer_team) and rnd.winning_team == kill.killer_team,
+                    round_won=round_won,
+                    supported=supported,
+                    isolated=isolated,
+                    crossfire=crossfire,
+                    advantage_death=adv_death,
+                    clutch_kill=clutch_kill,
+                    low_impact=low_impact,
                 )
             )
+
+            # Update living counts
+            if v_team in alive_counts:
+                alive_counts[v_team] = max(0, alive_counts[v_team] - 1)
     return out
 
 
@@ -225,6 +313,8 @@ def apply_filters(kills: Iterable[EnrichedKill], f: KillFilters) -> list[Enriche
         if f.rounds and k.round_num not in f.rounds:
             continue
         if f.weapons and k.weapon_name not in f.weapons:
+            continue
+        if f.victim_weapons and k.victim_weapon_name not in f.victim_weapons:
             continue
         if f.abilities and k.ability_name not in f.abilities:
             continue

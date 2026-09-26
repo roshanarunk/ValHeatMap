@@ -1,0 +1,49 @@
+# Docker Compose configuration for ValHeatMap on Hetzner Cloud.
+# Runs the API & continuous crawler alongside Caddy for automatic Let's Encrypt TLS.
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: valheatmap-app
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - VALHEATMAP_DATA_DIR=/data
+      - VALHEATMAP_READ_ONLY=0
+      - VALHEATMAP_CRAWLER=${VALHEATMAP_CRAWLER:-1}
+      - HENRIK_API_KEY=${HENRIK_API_KEY:-}
+      - HENRIK_RATE_LIMIT=${HENRIK_RATE_LIMIT:-90}
+      - RIOT_REGION=${RIOT_REGION:-na}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/data
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: valheatmap-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN:-valostats.roshanarun.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:

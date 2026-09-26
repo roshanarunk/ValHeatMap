@@ -225,6 +225,22 @@ def parse(data: dict[str, Any], source: str = "riot") -> Match:
             for tid in teams or {"Red": False, "Blue": False}:
                 team_sides[tid] = _side_for(num, tid, attacker_team)
 
+        # Map player puuid -> (wid, wname) for this round's economy
+        round_weapons: dict[str, tuple[str, str]] = {}
+        for ps in rnd.get("playerStats") or ():
+            p_puuid = _sub(ps)
+            if not p_puuid:
+                continue
+            econ = ps.get("economy") or {}
+            w_id = econ.get("weapon") or ""
+            wobj = get_weapon(w_id)
+            res_wname = wobj.name if wobj else ""
+            res_wid = wobj.uuid if wobj else w_id
+            if not res_wname and econ.get("loadoutValue", 0) == 0:
+                res_wname = "Classic"
+            if res_wname:
+                round_weapons[p_puuid] = (res_wid, res_wname)
+
         # --- kills -------------------------------------------------------
         kills: list[Kill] = []
         for ps in rnd.get("playerStats") or ():
@@ -263,6 +279,7 @@ def parse(data: dict[str, Any], source: str = "riot") -> Match:
 
                 kt = team_by_puuid.get(killer_puuid, "")
                 vt = team_by_puuid.get(victim, "")
+                victim_wid, victim_wname = round_weapons.get(victim, ("", ""))
                 kills.append(
                     Kill(
                         round_num=num,
@@ -277,6 +294,8 @@ def parse(data: dict[str, Any], source: str = "riot") -> Match:
                         damage_type=dtype,
                         weapon_id=damage_item if dtype is DamageType.WEAPON else "",
                         weapon_name=weapon.name if weapon else "",
+                        victim_weapon_id=victim_wid,
+                        victim_weapon_name=victim_wname,
                         ability_slot=slot,
                         ability_name=ability_name,
                         secondary_fire=bool(fd.get("isSecondaryFireMode")),

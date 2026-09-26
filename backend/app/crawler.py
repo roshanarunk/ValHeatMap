@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import gc
 import os
 import sys
 import threading
@@ -689,6 +690,7 @@ async def run_forever(
                         f"(freed {res['bytes_freed'] / 1e6:.1f} MB)"
                     )
                     since_archive = 0
+                    gc.collect()
             except Exception as exc:
                 crawler.log(f"  ! raw payload archiving failed: {exc}")
 
@@ -727,6 +729,7 @@ async def run_forever(
                     control.last_error = f"publish: {str(exc)[:100]}"
             note("paused" if (control and control.paused) else "running")
 
+        gc.collect()
         if pause_s:
             await asyncio.sleep(pause_s)
 

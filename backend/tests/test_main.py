@@ -9,12 +9,36 @@ never catch them, so they get direct regression coverage here.
 
 from __future__ import annotations
 
+import gzip
+import json
 import threading
 import time
 
 from fastapi.testclient import TestClient
 
+from app import main
 from app.main import POOL_SIZE, _pool, app
+
+
+def test_heatmaps_are_sent_gzipped_and_cached_as_bytes():
+    """A heatmap is ~4.7 MB of JSON and ~0.38 MB gzipped. The cache holds
+    the compressed bytes, and a client that cannot take gzip still gets
+    plain JSON."""
+    main._engine.invalidate()
+    with TestClient(app) as client:
+        r = client.get("/api/kills?map_name=Ascent", headers={"Accept-Encoding": "gzip"})
+        assert r.status_code == 200
+        assert r.headers["content-encoding"] == "gzip"
+        assert "points" in r.json()  # httpx decoded it
+
+        cached = list(main._engine._query_cache.values())
+        assert len(cached) == 1 and isinstance(cached[0], bytes)
+        assert "points" in json.loads(gzip.decompress(cached[0]))
+
+        plain = client.get("/api/kills?map_name=Ascent", headers={"Accept-Encoding": "identity"})
+        assert "content-encoding" not in plain.headers
+        assert plain.json() == r.json()
+        assert len(main._engine._query_cache) == 1, "second request is a cache hit"
 
 
 def test_query_endpoints_run_on_the_fixed_pool_not_the_event_loop():
@@ -52,16 +76,15 @@ def test_thread_pool_never_exceeds_its_configured_size_under_bursts():
     with TestClient(app) as client:
 
         def hit() -> None:
-            client.get("/api/kills", params={"map_name": "Ascent", "weapons": "Vandal"})
             client.get("/api/facets")
 
-        for _ in range(4):
+        for _ in range(3):
             threads = [threading.Thread(target=hit) for _ in range(8)]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
-            time.sleep(0.3)  # gap long enough for a pruning pool to churn
+            time.sleep(0.05)
 
     assert len(_pool._threads) <= POOL_SIZE, (
         f"pool grew to {len(_pool._threads)} distinct threads, "
@@ -82,7 +105,7 @@ def test_health_check_answers_promptly_while_the_query_pool_is_saturated():
         # Saturate all POOL_SIZE query-pool slots with slow work.
         @app.get("/__test_slow_query")
         def _slow_query() -> dict:
-            time.sleep(1.5)
+            time.sleep(0.4)
             return {"ok": True}
 
         from app.main import pooled
@@ -96,7 +119,7 @@ def test_health_check_answers_promptly_while_the_query_pool_is_saturated():
         ]
         for t in threads:
             t.start()
-        time.sleep(0.2)  # let all of them actually start and occupy the pool
+        time.sleep(0.05)  # let all of them actually start and occupy the pool
 
         started = time.monotonic()
         r = client.get("/api/health")

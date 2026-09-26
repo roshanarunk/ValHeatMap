@@ -2,6 +2,19 @@
  "status": 200,
  "data": [
   {
+   "uuid": "dd3a1cd9-41b1-50ea-3bd6-a7bb3c5978bd",
+   "displayName": "Gauntlet",
+   "mapUrl": "/Game/Maps/AbilityDraft/AbilityDraft",
+   "displayIcon": null,
+   "splash": "https://media.valorant-api.com/maps/dd3a1cd9-41b1-50ea-3bd6-a7bb3c5978bd/splash.png",
+   "listViewIcon": "https://media.valorant-api.com/maps/dd3a1cd9-41b1-50ea-3bd6-a7bb3c5978bd/listviewicon.png",
+   "xMultiplier": 0,
+   "yMultiplier": 0,
+   "xScalarToAdd": 0,
+   "yScalarToAdd": 0,
+   "callouts": null
+  },
+  {
    "uuid": "7eaecc1b-4337-bbf6-6ab9-04b8f06b3319",
    "displayName": "Ascent",
    "mapUrl": "/Game/Maps/Ascent/Ascent",

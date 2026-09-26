@@ -12,19 +12,23 @@ import {
 import { PlayerView } from './components/PlayerView'
 import { TimeSlider } from './components/TimeSlider'
 import { Empty, Panel, Slider, StatTile, Toggle } from './components/Controls'
-import { HeatLegend } from './components/HeatLegend'
+import { DivergingLegend, HeatLegend } from './components/HeatLegend'
 import { api, ApiError, type QueryFilters } from './lib/api'
 import type { RampName } from './lib/heatmap'
 import { winRateCss } from './lib/markers'
 import type {
   Facets,
   InsightsResponseV2,
+  KillPoint,
   KillsResponseV2,
   PlantsResponse,
+  RotationsResponse,
   UtilityResponseV2,
 } from './lib/types'
+import { RotationsPanel, type RotationsScope } from './components/RotationsPanel'
+import { ScoutingView } from './components/ScoutingView'
 
-type View = 'kills' | 'utility' | 'plants' | 'insights' | 'player'
+type View = 'kills' | 'utility' | 'plants' | 'rotations' | 'insights' | 'player' | 'scout'
 
 const ROUND_MAX_MS = 120_000
 /** Splat radius in px. Tight by default so hotspots stay distinct. */
@@ -35,14 +39,16 @@ const VIEWS: { id: View; label: string }[] = [
   { id: 'kills', label: 'Kills' },
   { id: 'utility', label: 'Utility' },
   { id: 'plants', label: 'Plants' },
+  { id: 'rotations', label: 'Rotations' },
   { id: 'insights', label: 'Breakdown' },
   { id: 'player', label: 'My stats' },
+  { id: 'scout', label: 'Scout' },
 ]
 
-// Valorant's own shop categories, so "Rifles" selects what a player means
-// by it rather than an arbitrary grouping.
+// Valorant's shop categories plus a Full Buy preset.
 const WEAPON_GROUPS: { label: string; values: string[] }[] = [
-  { label: 'Rifles', values: ['Vandal', 'Phantom', 'Bulldog', 'Guardian'] },
+  { label: 'Full Buy', values: ['Vandal', 'Phantom', 'Warden', 'Operator'] },
+  { label: 'Rifles', values: ['Vandal', 'Phantom', 'Warden', 'Bulldog', 'Guardian'] },
   { label: 'Snipers', values: ['Operator', 'Marshal', 'Outlaw'] },
   { label: 'SMGs', values: ['Spectre', 'Stinger'] },
   { label: 'Pistols', values: ['Classic', 'Shorty', 'Frenzy', 'Ghost', 'Sheriff'] },
@@ -52,6 +58,53 @@ const WEAPON_GROUPS: { label: string; values: string[] }[] = [
 
 const pct = (v: number) => `${Math.round(v * 100)}%`
 const num = (v: number) => v.toLocaleString()
+
+/** Which end of each duel the kills map plots; "both" nets one against the other. */
+type Plot = 'victim' | 'killer' | 'both'
+
+/**
+ * The same selection seen from the other end of the duel.
+ *
+ * The kills endpoint reads agent, role, weapon and side filters as
+ * describing the killer. For the combined view the subject also has to be
+ * matched when they *died*, so every killer-side filter moves to the
+ * victim and vice versa. Side is stored as the killer's, so it flips too.
+ */
+function mirrorFilters(f: QueryFilters): QueryFilters {
+  return {
+    ...f,
+    agents: f.victim_agents ?? [],
+    victim_agents: f.agents ?? [],
+    roles: f.victim_roles ?? [],
+    victim_roles: f.roles ?? [],
+    weapons: f.victim_weapons,
+    victim_weapons: f.weapons,
+    sides: (f.sides ?? []).map((s) =>
+      s === 'attack' ? 'defense' : s === 'defense' ? 'attack' : s,
+    ),
+  }
+}
+
+/** True when a filter only means something from one end of the duel. */
+function isOneSided(f: QueryFilters): boolean {
+  return !!(
+    f.agents?.length || f.victim_agents?.length || f.roles?.length ||
+    f.victim_roles?.length || f.weapons?.length || f.victim_weapons?.length ||
+    f.sides?.length
+  )
+}
+
+/**
+ * Thin `points` evenly to `keep` entries. Deterministic, so the map does
+ * not shimmer between redraws.
+ */
+function thin<T>(points: T[], keep: number): T[] {
+  if (keep >= points.length) return points
+  const out: T[] = []
+  const step = points.length / Math.max(1, keep)
+  for (let i = 0; i < keep; i++) out.push(points[Math.floor(i * step)])
+  return out
+}
 
 export default function App() {
   const [facets, setFacets] = useState<Facets | null>(null)
@@ -64,7 +117,11 @@ export default function App() {
   const [agent, setAgent] = useState('')
   const [roles, setRoles] = useState<string[]>([])
   const [ability, setAbility] = useState('')
+  // Weapon filters are relative to whoever the map plots: `weapons` is
+  // what the plotted player held, `enemyWeapons` what their opponent held.
+  // Which end of the duel each lands on is resolved in `filters` below.
   const [weapons, setWeapons] = useState<string[]>([])
+  const [enemyWeapons, setEnemyWeapons] = useState<string[]>([])
   // Zone cross-filter: the box constrains one end of each duel and the map
   // plots the other, so "kills by people here" and "deaths caused from
   // here" are two views of the same selection.
@@ -79,7 +136,7 @@ export default function App() {
 
   // display
   const [renderMode, setRenderMode] = useState<RenderMode>('heatmap')
-  const [anchor, setAnchor] = useState<'victim' | 'killer'>('victim')
+  const [plot, setPlot] = useState<Plot>('victim')
   const [ramp, setRamp] = useState<RampName>('inferno')
   const [radiusOverride, setRadiusOverride] = useState<number | null>(null)
   const [intensity, setIntensity] = useState(0.95)
@@ -91,11 +148,31 @@ export default function App() {
 
   // data
   const [kills, setKills] = useState<KillsResponseV2 | null>(null)
+  // The subject's deaths, fetched only when "Both" needs a second query.
+  const [deaths, setDeaths] = useState<KillsResponseV2 | null>(null)
   const [utility, setUtility] = useState<UtilityResponseV2 | null>(null)
   const [plants, setPlants] = useState<PlantsResponse | null>(null)
   const [insights, setInsights] = useState<InsightsResponseV2 | null>(null)
+  const [rotations, setRotations] = useState<RotationsResponse | null>(null)
+  const [rotationsScope, setRotationsScope] = useState<RotationsScope>('global')
+  const [rotationsPlayer, setRotationsPlayer] = useState<string>('')
+  const [rotationsAgent, setRotationsAgent] = useState<string>('')
+  const [rotationsMatchId, setRotationsMatchId] = useState<string>('')
+  const [rotationsTeam, setRotationsTeam] = useState<string>('')
+  const [rotationsRound, setRotationsRound] = useState<number | ''>('')
+  const [rotationsSide, setRotationsSide] = useState<'defense' | 'attack' | 'all'>('defense')
+  const [rotationsFocusZone, setRotationsFocusZone] = useState<string | null>(null)
+  const [rotationsMinCount, setRotationsMinCount] = useState<number>(5)
+  const [selectedZone, setSelectedZone] = useState<string | null>(null)
+  const [selectedRoute, setSelectedRoute] = useState<{ from: string; to: string } | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setSelectedZone(null)
+    setSelectedRoute(null)
+    setRotationsFocusZone(null)
+  }, [mapName, view])
 
   useEffect(() => {
     api
@@ -107,6 +184,11 @@ export default function App() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [])
 
+  // "Both" is a kills-view mode. Its filters describe the subject as the
+  // killer (the deaths query mirrors them), so labels read from that end.
+  const plotBoth = plot === 'both' && view === 'kills'
+  const anchor: 'victim' | 'killer' = plot === 'victim' ? 'victim' : 'killer'
+
   const filters: QueryFilters = useMemo(
     () => ({
       map_name: mapName || undefined,
@@ -115,7 +197,19 @@ export default function App() {
       agents: agent ? [agent] : [],
       roles,
       abilities: ability ? [ability] : [],
-      weapons,
+      // Plotting deaths makes the victim the subject, so their weapon is
+      // `victim_weapons` and the enemy's is the killer's. Utility kills
+      // only ever filter on the killer's weapon.
+      ...(view === 'kills' && anchor === 'victim'
+        ? {
+            weapons: enemyWeapons.length ? enemyWeapons : undefined,
+            victim_weapons: weapons.length ? weapons : undefined,
+          }
+        : {
+            weapons: weapons.length ? weapons : undefined,
+            victim_weapons:
+              view === 'kills' && enemyWeapons.length ? enemyWeapons : undefined,
+          }),
       sides,
       zone: zone ? `${zone.x0},${zone.y0},${zone.x1},${zone.y1}` : undefined,
       // The zone constrains the opposite end from the one being plotted:
@@ -129,8 +223,8 @@ export default function App() {
       post_plant_only: postPlantOnly,
     }),
     [
-      mapName, act, rank, agent, roles, ability, weapons, sides, timeRange, zone,
-      anchor, tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly,
+      mapName, act, rank, agent, roles, ability, weapons, enemyWeapons, sides, timeRange, zone,
+      anchor, view, tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly,
     ],
   )
 
@@ -144,8 +238,18 @@ export default function App() {
     const run = async () => {
       try {
         if (view === 'kills') {
-          const res = await api.killsV2(filters, { signal: controller.signal })
+          // Unfiltered, every duel is already a kill at one end and a death
+          // at the other, so one query covers both. Once a filter picks a
+          // side of the duel, the deaths need their own mirrored query.
+          const needDeaths = plotBoth && isOneSided(filters)
+          const [res, dead] = await Promise.all([
+            api.killsV2(filters, { signal: controller.signal }),
+            needDeaths
+              ? api.killsV2(mirrorFilters(filters), { signal: controller.signal })
+              : Promise.resolve(null),
+          ])
           setKills(res)
+          setDeaths(dead)
         } else if (view === 'utility') {
           const res = await api.utilityV2(filters, { signal: controller.signal })
           setUtility(res)
@@ -155,6 +259,28 @@ export default function App() {
             { signal: controller.signal },
           )
           setPlants(res)
+        } else if (view === 'rotations') {
+          const res = await api.rotations(
+            {
+              map_name: rotationsScope === 'match' && !mapName ? undefined : mapName,
+              side: rotationsSide === 'all' ? undefined : rotationsSide,
+              focus_zone: rotationsFocusZone || undefined,
+              min_count: rotationsMinCount,
+              player:
+                (rotationsScope === 'player' || rotationsScope === 'match') && rotationsPlayer.trim()
+                  ? rotationsPlayer.trim()
+                  : undefined,
+              agent: rotationsScope === 'player' && rotationsAgent ? rotationsAgent : undefined,
+              match_id: rotationsScope === 'match' && rotationsMatchId.trim() ? rotationsMatchId.trim() : undefined,
+              team: rotationsScope === 'match' && rotationsTeam ? rotationsTeam : undefined,
+              round_num: rotationsScope === 'match' && typeof rotationsRound === 'number' ? rotationsRound : undefined,
+            },
+            { signal: controller.signal },
+          )
+          setRotations(res)
+          if (res.map_name && res.map_name !== mapName) {
+            setMapName(res.map_name)
+          }
         } else {
           const res = await api.insightsV2(filters, { signal: controller.signal })
           setInsights(res)
@@ -176,18 +302,67 @@ export default function App() {
     return () => {
       controller.abort()
     }
-  }, [view, filters, mapName, clusterRadius])
+  }, [
+    view,
+    filters,
+    plotBoth,
+    mapName,
+    clusterRadius,
+    rotationsScope,
+    rotationsSide,
+    rotationsFocusZone,
+    rotationsMinCount,
+    rotationsPlayer,
+    rotationsAgent,
+    rotationsMatchId,
+    rotationsTeam,
+    rotationsRound,
+  ])
 
-  const toggle = (list: string[], value: string) =>
-    list.includes(value) ? list.filter((v) => v !== value) : [...list, value]
+  const rawKills = useMemo(
+    () =>
+      view === 'utility' ? (utility?.points ?? []) : view === 'kills' ? (kills?.points ?? []) : [],
+    [view, utility, kills],
+  )
 
-  const shownKills =
-    view === 'utility' ? (utility?.points ?? []) : view === 'kills' ? (kills?.points ?? []) : []
+  // For "Both", tag each duel with whether the subject won it, which is
+  // what MapCanvas splits on. Wins sit at the killer's end, losses at the
+  // victim's.
+  const shownKills: KillPoint[] = useMemo(() => {
+    if (!plotBoth || !kills) return rawKills
+    // Duel lines already show both ends; tagging would only double them.
+    if (renderMode === 'lines') return deaths ? [...kills.points, ...deaths.points] : rawKills
+    if (!deaths) {
+      return kills.points.flatMap((k) => [
+        { ...k, mine: true },
+        { ...k, mine: false },
+      ])
+    }
+    // Each query samples at its own rate once it hits the point cap. Left
+    // alone, a 3:1 real imbalance would draw as 1:1, so thin the denser
+    // sample down to the sparser one's rate.
+    let won = kills.points
+    let lost = deaths.points
+    const rateWon = won.length / Math.max(1, kills.total)
+    const rateLost = lost.length / Math.max(1, deaths.total)
+    if (rateWon > rateLost) won = thin(won, Math.round(kills.total * rateLost))
+    else if (rateLost > rateWon) lost = thin(lost, Math.round(deaths.total * rateWon))
+    return [
+      ...won.map((k) => ({ ...k, mine: true })),
+      ...lost.map((k) => ({ ...k, mine: false })),
+    ]
+  }, [plotBoth, kills, deaths, rawKills, renderMode])
   const stats = view === 'utility' ? utility?.stats : kills?.stats
   const total = view === 'utility' ? utility?.total : kills?.total
   const sampled = view === 'utility' ? utility?.sampled : kills?.sampled
   const activeMap =
-    view === 'plants' ? plants?.map : view === 'utility' ? utility?.map : kills?.map
+    view === 'plants'
+      ? plants?.map
+      : view === 'utility'
+        ? utility?.map
+        : view === 'rotations'
+          ? rotations?.map
+          : kills?.map
 
   // Fixed 5px rather than scaling with point count: a tight splat keeps
   // individual positions readable instead of blurring neighbouring spots
@@ -201,6 +376,7 @@ export default function App() {
     setRoles([])
     setAbility('')
     setWeapons([])
+    setEnemyWeapons([])
     setSides([])
     setZone(null)
     setTimeRange([0, ROUND_MAX_MS])
@@ -212,14 +388,31 @@ export default function App() {
 
   const activeFilters =
     (act ? 1 : 0) + (rank ? 1 : 0) + (agent ? 1 : 0) + roles.length +
-    (ability ? 1 : 0) + (weapons.length ? 1 : 0) +
+    (ability ? 1 : 0) + (weapons.length ? 1 : 0) + (view === 'kills' && enemyWeapons.length ? 1 : 0) +
     (zone ? 1 : 0) + sides.length +
     (timeRange[0] > 0 || timeRange[1] < ROUND_MAX_MS ? 1 : 0) +
     [tradedOnly, untradedOnly, firstBloodOnly, postPlantOnly].filter(Boolean).length
 
   const isPlants = view === 'plants'
+  const isRotations = view === 'rotations'
   const isInsights = view === 'insights'
   const isPlayer = view === 'player'
+  const isScout = view === 'scout'
+
+  const weaponOptions = useMemo(() => {
+    const list = (facets?.weapons ?? []).map((w) => ({
+      value: w.weapon,
+      label: w.weapon,
+      hint: w.kills.toLocaleString(),
+    }))
+    const known = new Set(list.map((item) => item.value.toLowerCase()))
+    if (!known.has('warden')) {
+      const phantomIdx = list.findIndex((item) => item.value.toLowerCase() === 'phantom')
+      const insertAt = phantomIdx !== -1 ? phantomIdx + 1 : 2
+      list.splice(insertAt, 0, { value: 'Warden', label: 'Warden', hint: '0' })
+    }
+    return list
+  }, [facets?.weapons])
 
   return (
     <div className="app">
@@ -256,7 +449,39 @@ export default function App() {
       {/* The player tab is its own thing: no map picker and none of the
           global filters apply to it, so it replaces the stage entirely. */}
       {isPlayer ? (
-        <PlayerView />
+        <PlayerView
+          onNavigateToRotations={({ player, agent, mapName: mName, matchId }) => {
+            if (mName) setMapName(mName)
+            if (matchId) {
+              setRotationsScope('match')
+              setRotationsMatchId(matchId)
+              setRotationsPlayer(player || '')
+              setRotationsMinCount(1)
+            } else if (player) {
+              setRotationsScope('player')
+              setRotationsPlayer(player)
+              setRotationsAgent(agent || '')
+              setRotationsMinCount(2)
+            }
+            setView('rotations')
+          }}
+        />
+      ) : isScout ? (
+        <ScoutingView
+          maps={(facets?.maps ?? []).map((m) => ({ map_name: m.map_name, minimap: m.minimap }))}
+          initialMap={mapName || 'Ascent'}
+          agents={(facets?.agents ?? []).map((a) => ({ name: a.agent, icon: a.icon, role: a.role }))}
+          onNavigateToRotations={({ player, agent: ag, mapName: mName }) => {
+            if (mName) setMapName(mName)
+            if (player) {
+              setRotationsScope('player')
+              setRotationsPlayer(player)
+              setRotationsAgent(ag || '')
+              setRotationsMinCount(2)
+            }
+            setView('rotations')
+          }}
+        />
       ) : (
       <>
       <div className="mapselect">
@@ -268,6 +493,8 @@ export default function App() {
             onClick={() => {
               setMapName(m.map_name)
               setSelectedSpot(null)
+              setZone(null)
+              setZoneMode(false)
             }}
             title={`${num(m.matches)} matches · ${num(m.kills)} kills`}
           >
@@ -279,44 +506,49 @@ export default function App() {
 
       {error && <div className="banner banner--error">{error}</div>}
 
-      <main className="stage2">
+      <main className={`stage2${isInsights ? ' stage2--fullwidth' : ''}`}>
         <div className="stage2__main">
           {/* --- controls above the map --- */}
           <ControlBar>
-            <ControlGroup label="Act">
-              <Select
-                value={act}
-                placeholder="All acts"
-                options={(facets?.acts ?? []).map((a) => ({
-                  value: a.act,
-                  label: `${a.act} (${num(a.matches)})`,
-                }))}
-                onChange={setAct}
-              />
-            </ControlGroup>
+            {!isRotations && (
+              <>
+                <ControlGroup label="Act">
+                  <Select
+                    value={act}
+                    placeholder="All acts"
+                    options={(facets?.acts ?? []).map((a) => ({
+                      value: a.act,
+                      label: `${a.act} (${num(a.matches)})`,
+                    }))}
+                    onChange={setAct}
+                  />
+                </ControlGroup>
 
-            <ControlGroup label="Rank">
-              <SegmentedControl
-                size="sm"
-                options={[
-                  { value: '', label: 'All' },
-                  ...(facets?.ranks ?? []).map((r) => ({ value: r.id, label: r.name })),
-                ]}
-                value={rank}
-                onChange={(v) => setRank(v === rank ? '' : v)}
-              />
-            </ControlGroup>
+                <ControlGroup label="Rank">
+                  <Select
+                    value={rank}
+                    placeholder="All ranks"
+                    options={(facets?.ranks ?? []).map((r) => ({
+                      value: r.id,
+                      label: r.name,
+                    }))}
+                    onChange={setRank}
+                  />
+                </ControlGroup>
+              </>
+            )}
 
-            {!isPlants && (
+            {!isPlants && !isRotations && (
               <ControlGroup label="Side">
                 <SegmentedControl
                   size="sm"
                   options={[
+                    { value: '', label: 'Both' },
                     { value: 'attack', label: 'Attack' },
                     { value: 'defense', label: 'Defense' },
                   ]}
-                  value={sides}
-                  onChange={(v) => setSides((cur) => toggle(cur, v))}
+                  value={sides.length === 1 ? sides[0] : ''}
+                  onChange={(v) => setSides(v ? [v] : [])}
                 />
               </ControlGroup>
             )}
@@ -335,23 +567,33 @@ export default function App() {
               </ControlGroup>
             )}
 
-            {!isPlants && !isInsights && (
-              <ControlGroup label="Weapon">
-                <MultiSelect
-                  values={weapons}
-                  placeholder="All weapons"
-                  groups={WEAPON_GROUPS}
-                  options={(facets?.weapons ?? []).map((w) => ({
-                    value: w.weapon,
-                    label: w.weapon,
-                    hint: w.kills.toLocaleString(),
-                  }))}
-                  onChange={setWeapons}
-                />
-              </ControlGroup>
+            {!isPlants && !isInsights && !isRotations && (
+              <>
+                <ControlGroup label="Weapon">
+                  <MultiSelect
+                    values={weapons}
+                    placeholder="All weapons"
+                    groups={WEAPON_GROUPS}
+                    options={weaponOptions}
+                    onChange={setWeapons}
+                  />
+                </ControlGroup>
+
+                {view === 'kills' && (
+                  <ControlGroup label="Enemy Weapon">
+                    <MultiSelect
+                      values={enemyWeapons}
+                      placeholder="All enemy weapons"
+                      groups={WEAPON_GROUPS}
+                      options={weaponOptions}
+                      onChange={setEnemyWeapons}
+                    />
+                  </ControlGroup>
+                )}
+              </>
             )}
 
-            {!isPlants && (
+            {!isPlants && !isRotations && (
               <ControlGroup label="Agent">
                 <Select
                   value={agent}
@@ -365,7 +607,7 @@ export default function App() {
               </ControlGroup>
             )}
 
-            {!isPlants && (
+            {!isPlants && !isRotations && (
               <ControlGroup label="Role">
                 <MultiSelect
                   values={roles}
@@ -380,7 +622,7 @@ export default function App() {
               </ControlGroup>
             )}
 
-            {!isPlants && (
+            {!isPlants && !isRotations && (
               <ControlGroup label="View">
                 <SegmentedControl
                   size="sm"
@@ -395,7 +637,7 @@ export default function App() {
               </ControlGroup>
             )}
 
-            {!isPlants && !isInsights && (
+            {!isPlants && !isInsights && !isRotations && !plotBoth && (
               <ControlGroup label="Zone">
                 <Toggle
                   label={zoneMode ? 'Drawing' : 'Select area'}
@@ -418,7 +660,15 @@ export default function App() {
               <RotateControl rotation={rotation} onChange={setRotation} />
             </ControlGroup>
 
-            {activeFilters > 0 && (
+            {isRotations && (
+              <ControlGroup label="Display">
+                <div className="togglerow">
+                  <Toggle label="Callouts" checked={showCallouts} onChange={setShowCallouts} />
+                </div>
+              </ControlGroup>
+            )}
+
+            {activeFilters > 0 && !isRotations && (
               <button type="button" className="linkbtn resetall" onClick={resetFilters}>
                 Reset {activeFilters}
               </button>
@@ -430,9 +680,15 @@ export default function App() {
             <div className="stage2__map">
               <MapCanvas
                 map={activeMap ?? null}
-                kills={shownKills}
+                kills={isRotations ? [] : shownKills}
+                splitOutcome={plotBoth}
                 plants={isPlants ? (plants?.points ?? []) : []}
                 spots={isPlants ? (plants?.spots ?? []) : []}
+                rotations={isRotations ? rotations : null}
+                selectedZone={selectedZone}
+                selectedRoute={selectedRoute}
+                onSelectZone={setSelectedZone}
+                onSelectRoute={setSelectedRoute}
                 mode={isPlants ? 'points' : renderMode}
                 ramp={view === 'utility' ? 'toxic' : ramp}
                 radius={radius}
@@ -446,7 +702,7 @@ export default function App() {
                 loading={loading}
                 selectedSpot={selectedSpot}
                 onSelectSpot={setSelectedSpot}
-                zoneMode={zoneMode && !isPlants}
+                zoneMode={zoneMode && !isPlants && !isRotations && !plotBoth}
                 zone={zone}
                 onZoneChange={setZone}
               />
@@ -454,7 +710,7 @@ export default function App() {
           )}
 
           {/* --- controls below the map --- */}
-          {!isInsights && (
+          {!isInsights && !isRotations && (
             <>
               {zone && !isPlants && (
                 <div className="zonenote">
@@ -478,7 +734,8 @@ export default function App() {
                 </div>
               )}
               {renderMode === 'lines' && !isPlants && <DuelLegend />}
-              {renderMode === 'heatmap' && !isPlants && (
+              {renderMode === 'heatmap' && !isPlants && plotBoth && <DivergingLegend />}
+              {renderMode === 'heatmap' && !isPlants && !plotBoth && (
                 <HeatLegend
                   ramp={view === 'utility' ? 'toxic' : ramp}
                   label={anchor === 'killer' ? 'Kills from here' : 'Deaths here'}
@@ -502,46 +759,59 @@ export default function App() {
                     <SegmentedControl
                       size="sm"
                       options={[
-                        { value: 'victim' as const, label: 'Deaths' },
-                        { value: 'killer' as const, label: 'Killer spots' },
+                        { value: 'victim' as Plot, label: 'Deaths' },
+                        { value: 'killer' as Plot, label: 'Killer spots' },
+                        // Nets kills against deaths per spot. Utility kills
+                        // have no meaningful "death" end, so it is kills-only.
+                        ...(view === 'kills' ? [{ value: 'both' as Plot, label: 'Both' }] : []),
                       ]}
-                      value={anchor}
-                      onChange={setAnchor}
+                      value={view === 'kills' ? plot : anchor}
+                      onChange={(v) => {
+                        setPlot(v)
+                        // A zone constrains one end of the duel, which has
+                        // no single meaning once both ends are plotted.
+                        if (v === 'both') {
+                          setZone(null)
+                          setZoneMode(false)
+                        }
+                      }}
                     />
                   </ControlGroup>
                 )}
                 {!isPlants && (
-                  <ControlGroup label="Filter" grow>
-                    <div className="togglerow">
-                      <Toggle
-                        label="Traded"
-                        checked={tradedOnly}
+                  <>
+                    <ControlGroup label="Trades">
+                      <SegmentedControl
+                        size="sm"
+                        options={[
+                          { value: 'all', label: 'All' },
+                          { value: 'traded', label: 'Traded' },
+                          { value: 'untraded', label: 'Untraded' },
+                        ]}
+                        value={tradedOnly ? 'traded' : untradedOnly ? 'untraded' : 'all'}
                         onChange={(v) => {
-                          setTradedOnly(v)
-                          if (v) setUntradedOnly(false)
-                        }}
-                        hint="Deaths a teammate avenged"
-                      />
-                      <Toggle
-                        label="Untraded"
-                        checked={untradedOnly}
-                        onChange={(v) => {
-                          setUntradedOnly(v)
-                          if (v) setTradedOnly(false)
+                          setTradedOnly(v === 'traded')
+                          setUntradedOnly(v === 'untraded')
                         }}
                       />
-                      <Toggle
-                        label="Openings"
-                        checked={firstBloodOnly}
-                        onChange={setFirstBloodOnly}
-                      />
-                      <Toggle
-                        label="Post-plant"
-                        checked={postPlantOnly}
-                        onChange={setPostPlantOnly}
-                      />
-                    </div>
-                  </ControlGroup>
+                    </ControlGroup>
+                    <ControlGroup label="Context">
+                      <div className="togglerow">
+                        <Toggle
+                          label="Openings"
+                          checked={firstBloodOnly}
+                          onChange={setFirstBloodOnly}
+                          hint="First duel of each round"
+                        />
+                        <Toggle
+                          label="Post-plant"
+                          checked={postPlantOnly}
+                          onChange={setPostPlantOnly}
+                          hint="Duels fought after spike plant"
+                        />
+                      </div>
+                    </ControlGroup>
+                  </>
                 )}
                 {isPlants && (
                   <ControlGroup label="Spot grouping" grow>
@@ -569,8 +839,9 @@ export default function App() {
         </div>
 
         {/* --- side rail --- */}
-        <aside className="stage2__side">
-          {!isPlants && !isInsights && (
+        {!isInsights && (
+          <aside className="stage2__side">
+            {!isPlants && !isRotations && (
             <div className="statgrid">
               <StatTile
                 label={view === 'utility' ? 'Utility kills' : 'Kills'}
@@ -601,6 +872,45 @@ export default function App() {
             <PlantSide data={plants} selected={selectedSpot} onSelect={setSelectedSpot} />
           )}
 
+          {isRotations && (
+            <RotationsPanel
+              data={rotations}
+              loading={loading}
+              scope={rotationsScope}
+              onScopeChange={(s) => {
+                setRotationsScope(s)
+                setRotationsPlayer('')
+                if (s === 'match') setRotationsMinCount(1)
+                else if (s === 'player') setRotationsMinCount(2)
+                else setRotationsMinCount(5)
+              }}
+              side={rotationsSide}
+              onSideChange={setRotationsSide}
+              player={rotationsPlayer}
+              onPlayerChange={setRotationsPlayer}
+              agent={rotationsAgent}
+              onAgentChange={setRotationsAgent}
+              availableAgents={rotations?.available_agents ?? []}
+              matchId={rotationsMatchId}
+              onMatchIdChange={(id) => {
+                setRotationsMatchId(id)
+                setRotationsPlayer('')
+              }}
+              team={rotationsTeam}
+              onTeamChange={setRotationsTeam}
+              roundNum={rotationsRound}
+              onRoundNumChange={setRotationsRound}
+              focusZone={rotationsFocusZone}
+              onFocusZoneChange={setRotationsFocusZone}
+              minCount={rotationsMinCount}
+              onMinCountChange={setRotationsMinCount}
+              selectedRoute={selectedRoute}
+              onSelectRoute={setSelectedRoute}
+              selectedZone={selectedZone}
+              onSelectZone={setSelectedZone}
+            />
+          )}
+
           {view === 'utility' && utility && (
             <Panel title="Abilities" subtitle="Damaging util that finished a kill">
               {utility.abilities.length === 0 ? (
@@ -629,19 +939,23 @@ export default function App() {
             </Panel>
           )}
 
-          {!isPlants && !isInsights && (
+          {!isPlants && !isInsights && !isRotations && (
             <Panel title="Rendering">
-              <SegmentedControl
-                size="sm"
-                options={[
-                  { value: 'inferno' as RampName, label: 'Inferno' },
-                  { value: 'ice' as RampName, label: 'Ice' },
-                  { value: 'toxic' as RampName, label: 'Toxic' },
-                  { value: 'duel' as RampName, label: 'Blood' },
-                ]}
-                value={ramp}
-                onChange={setRamp}
-              />
+              {/* The diverging view has its own fixed scale, so a ramp
+                  picker there would do nothing. */}
+              {!plotBoth && (
+                <SegmentedControl
+                  size="sm"
+                  options={[
+                    { value: 'inferno' as RampName, label: 'Inferno' },
+                    { value: 'ice' as RampName, label: 'Ice' },
+                    { value: 'toxic' as RampName, label: 'Toxic' },
+                    { value: 'duel' as RampName, label: 'Blood' },
+                  ]}
+                  value={ramp}
+                  onChange={setRamp}
+                />
+              )}
               <Slider
                 label="Spot size"
                 min={5}
@@ -682,7 +996,8 @@ export default function App() {
               )}
             </Panel>
           )}
-        </aside>
+          </aside>
+        )}
       </main>
       </>
       )}

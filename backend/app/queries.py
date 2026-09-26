@@ -8,10 +8,12 @@ navigate: pick a map first, then narrow.
 from __future__ import annotations
 
 import math
+import sqlite3
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Callable
 
+from .analytics.rotations import get_map_zones
 from .analytics_db import (
     DMG_NAME,
     POS_SCALE,
@@ -21,6 +23,12 @@ from .analytics_db import (
     FLAG_ROUND_WON,
     FLAG_TRADE_KILL,
     FLAG_TRADED,
+    FLAG_SUPPORTED,
+    FLAG_ISOLATED,
+    FLAG_CROSSFIRE,
+    FLAG_ADVANTAGE_DEATH,
+    FLAG_CLUTCH_KILL,
+    FLAG_LOW_IMPACT,
     SIDE_NAME,
     AnalyticsDB,
 )
@@ -71,6 +79,7 @@ class Filters:
     agents: list[str] = field(default_factory=list)
     victim_agents: list[str] = field(default_factory=list)
     weapons: list[str] = field(default_factory=list)
+    victim_weapons: list[str] = field(default_factory=list)
     abilities: list[str] = field(default_factory=list)
     sides: list[str] = field(default_factory=list)
     # Zone selection: a box in minimap space, and which end of the duel it
@@ -143,6 +152,7 @@ class Filters:
             agents=lst("agents"),
             victim_agents=lst("victim_agents"),
             weapons=lst("weapons"),
+            victim_weapons=lst("victim_weapons"),
             abilities=lst("abilities"),
             sides=lst("sides"),
             zone=_zone(params),
@@ -199,9 +209,14 @@ class QueryEngine:
     def __init__(self, db: AnalyticsDB) -> None:
         self.db = db
         self._dims: dict[str, dict[str, int]] = {}
-        self._query_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        # Finished responses, as gzipped JSON bytes. Not the result dicts:
+        # one heatmap is 15k point dicts, measured at 14.8 MB of Python
+        # objects against 0.36 MB compressed. At 256 entries the dicts could
+        # outgrow the whole 1 GB machine, and even the warmer's dozen took
+        # the memory the OS would otherwise spend caching the database.
+        self._query_cache: dict[tuple[Any, ...], bytes] = {}
         self._cache_lock = threading.Lock()
-        self._cache_max_entries = 32
+        self._cache_max_entries = 256
 
     def _ids(self, kind: str) -> dict[str, int]:
         if kind not in self._dims:
@@ -214,11 +229,41 @@ class QueryEngine:
             self._dims[key] = self.db.dim_names(kind)  # type: ignore[assignment]
         return self._dims[key]  # type: ignore[return-value]
 
-    def invalidate(self) -> None:
-        """Drop cached dimension maps and query results after an ingest adds new names."""
+    def invalidate(self, players_only: bool = False) -> None:
+        """Drop cached dimension maps and query results after an ingest adds new names.
+
+        `players_only` is for player events (register, refresh, scout): a
+        handful of one player's matches changes nothing visible on the
+        map-wide heatmaps, so only responses scoped to a player are
+        dropped. Clearing everything made every such event send the next
+        visitors to cold queries until the warmer's next pass.
+        """
         self._dims.clear()
         with self._cache_lock:
-            self._query_cache.clear()
+            if players_only:
+                for key in [k for k in self._query_cache if k[-1]]:
+                    del self._query_cache[key]
+            else:
+                self._query_cache.clear()
+
+    def cache_key(self, kind: str, f: Filters) -> tuple[Any, ...]:
+        """Identity of a response: the resolved SQL rather than the raw
+        filters, so equivalent selections share one entry. The player is
+        last, which is what `invalidate(players_only=True)` matches on."""
+        where, args = self._where(f)
+        return (kind, where, tuple(args), f.limit, f.player or None)
+
+    def cached(self, key: tuple[Any, ...], build: Callable[[], bytes]) -> bytes:
+        with self._cache_lock:
+            hit = self._query_cache.get(key)
+        if hit is not None:
+            return hit
+        body = build()
+        with self._cache_lock:
+            if len(self._query_cache) >= self._cache_max_entries:
+                self._query_cache.pop(next(iter(self._query_cache)), None)
+            self._query_cache[key] = body
+        return body
 
     def _role_agent_ids(self, roles: list[str]) -> list[int] | None:
         """Agent ids belonging to any of `roles`, or None if none resolve.
@@ -252,7 +297,11 @@ class QueryEngine:
 
     # --- SQL building ---------------------------------------------------
     def _where(
-        self, f: Filters, table: str = "kills", is_player: bool = False
+        self,
+        f: Filters,
+        table: str = "kills",
+        is_player: bool = False,
+        player_pid: int | None = None,
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         args: list[Any] = []
@@ -288,12 +337,14 @@ class QueryEngine:
             clauses.append(f"{table}.m = ?")
             args.append(row)
 
+        active_pid = player_pid
         if f.player and table == "kills":
             pid = self._ids("player").get(f.player)
             if pid is None:
                 # Never crawled, or crawled before attribution existed.
                 # Empty is the honest answer; a full scan is not.
                 return "1=0", []
+            active_pid = pid
             if f.player_role == "victim":
                 clauses.append("victim_pid = ?")
                 args.append(pid)
@@ -325,37 +376,97 @@ class QueryEngine:
             pfx = "+"
             ability_pfx = "" if f.utility_only else "+"
 
+            # Resolve player's agent and role filters
+            agent_filter_ids: set[int] | None = None
             if f.agents:
                 ids = self._resolve("agent", f.agents)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"{pfx}ka_id IN ({','.join('?' * len(ids))})")
-                args.extend(ids)
-            if f.victim_agents:
-                ids = self._resolve("agent", f.victim_agents)
-                if ids is None:
-                    return "1=0", []
-                clauses.append(f"{pfx}va_id IN ({','.join('?' * len(ids))})")
-                args.extend(ids)
-            # Roles narrow the same columns as the agent filters, so
-            # selecting Duelist *and* Jett means Jett, not both sets.
+                agent_filter_ids = set(ids)
+
             if f.roles:
                 ids = self._role_agent_ids(f.roles)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"{pfx}ka_id IN ({','.join('?' * len(ids))})")
-                args.extend(ids)
+                if agent_filter_ids is not None:
+                    agent_filter_ids = agent_filter_ids.intersection(ids)
+                    if not agent_filter_ids:
+                        return "1=0", []
+                else:
+                    agent_filter_ids = set(ids)
+
+            if agent_filter_ids is not None:
+                sorted_ids = sorted(agent_filter_ids)
+                qmarks = ",".join("?" * len(sorted_ids))
+                if active_pid is not None:
+                    # In player-specific queries, role/agent describes what this player played:
+                    # on kills it's ka_id, on deaths it's va_id.
+                    if f.player_role == "victim":
+                        clauses.append(f"{pfx}va_id IN ({qmarks})")
+                        args.extend(sorted_ids)
+                    elif f.player_role == "killer":
+                        clauses.append(f"{pfx}ka_id IN ({qmarks})")
+                        args.extend(sorted_ids)
+                    else:
+                        clauses.append(
+                            f"((killer_pid = ? AND {pfx}ka_id IN ({qmarks})) OR "
+                            f"(victim_pid = ? AND {pfx}va_id IN ({qmarks})))"
+                        )
+                        args.extend([active_pid] + sorted_ids + [active_pid] + sorted_ids)
+                else:
+                    clauses.append(f"{pfx}ka_id IN ({qmarks})")
+                    args.extend(sorted_ids)
+
+            victim_agent_filter_ids: set[int] | None = None
+            if f.victim_agents:
+                ids = self._resolve("agent", f.victim_agents)
+                if ids is None:
+                    return "1=0", []
+                victim_agent_filter_ids = set(ids)
+
             if f.victim_roles:
                 ids = self._role_agent_ids(f.victim_roles)
                 if ids is None:
                     return "1=0", []
-                clauses.append(f"{pfx}va_id IN ({','.join('?' * len(ids))})")
-                args.extend(ids)
+                if victim_agent_filter_ids is not None:
+                    victim_agent_filter_ids = victim_agent_filter_ids.intersection(ids)
+                    if not victim_agent_filter_ids:
+                        return "1=0", []
+                else:
+                    victim_agent_filter_ids = set(ids)
+
+            if victim_agent_filter_ids is not None:
+                sorted_v_ids = sorted(victim_agent_filter_ids)
+                qmarks_v = ",".join("?" * len(sorted_v_ids))
+                if active_pid is not None:
+                    # In player queries, victim_agent/role filters the opponent:
+                    # on kills opponent is va_id, on deaths opponent is ka_id.
+                    if f.player_role == "victim":
+                        clauses.append(f"{pfx}ka_id IN ({qmarks_v})")
+                        args.extend(sorted_v_ids)
+                    elif f.player_role == "killer":
+                        clauses.append(f"{pfx}va_id IN ({qmarks_v})")
+                        args.extend(sorted_v_ids)
+                    else:
+                        clauses.append(
+                            f"((killer_pid = ? AND {pfx}va_id IN ({qmarks_v})) OR "
+                            f"(victim_pid = ? AND {pfx}ka_id IN ({qmarks_v})))"
+                        )
+                        args.extend([active_pid] + sorted_v_ids + [active_pid] + sorted_v_ids)
+                else:
+                    clauses.append(f"{pfx}va_id IN ({qmarks_v})")
+                    args.extend(sorted_v_ids)
             if f.weapons:
                 ids = self._resolve("weapon", f.weapons)
                 if ids is None:
                     return "1=0", []
                 clauses.append(f"{pfx}weapon_id IN ({','.join('?' * len(ids))})")
+                args.extend(ids)
+            if f.victim_weapons:
+                ids = self._resolve("weapon", f.victim_weapons)
+                if ids is None:
+                    return "1=0", []
+                clauses.append(f"{pfx}vw_id IN ({','.join('?' * len(ids))})")
                 args.extend(ids)
             if f.abilities:
                 ids = self._resolve("ability", f.abilities)
@@ -405,12 +516,6 @@ class QueryEngine:
     # --- public queries -------------------------------------------------
     def kill_points(self, f: Filters) -> dict[str, Any]:
         where, args = self._where(f)
-        cache_key = (where, tuple(args), f.limit, f.player)
-        with self._cache_lock:
-            cached = self._query_cache.get(cache_key)
-            if cached is not None:
-                return cached
-
         with self.db.connect() as conn:
             total = conn.execute(
                 f"SELECT COUNT(*) n FROM kills WHERE {where}", args
@@ -422,13 +527,13 @@ class QueryEngine:
             sample_sql = ""
             if total > f.limit and f.limit > 0:
                 stride = math.ceil(total / f.limit)
-                sample_sql = f" AND (rowid % {stride}) = 0"
+                sample_sql = f" AND (rowid % {stride}) = 0 LIMIT {int(f.limit)}"
             elif f.limit > 0 and not sample_sql:
                 sample_sql = f" LIMIT {int(f.limit)}"
 
             rows = conn.execute(
                 f"""SELECT m, t_ms, side, ka_id, va_id, weapon_id, ability_id, dmg_type,
-                           vx, vy, kx, ky, flags, round_num, killer_pid, victim_pid
+                           vx, vy, kx, ky, flags, round_num, killer_pid, victim_pid, vw_id
                     FROM kills WHERE {where}{sample_sql}""",
                 args,
             ).fetchall()
@@ -454,6 +559,7 @@ class QueryEngine:
                 "killer_agent": agents.get(r["ka_id"], ""),
                 "victim_agent": agents.get(r["va_id"], ""),
                 "weapon": weapons.get(r["weapon_id"], ""),
+                "victim_weapon": weapons.get(r["vw_id"], "") if ("vw_id" in r.keys() and r["vw_id"] is not None) else "",
                 "ability": abilities.get(r["ability_id"], ""),
                 "type": DMG_NAME.get(r["dmg_type"], "other"),
                 "victim_pos": {"x": from_pos(r["vx"]), "y": from_pos(r["vy"])},
@@ -510,21 +616,13 @@ class QueryEngine:
             for t in sorted(hist_buckets)
         ]
 
-        result = {
+        return {
             "points": points,
             "total": total,
             "sampled": len(points) < total,
             "stats": stats,
             "histogram": histogram,
         }
-
-        with self._cache_lock:
-            if len(self._query_cache) >= self._cache_max_entries:
-                oldest = next(iter(self._query_cache))
-                self._query_cache.pop(oldest, None)
-            self._query_cache[cache_key] = result
-
-        return result
 
     def summary(self, f: Filters) -> dict[str, Any]:
         where, args = self._where(f)
@@ -660,13 +758,36 @@ class QueryEngine:
                 "rounds_won_with_kill": 0, "kill_round_win_rate": 0.0,
                 "post_plant_kills": 0, "post_plant_deaths": 0,
                 "multi_kill_rounds": 0, "best_round": 0,
+                "supported_deaths": 0, "isolated_deaths": 0, "support_rate": 0.0,
+                "crossfire_kills": 0,
+                "advantage_deaths": 0, "advantage_rounds_thrown": 0, "advantage_throw_rate": 0.0,
+                "clutch_kills": 0, "clutches_faced": 0, "clutches_won": 0, "clutch_win_rate": 0.0,
+                "low_impact_kills": 0, "impact_kills": 0, "impact_kill_rate": 0.0,
                 "tracked": False,
             }
 
         where, args = "1=1", []
         if f is not None:
-            scoped = replace(f, player="", player_role="killer")
-            where, args = self._where(scoped, is_player=True)
+            scoped = replace(f, player="", player_role="either")
+            where, args = self._where(scoped, is_player=True, player_pid=pid)
+
+        if where == "1=0":
+            return {
+                "kills": 0, "deaths": 0, "kd": 0.0, "matches": 0,
+                "traded_deaths": 0, "trade_rate": 0.0,
+                "first_bloods": 0, "first_deaths": 0,
+                "opening_duels": 0, "opening_win_rate": 0.0,
+                "trade_kills": 0, "untraded_deaths": 0,
+                "rounds_won_with_kill": 0, "kill_round_win_rate": 0.0,
+                "post_plant_kills": 0, "post_plant_deaths": 0,
+                "multi_kill_rounds": 0, "best_round": 0,
+                "supported_deaths": 0, "isolated_deaths": 0, "support_rate": 0.0,
+                "crossfire_kills": 0,
+                "advantage_deaths": 0, "advantage_rounds_thrown": 0, "advantage_throw_rate": 0.0,
+                "clutch_kills": 0, "clutches_faced": 0, "clutches_won": 0, "clutch_win_rate": 0.0,
+                "low_impact_kills": 0, "impact_kills": 0, "impact_kill_rate": 0.0,
+                "tracked": True,
+            }
 
         with self.db.connect() as conn:
             row = conn.execute(
@@ -680,10 +801,16 @@ class QueryEngine:
                         SUM(killer_pid = ? AND (flags & {FLAG_ROUND_WON}) != 0) kills_in_won,
                         SUM(killer_pid = ? AND (flags & {FLAG_POST_PLANT}) != 0) pp_kills,
                         SUM(victim_pid = ? AND (flags & {FLAG_POST_PLANT}) != 0) pp_deaths,
+                        SUM(victim_pid = ? AND (flags & {FLAG_SUPPORTED}) != 0) supported_deaths,
+                        SUM(victim_pid = ? AND (flags & {FLAG_ISOLATED}) != 0) isolated_deaths,
+                        SUM(killer_pid = ? AND (flags & {FLAG_CROSSFIRE}) != 0) crossfire_kills,
+                        SUM(victim_pid = ? AND (flags & {FLAG_ADVANTAGE_DEATH}) != 0) advantage_deaths,
+                        SUM(killer_pid = ? AND (flags & {FLAG_CLUTCH_KILL}) != 0) clutch_kills,
+                        SUM(killer_pid = ? AND (flags & {FLAG_LOW_IMPACT}) != 0) low_impact_kills,
                         COUNT(DISTINCT m) matches
                     FROM kills
                     WHERE (killer_pid = ? OR victim_pid = ?) AND {where}""",
-                [pid] * 11 + args,
+                [pid] * 17 + args,
             ).fetchone()
 
             # Rounds where they got two or more kills. Grouped per round
@@ -706,6 +833,26 @@ class QueryEngine:
                 [pid] + args,
             ).fetchone()
 
+            # Clutches (1vX rounds)
+            clutch_row = conn.execute(
+                f"""SELECT
+                        COUNT(DISTINCT m || ':' || round_num) total_clutches,
+                        COUNT(DISTINCT CASE WHEN (flags & {FLAG_ROUND_WON}) != 0 THEN m || ':' || round_num END) won_clutches
+                    FROM kills
+                    WHERE killer_pid = ? AND (flags & {FLAG_CLUTCH_KILL}) != 0 AND {where}""",
+                [pid] + args,
+            ).fetchone()
+
+            # Advantage rounds where this player was the casualty
+            adv_row = conn.execute(
+                f"""SELECT
+                        COUNT(DISTINCT m || ':' || round_num) adv_deaths_rounds,
+                        COUNT(DISTINCT CASE WHEN (flags & {FLAG_ROUND_WON}) = 0 THEN m || ':' || round_num END) adv_thrown_rounds
+                    FROM kills
+                    WHERE victim_pid = ? AND (flags & {FLAG_ADVANTAGE_DEATH}) != 0 AND {where}""",
+                [pid] + args,
+            ).fetchone()
+
         kills = row["kills"] or 0
         deaths = row["deaths"] or 0
         traded = row["traded_deaths"] or 0
@@ -713,6 +860,21 @@ class QueryEngine:
         first_deaths = row["first_deaths"] or 0
         openings = first_bloods + first_deaths
         kills_in_won = row["kills_in_won"] or 0
+
+        supported_deaths = row["supported_deaths"] or 0
+        isolated_deaths = row["isolated_deaths"] or 0
+        crossfire_kills = row["crossfire_kills"] or 0
+        advantage_deaths = row["advantage_deaths"] or 0
+        adv_deaths_rounds = adv_row["adv_deaths_rounds"] or 0
+        adv_thrown_rounds = adv_row["adv_thrown_rounds"] or 0
+
+        clutch_kills = row["clutch_kills"] or 0
+        clutches_faced = clutch_row["total_clutches"] or 0
+        clutches_won = clutch_row["won_clutches"] or 0
+
+        low_impact_kills = row["low_impact_kills"] or 0
+        impact_kills = max(0, kills - low_impact_kills)
+
         return {
             "kills": kills,
             "deaths": deaths,
@@ -741,6 +903,24 @@ class QueryEngine:
             "post_plant_deaths": row["pp_deaths"] or 0,
             "multi_kill_rounds": multi["rounds"] or 0,
             "best_round": best["best"] or 0,
+            # Tactical spacing & micro-positioning
+            "supported_deaths": supported_deaths,
+            "isolated_deaths": isolated_deaths,
+            "support_rate": round(supported_deaths / deaths, 4) if deaths else 0.0,
+            "crossfire_kills": crossfire_kills,
+            # Discipline & Man-advantage
+            "advantage_deaths": advantage_deaths,
+            "advantage_rounds_thrown": adv_thrown_rounds,
+            "advantage_throw_rate": round(adv_thrown_rounds / adv_deaths_rounds, 4) if adv_deaths_rounds else 0.0,
+            # Clutches (1vX)
+            "clutch_kills": clutch_kills,
+            "clutches_faced": clutches_faced,
+            "clutches_won": clutches_won,
+            "clutch_win_rate": round(clutches_won / clutches_faced, 4) if clutches_faced else 0.0,
+            # Impact vs Low Impact / Exit
+            "low_impact_kills": low_impact_kills,
+            "impact_kills": impact_kills,
+            "impact_kill_rate": round(impact_kills / kills, 4) if kills else 0.0,
             "tracked": True,
         }
 
@@ -900,6 +1080,28 @@ class QueryEngine:
             if k["victim"]:
                 entry(k["victim"], k["victim_agent"])["deaths"] += 1
 
+        # Look up team from rotations if available
+        team_by_puuid: dict[str, str] = {}
+        with self.db.connect() as conn:
+            rot_teams = conn.execute(
+                """SELECT player_pid, team FROM rotations
+                   WHERE m = ? AND player_pid IS NOT NULL AND team IS NOT NULL
+                   GROUP BY player_pid, team""",
+                (row_id,),
+            ).fetchall()
+            player_names = self._names("player")
+            for rt in rot_teams:
+                p_u = player_names.get(rt["player_pid"])
+                if p_u:
+                    team_by_puuid[p_u] = (rt["team"] or "").capitalize()
+
+        from .reference import get_agent
+        for puuid_key, p_entry in board.items():
+            ag_info = get_agent(p_entry["agent"])
+            p_entry["role"] = ag_info.role if ag_info else ""
+            p_entry["icon"] = ag_info.icon if ag_info else ""
+            p_entry["team"] = team_by_puuid.get(puuid_key, "")
+
         scoreboard = sorted(board.values(), key=lambda p: (-p["kills"], p["deaths"]))
         for row in scoreboard:
             row["kd"] = (
@@ -930,4 +1132,423 @@ class QueryEngine:
                 for r in plant_rows
             ],
             "scoreboard": scoreboard,
+        }
+
+    # --- macro rotation flow (6.3) ---------------------------------------
+    def rotations(
+        self,
+        map_name: str | None = None,
+        side: str = "defense",
+        player: str | None = None,
+        agent: str | None = None,
+        match_id: str | None = None,
+        team: str | None = None,
+        round_num: int | None = None,
+        min_count: int = 5,
+        focus_zone: str | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate macro-rotation transitions between zones for a map, match, or player."""
+        m_id = None
+        if match_id:
+            with self.db.connect() as conn:
+                mrow = conn.execute(
+                    "SELECT id, map_id FROM matches WHERE match_id = ?", (match_id,)
+                ).fetchone()
+                if mrow:
+                    m_id = mrow["id"]
+                    if not map_name:
+                        map_names = self._names("map")
+                        map_name = map_names.get(mrow["map_id"], "")
+
+        if not map_name:
+            map_name = "Ascent"
+
+        maps_by_lower = {k.lower(): v for k, v in self._ids("map").items()}
+        map_id = maps_by_lower.get(map_name.lower())
+        if map_id is None:
+            self._dims.pop("map", None)
+            maps_by_lower = {k.lower(): v for k, v in self._ids("map").items()}
+            map_id = maps_by_lower.get(map_name.lower())
+
+        zones_dict = get_map_zones(map_name)
+
+        if map_id is None or not zones_dict:
+            return {
+                "map_name": map_name,
+                "side": side,
+                "player": player,
+                "agent": agent,
+                "match_id": match_id,
+                "team": team,
+                "round_num": round_num,
+                "available_agents": [],
+                "match_players": [],
+                "total_transitions": 0,
+                "zones": list(zones_dict.values()) if zones_dict else [],
+                "transitions": [],
+            }
+
+        # Side mapping: "attack" -> 1, "defense" -> 2, "all" -> 0
+        side_l = (side or "defense").lower()
+        side_id = 1 if side_l == "attack" else (2 if side_l == "defense" else 0)
+
+        # Player resolution
+        pid = None
+        if player:
+            if "#" in player:
+                with self.db.connect() as conn:
+                    parts = player.split("#", 1)
+                    row = conn.execute(
+                        "SELECT puuid, pid FROM tracked_players WHERE LOWER(name)=LOWER(?) AND LOWER(tag)=LOWER(?)",
+                        (parts[0], parts[1]),
+                    ).fetchone()
+                    if row:
+                        pid = row["pid"] or self._ids("player").get(row["puuid"])
+                        if pid is None:
+                            self._dims.pop("player", None)
+                            pid = self._ids("player").get(row["puuid"])
+                    if pid is None:
+                        pid = self._ids("player").get(player) or self._ids("player").get(parts[0])
+            else:
+                pid = self._ids("player").get(player)
+                if pid is None:
+                    with self.db.connect() as conn:
+                        row = conn.execute(
+                            "SELECT puuid, pid FROM tracked_players WHERE LOWER(name)=LOWER(?)",
+                            (player,),
+                        ).fetchone()
+                        if row:
+                            pid = row["pid"] or self._ids("player").get(row["puuid"])
+                if pid is None:
+                    self._dims.pop("player", None)
+                    pid = self._ids("player").get(player)
+
+        with self.db.connect() as conn:
+            # Check if rotations exist for this match, map, or player
+            if not getattr(self.db, "read_only", False):
+                if m_id is not None:
+                    m_count = conn.execute(
+                        "SELECT COUNT(*) as n FROM rotations WHERE m = ?", (m_id,)
+                    ).fetchone()["n"]
+                    if m_count == 0:
+                        from .backfill_rotations import backfill_match_rotations
+                        try:
+                            backfill_match_rotations(self.db, conn, m_id, match_id, map_name)
+                        except Exception:
+                            pass
+                else:
+                    table_count = conn.execute(
+                        "SELECT COUNT(*) as n FROM rotations WHERE map_id = ?", (map_id,)
+                    ).fetchone()["n"]
+                    if table_count == 0:
+                        from .backfill_rotations import backfill_match_rotations
+                        raw_rows = conn.execute(
+                            "SELECT id, match_id FROM matches WHERE map_id = ? LIMIT 50", (map_id,)
+                        ).fetchall()
+                        for r in raw_rows:
+                            try:
+                                backfill_match_rotations(self.db, conn, r["id"], r["match_id"], map_name)
+                            except Exception:
+                                pass
+
+                    if pid is not None:
+                        # Ensure all matches featuring this player on this map are in rotations
+                        missing_player_matches = conn.execute(
+                            """SELECT DISTINCT m.id, m.match_id
+                               FROM matches m
+                               WHERE m.map_id = ?
+                                 AND m.id IN (
+                                     SELECT m FROM kills WHERE killer_pid = ? AND map_id = ?
+                                     UNION
+                                     SELECT m FROM kills WHERE victim_pid = ? AND map_id = ?
+                                 )
+                                 AND m.id NOT IN (
+                                     SELECT DISTINCT m FROM rotations WHERE map_id = ?
+                                 )""",
+                            (map_id, pid, map_id, pid, map_id, map_id),
+                        ).fetchall()
+                        if missing_player_matches:
+                            from .backfill_rotations import backfill_match_rotations
+                            for r in missing_player_matches:
+                                try:
+                                    backfill_match_rotations(self.db, conn, r["id"], r["match_id"], map_name)
+                                except Exception:
+                                    pass
+
+            # Agent resolution (after backfill, in case new agent was interned)
+            agent_id = None
+            if agent:
+                agents_by_lower = {k.lower(): v for k, v in self._ids("agent").items()}
+                agent_id = agents_by_lower.get(agent.lower())
+                if agent_id is None:
+                    self._dims.pop("agent", None)
+                    agents_by_lower = {k.lower(): v for k, v in self._ids("agent").items()}
+                    agent_id = agents_by_lower.get(agent.lower())
+
+            where_clauses = ["map_id = ?"]
+            params: list[Any] = [map_id]
+
+            if m_id is not None:
+                where_clauses.append("m = ?")
+                params.append(m_id)
+
+            if side_id != 0:
+                where_clauses.append("side = ?")
+                params.append(side_id)
+
+            if player:
+                if pid is not None:
+                    where_clauses.append("player_pid = ?")
+                    params.append(pid)
+                else:
+                    where_clauses.append("1=0")
+
+            if agent:
+                if agent_id is not None:
+                    where_clauses.append("agent_id = ?")
+                    params.append(agent_id)
+                else:
+                    where_clauses.append("1=0")
+
+            if team:
+                where_clauses.append("LOWER(team) = LOWER(?)")
+                params.append(team)
+
+            if round_num is not None:
+                where_clauses.append("round_num = ?")
+                params.append(int(round_num))
+
+            if focus_zone:
+                where_clauses.append("(from_zone = ? OR to_zone = ?)")
+                params.extend([focus_zone, focus_zone])
+
+            where_sql = " AND ".join(where_clauses)
+
+            # In match, player, or agent mode, single transitions are relevant (default threshold 1)
+            if m_id is not None or round_num is not None or player or agent:
+                effective_min = max(1, int(min_count)) if min_count != 5 else 1
+            else:
+                effective_min = max(1, int(min_count))
+
+            having_sql = "HAVING COUNT(*) >= ?"
+            params.append(effective_min)
+
+            sql = f"""
+                SELECT
+                    from_zone, to_zone,
+                    COUNT(*) as count,
+                    AVG((t_end_ms - t_start_ms) / 1000.0) as avg_duration_s,
+                    SUM(won) as rounds_won
+                FROM rotations
+                WHERE {where_sql}
+                GROUP BY from_zone, to_zone
+                {having_sql}
+                ORDER BY count DESC
+            """
+
+            rows = conn.execute(sql, params).fetchall()
+
+            # Query available agents for player or match
+            available_agents: list[str] = []
+            agent_names = self._names("agent")
+            if pid is not None:
+                ag_rows = conn.execute(
+                    """SELECT DISTINCT agent_id FROM (
+                           SELECT agent_id FROM rotations WHERE map_id = ? AND player_pid = ? AND agent_id IS NOT NULL
+                           UNION
+                           SELECT ka_id as agent_id FROM kills WHERE map_id = ? AND killer_pid = ? AND ka_id IS NOT NULL
+                           UNION
+                           SELECT va_id as agent_id FROM kills WHERE map_id = ? AND victim_pid = ? AND va_id IS NOT NULL
+                       )""",
+                    (map_id, pid, map_id, pid, map_id, pid),
+                ).fetchall()
+                if any(r["agent_id"] not in agent_names for r in ag_rows):
+                    self._dims.pop("~agent", None)
+                    agent_names = self._names("agent")
+                available_agents = sorted(filter(None, [agent_names.get(r["agent_id"]) for r in ag_rows]))
+            elif m_id is not None:
+                ag_rows = conn.execute(
+                    "SELECT DISTINCT agent_id FROM rotations WHERE m = ? AND agent_id IS NOT NULL",
+                    (m_id,),
+                ).fetchall()
+                if any(r["agent_id"] not in agent_names for r in ag_rows):
+                    self._dims.pop("~agent", None)
+                    agent_names = self._names("agent")
+                available_agents = sorted(filter(None, [agent_names.get(r["agent_id"]) for r in ag_rows]))
+
+            # Query match players if match is scoped
+            match_players: list[dict[str, Any]] = []
+            if m_id is not None:
+                from .reference import get_agent
+                p_rows = conn.execute(
+                    """SELECT DISTINCT player_pid, agent_id, team
+                       FROM rotations
+                       WHERE m = ? AND player_pid IS NOT NULL
+                       ORDER BY CASE WHEN LOWER(team)='blue' THEN 0 ELSE 1 END, team, agent_id""",
+                    (m_id,),
+                ).fetchall()
+                player_names = self._names("player")
+                agent_names = self._names("agent")
+
+                val_conn = None
+                try:
+                    from .paths import DATA_DIR
+                    val_db_path = DATA_DIR / "valheatmap.db"
+                    if val_db_path.exists():
+                        val_conn = sqlite3.connect(f"file:{val_db_path}?mode=ro", uri=True)
+                except Exception:
+                    val_conn = None
+
+                for pr in p_rows:
+                    p_pid = pr["player_pid"]
+                    a_id = pr["agent_id"]
+                    t_str = (pr["team"] or "").capitalize()
+                    puuid_str = player_names.get(p_pid, "")
+                    agent_str = agent_names.get(a_id, "")
+                    ag_info = get_agent(agent_str)
+
+                    disp_name = ""
+                    t_row = conn.execute(
+                        "SELECT name, tag FROM tracked_players WHERE puuid = ?", (puuid_str,)
+                    ).fetchone()
+                    if t_row and t_row["name"] and t_row["name"] != "Unknown":
+                        disp_name = f"{t_row['name']}#{t_row['tag']}" if t_row["tag"] else t_row["name"]
+                    elif val_conn:
+                        try:
+                            v_row = val_conn.execute(
+                                "SELECT name, tag FROM players WHERE puuid = ?", (puuid_str,)
+                            ).fetchone()
+                            if v_row and v_row[0] and v_row[0] != "Unknown":
+                                disp_name = f"{v_row[0]}#{v_row[1]}" if v_row[1] else v_row[0]
+                        except Exception:
+                            pass
+
+                    match_players.append({
+                        "puuid": puuid_str,
+                        "name": disp_name,
+                        "agent": agent_str,
+                        "role": ag_info.role if ag_info else "",
+                        "icon": ag_info.icon if ag_info else "",
+                        "team": t_str,
+                    })
+
+                if val_conn:
+                    try:
+                        val_conn.close()
+                    except Exception:
+                        pass
+
+            from .reference import get_agent
+
+            # Query agent breakdown per transition
+            agent_rot_sql = f"""
+                SELECT
+                    from_zone, to_zone, agent_id,
+                    COUNT(*) as cnt
+                FROM rotations
+                WHERE {where_sql} AND agent_id IS NOT NULL
+                GROUP BY from_zone, to_zone, agent_id
+                ORDER BY cnt DESC
+            """
+            ag_trans_rows = conn.execute(agent_rot_sql, params[:-1]).fetchall()
+            agents_by_route: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for atr in ag_trans_rows:
+                ag_name = agent_names.get(atr["agent_id"])
+                if not ag_name:
+                    continue
+                ag_inf = get_agent(ag_name)
+                key = (atr["from_zone"], atr["to_zone"])
+                agents_by_route.setdefault(key, []).append({
+                    "agent": ag_name,
+                    "icon": ag_inf.icon if ag_inf else "",
+                    "role": ag_inf.role if ag_inf else "",
+                    "count": atr["cnt"],
+                })
+
+            # Query round setups if match and round are specified
+            round_setups: list[dict[str, Any]] = []
+            if m_id is not None and round_num is not None:
+                round_setup_rows = conn.execute(
+                    """SELECT player_pid, agent_id, team, from_zone, to_zone, t_start_ms, won
+                       FROM rotations
+                       WHERE m = ? AND round_num = ? AND player_pid IS NOT NULL
+                       ORDER BY team, t_start_ms ASC""",
+                    (m_id, int(round_num)),
+                ).fetchall()
+                for rsr in round_setup_rows:
+                    ag_name = agent_names.get(rsr["agent_id"], "")
+                    ag_inf = get_agent(ag_name)
+                    round_setups.append({
+                        "team": (rsr["team"] or "").capitalize(),
+                        "agent": ag_name,
+                        "icon": ag_inf.icon if ag_inf else "",
+                        "role": ag_inf.role if ag_inf else "",
+                        "from_zone": rsr["from_zone"],
+                        "to_zone": rsr["to_zone"],
+                        "start_s": round(rsr["t_start_ms"] / 1000.0, 1),
+                        "won": bool(rsr["won"]),
+                    })
+
+        # Compute zone traffic and departure/arrival shares
+        outgoing_totals: dict[str, int] = {}
+        incoming_totals: dict[str, int] = {}
+        transitions: list[dict[str, Any]] = []
+
+        for r in rows:
+            fz = r["from_zone"]
+            tz = r["to_zone"]
+            c = r["count"]
+            outgoing_totals[fz] = outgoing_totals.get(fz, 0) + c
+            incoming_totals[tz] = incoming_totals.get(tz, 0) + c
+
+        for r in rows:
+            fz = r["from_zone"]
+            tz = r["to_zone"]
+            c = r["count"]
+            out_tot = outgoing_totals.get(fz, 0)
+            in_tot = incoming_totals.get(tz, 0)
+            won_cnt = r["rounds_won"] or 0
+            route_agents = agents_by_route.get((fz, tz), [])
+
+            transitions.append(
+                {
+                    "from_zone": fz,
+                    "to_zone": tz,
+                    "count": c,
+                    "outgoing_share": round(c / out_tot, 4) if out_tot else 0.0,
+                    "incoming_share": round(c / in_tot, 4) if in_tot else 0.0,
+                    "avg_duration_s": round(r["avg_duration_s"] or 0.0, 1),
+                    "rounds_won": won_cnt,
+                    "win_rate": round(won_cnt / c, 4) if c else 0.0,
+                    "agents": route_agents,
+                }
+            )
+
+        # Update zone traffic
+        zone_list = []
+        for zid, zinfo in zones_dict.items():
+            tot = outgoing_totals.get(zid, 0) + incoming_totals.get(zid, 0)
+            zone_list.append(
+                {
+                    **zinfo,
+                    "outgoing_count": outgoing_totals.get(zid, 0),
+                    "incoming_count": incoming_totals.get(zid, 0),
+                    "total_traffic": tot,
+                }
+            )
+
+        return {
+            "map_name": map_name,
+            "side": side,
+            "player": player,
+            "agent": agent,
+            "match_id": match_id,
+            "team": team,
+            "round_num": round_num,
+            "available_agents": available_agents,
+            "match_players": match_players,
+            "round_setups": round_setups,
+            "total_transitions": sum(t["count"] for t in transitions),
+            "zones": zone_list,
+            "transitions": transitions,
         }

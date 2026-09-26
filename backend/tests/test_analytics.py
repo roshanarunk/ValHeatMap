@@ -14,7 +14,7 @@ import pytest
 from app.analytics.kills import KillFilters, apply_filters, enrich, summarise
 from app.analytics.plants import cluster, spot_payload
 from app.models import (
-    DamageType, Kill, Match, MatchMeta, Plant, Player, Point, Round, Side,
+    DamageType, Kill, Match, MatchMeta, Plant, Player, PlayerLocation, Point, Round, Side,
 )
 from app.reference import get_agent, get_map
 from app.store import MatchStore, parse_any
@@ -479,3 +479,70 @@ def test_kill_without_position_is_counted_but_not_plotted():
     assert summarise(enriched, match)["total"] == 2
     from app.analytics.kills import to_points
     assert len(to_points(enriched, get_map("/Game/Maps/Ascent/Ascent"))) == 1
+
+
+def test_tactical_metrics_enrichment():
+    """Verify supported, isolated, crossfire, advantage_death, clutch_kill, and low_impact."""
+    meta = MatchMeta(
+        match_id="t", map_id="/Game/Maps/Ascent/Ascent", map_name="Ascent",
+        mode="standard", mode_raw="Bomb", queue="unrated", started_at=0, game_length_ms=0,
+    )
+    players = [
+        Player(puuid="A1", name="A1", tag="1", team="Red", agent="Jett", agent_id=""),
+        Player(puuid="A2", name="A2", tag="1", team="Red", agent="Sova", agent_id=""),
+        Player(puuid="A3", name="A3", tag="1", team="Red", agent="Raze", agent_id=""),
+        Player(puuid="B1", name="B1", tag="2", team="Blue", agent="Sage", agent_id=""),
+        Player(puuid="B2", name="B2", tag="2", team="Blue", agent="Omen", agent_id=""),
+    ]
+    # Kill 1: A1 kills B1. A1 at (0, 0), A2 at (0, 1000). B1 at (1000, 500). B2 at (1500, 500) (dist 500 = 5m <= 12m supported).
+    locs1 = [
+        PlayerLocation(puuid="A1", location=Point(0, 0)),
+        PlayerLocation(puuid="A2", location=Point(0, 1000)),
+        PlayerLocation(puuid="A3", location=Point(0, 2000)),
+        PlayerLocation(puuid="B2", location=Point(1500, 500)),
+    ]
+    k1 = Kill(
+        round_num=0, time_in_round_ms=1000, time_in_match_ms=1000,
+        killer_puuid="A1", victim_puuid="B1",
+        victim_location=Point(1000, 500), killer_location=Point(0, 0),
+        killer_team="Red", victim_team="Blue",
+        player_locations=locs1,
+    )
+    # Kill 2: B2 kills A1. Red had 3 players (A1, A2, A3), Blue had 1 player (B2).
+    # A1 was at (0,0), nearest teammate A2 at (0, 4000) (dist 4000 = 40m > 25m isolated=True).
+    # Red had 3v1 (>=2 advantage) -> advantage_death is True for A1!
+    # Blue had 1v3 (>=2 deficit) and lost round -> low_impact is True for B2!
+    # B2 was 1v3 -> clutch_kill is True for B2!
+    locs2 = [
+        PlayerLocation(puuid="B2", location=Point(1500, 500)),
+        PlayerLocation(puuid="A2", location=Point(0, 4000)),
+        PlayerLocation(puuid="A3", location=Point(0, 5000)),
+    ]
+    k2 = Kill(
+        round_num=0, time_in_round_ms=2000, time_in_match_ms=2000,
+        killer_puuid="B2", victim_puuid="A1",
+        victim_location=Point(0, 0), killer_location=Point(1500, 500),
+        killer_team="Blue", victim_team="Red",
+        player_locations=locs2,
+    )
+    match = Match(
+        meta=meta, players=players,
+        rounds=[Round(number=0, winning_team="Red", result="Elimination", kills=[k1, k2])],
+        teams={"Red": True, "Blue": False},
+    )
+    enriched = enrich(match)
+    assert len(enriched) == 2
+
+    # Kill 1
+    assert enriched[0].supported is True
+    assert enriched[0].isolated is False
+    assert enriched[0].crossfire is True
+    assert enriched[0].clutch_kill is False
+
+    # Kill 2
+    assert enriched[1].supported is False
+    assert enriched[1].isolated is True
+    assert enriched[1].advantage_death is True
+    assert enriched[1].clutch_kill is True
+    assert enriched[1].low_impact is True  # Blue lost round, 1v3 deficit, not first blood
+

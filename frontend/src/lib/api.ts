@@ -10,6 +10,9 @@ import type {
   MapRow,
   MatchSummary,
   PlantsResponse,
+  RotationsResponse,
+  ScoutReport,
+  ScoutResponse,
   UtilityResponse,
   WeaponInfo,
 } from './types'
@@ -108,6 +111,7 @@ export interface QueryFilters {
   sides?: string[]
   rounds?: number[]
   weapons?: string[]
+  victim_weapons?: string[]
   abilities?: string[]
   /** Zone box as "x0,y0,x1,y1" in normalised minimap space. */
   zone?: string
@@ -172,6 +176,24 @@ export interface PlayerSummary {
   /** Rounds with 2+ kills, and the best single round. */
   multi_kill_rounds: number
   best_round: number
+  // Tactical spacing & micro-positioning
+  supported_deaths: number
+  isolated_deaths: number
+  support_rate: number
+  crossfire_kills: number
+  // Discipline & Man-advantage
+  advantage_deaths: number
+  advantage_rounds_thrown: number
+  advantage_throw_rate: number
+  // Clutches (1vX)
+  clutch_kills: number
+  clutches_faced: number
+  clutches_won: number
+  clutch_win_rate: number
+  // Impact vs Low Impact / Exit
+  low_impact_kills: number
+  impact_kills: number
+  impact_kill_rate: number
   tracked: boolean
 }
 
@@ -233,6 +255,9 @@ export interface MatchDetail {
   scoreboard: {
     puuid: string
     agent: string
+    role?: string
+    icon?: string
+    team?: string
     kills: number
     deaths: number
     first_bloods: number
@@ -330,6 +355,21 @@ export const api = {
     options?: { signal?: AbortSignal },
   ) =>
     get<PlantsResponse>('/api/plants', f as Record<string, unknown>, options),
+  rotations: (
+    params: {
+      map_name?: string
+      side?: 'defense' | 'attack' | 'all'
+      player?: string
+      agent?: string
+      match_id?: string
+      team?: string
+      round_num?: number
+      min_count?: number
+      focus_zone?: string
+    },
+    options?: { signal?: AbortSignal },
+  ) =>
+    get<RotationsResponse>('/api/rotations', params as Record<string, unknown>, options),
   insights: (f: QueryFilters & { grid?: number }, options?: { signal?: AbortSignal }) =>
     get<InsightsResponse>('/api/insights', f as Record<string, unknown>, options),
   importUpload: (payload: unknown) =>
@@ -347,5 +387,13 @@ export const api = {
   importRiot: (matchId: string, region?: string) =>
     post<{ imported: string; match: MatchSummary }>(
       `/api/import/riot/${encodeURIComponent(matchId)}${region ? `?region=${region}` : ''}`,
+    ),
+  scoutLobby: (mapName: string, opponents: { riot_id: string; agent?: string }[]) =>
+    post<ScoutResponse>('/api/scout', { map_name: mapName, opponents }),
+  scoutPlayer: (riotId: string, mapName: string, agent?: string, options?: { signal?: AbortSignal }) =>
+    get<ScoutReport>(
+      '/api/scout/player',
+      { riot_id: riotId, map_name: mapName, agent },
+      options,
     ),
 }

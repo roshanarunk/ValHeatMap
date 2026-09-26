@@ -6,6 +6,7 @@ they neither touch nor depend on the real crawled dataset.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,7 @@ def _match(
                 killer_location=_world_at(map_name, 0.35 + i * 0.1, 0.4 + i * 0.08),
                 damage_type=DamageType.ABILITY if i == 0 else DamageType.WEAPON,
                 weapon_name="" if i == 0 else "Vandal",
+                victim_weapon_name="Classic" if i == 1 else ("Sheriff" if i > 1 else ""),
                 ability_name="Blade Storm" if i == 0 else "",
                 killer_side=Side.ATTACK if i % 2 == 0 else Side.DEFENSE,
                 killer_team="Red" if i % 2 == 0 else "Blue",
@@ -330,6 +332,53 @@ def test_engine_cache_can_be_invalidated(db: AnalyticsDB):
     assert engine.summary(Filters(map_name="Ascent", agents=["Omen"]))["total"] > 0
 
 
+def test_player_events_keep_map_wide_responses_cached(engine: QueryEngine):
+    """Registering or refreshing one player must not cold-start every
+    heatmap: only responses scoped to a player are dropped."""
+    everyone = engine.cache_key("kills", Filters(map_name="Ascent"))
+    mine = engine.cache_key("kills", Filters(map_name="Ascent", player="atk"))
+    engine.cached(everyone, lambda: b"everyone")
+    engine.cached(mine, lambda: b"mine")
+
+    engine.invalidate(players_only=True)
+    assert engine.cached(everyone, lambda: b"rebuilt") == b"everyone"
+    assert engine.cached(mine, lambda: b"rebuilt") == b"rebuilt"
+
+    engine.invalidate()
+    assert engine.cached(everyone, lambda: b"rebuilt") == b"rebuilt"
+
+
+def test_cache_is_bounded(engine: QueryEngine):
+    engine._cache_max_entries = 2
+    for i in range(3):
+        engine.cached(("kills", i, None), lambda: b"x")
+    assert len(engine._query_cache) == 2
+    assert ("kills", 0, None) not in engine._query_cache
+
+
+def test_filtered_heatmap_count_never_touches_the_table(db: AnalyticsDB):
+    """Weapon/agent/side filters used to force a table read per row of the
+    map (5.8s for one weapon on a 1.1M-kill map). idx_k_heat covers them."""
+    with db.connect() as conn:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM kills "
+            "WHERE map_id = 1 AND +weapon_id IN (1) AND +ka_id IN (2) AND side = 1"
+        ).fetchall()
+    assert any("COVERING INDEX idx_k_heat" in row[-1] for row in plan), plan
+
+
+def test_existing_databases_get_the_heatmap_index(tmp_path: Path):
+    """SCHEMA only reruns when a migration applies, so the index has to be
+    a migration of its own to reach the production database."""
+    AnalyticsDB(tmp_path / "old.db")
+    with sqlite3.connect(tmp_path / "old.db") as conn:
+        conn.execute("DROP INDEX idx_k_heat")
+    AnalyticsDB(tmp_path / "old.db")
+    with sqlite3.connect(tmp_path / "old.db") as conn:
+        names = {row[1] for row in conn.execute("PRAGMA index_list(kills)")}
+    assert "idx_k_heat" in names
+
+
 def test_unresolvable_filter_matches_nothing_not_everything(engine: QueryEngine):
     """A filter naming only unknown values must return no rows.
 
@@ -454,6 +503,19 @@ def test_multiple_weapons_are_a_union(engine: QueryEngine, db: AnalyticsDB):
 
 def test_unknown_weapon_matches_nothing(engine: QueryEngine):
     assert engine.summary(Filters(map_name="Ascent", weapons=["Trombone"]))["total"] == 0
+
+
+def test_victim_weapon_filter_narrows_the_selection(engine: QueryEngine):
+    total = engine.summary(Filters(map_name="Ascent"))["total"]
+    classic = engine.summary(Filters(map_name="Ascent", victim_weapons=["Classic"]))["total"]
+    sheriff = engine.summary(Filters(map_name="Ascent", victim_weapons=["Sheriff"]))["total"]
+    assert 0 < classic < total
+    assert 0 < sheriff < total
+    assert classic + sheriff < total
+
+
+def test_unknown_victim_weapon_matches_nothing(engine: QueryEngine):
+    assert engine.summary(Filters(map_name="Ascent", victim_weapons=["Trombone"]))["total"] == 0
 
 
 def test_weapons_appear_in_facets(db: AnalyticsDB):
@@ -604,12 +666,28 @@ def test_player_summary_counts_both_ends_of_the_duel(db: AnalyticsDB):
     assert summary["deaths"] > 0
     assert summary["tracked"] is True
     assert summary["matches"] == 6
+    assert "supported_deaths" in summary
+    assert "isolated_deaths" in summary
+    assert "support_rate" in summary
+    assert "crossfire_kills" in summary
+    assert "advantage_deaths" in summary
+    assert "advantage_throw_rate" in summary
+    assert "clutch_kills" in summary
+    assert "clutches_faced" in summary
+    assert "clutches_won" in summary
+    assert "clutch_win_rate" in summary
+    assert "low_impact_kills" in summary
+    assert "impact_kills" in summary
+    assert "impact_kill_rate" in summary
 
 
 def test_player_summary_of_an_unknown_player_is_empty_not_everything(db: AnalyticsDB):
     summary = QueryEngine(db).player_summary("never-seen")
     assert summary["tracked"] is False
     assert summary["kills"] == 0 and summary["deaths"] == 0
+    assert summary["supported_deaths"] == 0
+    assert summary["clutches_faced"] == 0
+    assert summary["impact_kills"] == 0
 
 
 def test_kd_reports_kills_when_deaths_are_zero(db: AnalyticsDB):
@@ -849,6 +927,27 @@ def test_player_summary_ignores_the_player_filter_on_f(db: AnalyticsDB):
     )
     assert plain == with_player
     assert plain["deaths"] > 0
+
+
+def test_player_summary_role_and_agent_filter(db: AnalyticsDB):
+    """Filtering by role or agent restricts to matches where the player played that role/agent."""
+    engine = QueryEngine(db)
+    # The fixture player 'atk' only plays Jett (Duelist)
+    duelist = engine.player_summary("atk", Filters(roles=["duelist"]))
+    jett = engine.player_summary("atk", Filters(agents=["Jett"]))
+    sentinel = engine.player_summary("atk", Filters(roles=["sentinel"]))
+    cypher = engine.player_summary("atk", Filters(agents=["Cypher"]))
+
+    assert duelist["matches"] == 6
+    assert duelist["kills"] > 0
+    assert jett["matches"] == 6
+    assert jett["kills"] == duelist["kills"]
+
+    assert sentinel["matches"] == 0
+    assert sentinel["kills"] == 0
+    assert sentinel["deaths"] == 0
+    assert cypher["matches"] == 0
+    assert cypher["kills"] == 0
 
 
 def test_ping_returns_true(db: AnalyticsDB):

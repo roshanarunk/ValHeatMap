@@ -210,6 +210,26 @@ def parse(data: dict[str, Any], source: str = "henrik") -> Match:
             votes[key] = votes.get(key, 0) + 1
         attacker_team = max(votes, key=lambda k: votes[k]) if votes else "Red"
 
+    # Map (round_num, puuid) -> (wid, wname) for player round economy
+    round_weapons: dict[tuple[int, str], tuple[str, str]] = {}
+    for idx, rnd in enumerate(rounds_raw):
+        r_num = int(rnd.get("id", idx))
+        for pstat in rnd.get("stats") or ():
+            p_puuid, _ = _player_ref(pstat.get("player"))
+            if not p_puuid:
+                continue
+            econ = pstat.get("economy") or {}
+            w = econ.get("weapon") or {}
+            wid_raw = w.get("id") or ""
+            wname_raw = w.get("name") or ""
+            wobj = get_weapon(wid_raw or wname_raw)
+            res_wname = wobj.name if wobj else (wname_raw or "")
+            res_wid = wobj.uuid if wobj else wid_raw
+            if not res_wname and econ.get("loadout_value", 0) == 0:
+                res_wname = "Classic"
+            if res_wname:
+                round_weapons[(r_num, p_puuid)] = (res_wid, res_wname)
+
     # Kills are flat; bucket them by round.
     kills_by_round: dict[int, list[Kill]] = {}
     for k in data.get("kills") or ():
@@ -256,6 +276,8 @@ def parse(data: dict[str, Any], source: str = "henrik") -> Match:
             else Side.NONE
         )
 
+        victim_wid, victim_wname = round_weapons.get((num, victim_puuid), ("", ""))
+
         kills_by_round.setdefault(num, []).append(
             Kill(
                 round_num=num,
@@ -270,6 +292,8 @@ def parse(data: dict[str, Any], source: str = "henrik") -> Match:
                 damage_type=dtype,
                 weapon_id=wid if dtype is DamageType.WEAPON else "",
                 weapon_name=(weapon.name if weapon else wname) if dtype is DamageType.WEAPON else "",
+                victim_weapon_id=victim_wid,
+                victim_weapon_name=victim_wname,
                 ability_slot=slot,
                 ability_name=ability_name,
                 secondary_fire=bool(k.get("secondary_fire_mode")),

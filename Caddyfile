@@ -1,0 +1,16 @@
+# Caddy configuration for ValHeatMap
+# Automatically provisions and renews Let's Encrypt TLS certificates.
+
+{$DOMAIN:valostats.roshanarun.com} {
+	encode zstd gzip
+
+	# Vite static assets have content hashes in filenames; cache aggressively
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+
+	# API responses update as the background crawler ingests matches
+	@api path /api/*
+	header @api Cache-Control "public, max-age=30, must-revalidate"
+
+	reverse_proxy app:8000
+}

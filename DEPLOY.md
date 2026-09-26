@@ -16,6 +16,11 @@ Two halves that meet at one file.
 **Total hosting cost: $0.** Vercel Hobby and R2's free tier both cover this
 comfortably.
 
+> For single-host server deployments running the crawler + API 24/7:
+> - **[Hetzner Cloud (deploy/HETZNER.md)](deploy/HETZNER.md)** — **Recommended** (CX23: 4 GB RAM, 40 GB NVMe, Docker Compose + Caddy, ~€5.99/mo)
+> - **[Fly.io (deploy/FLY.md)](deploy/FLY.md)** — Managed container platform (~$8.70/mo)
+> - **[Oracle Cloud (deploy/ORACLE.md)](deploy/ORACLE.md)** — Always Free Tier ($0/mo)
+
 Why split it this way: a Vercel function is killed after 300s, so it cannot
 host a crawler that runs forever, and it cannot re-parse 2.5 GB of raw JSON
 on every cold start. Running the crawler on your PC sidesteps both, and is

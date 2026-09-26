@@ -28,6 +28,7 @@ from .paths import DATA_DIR
 from typing import Any, Iterator, Sequence
 
 from .analytics.kills import EnrichedKill, enrich
+from .analytics.rotations import extract_rotations
 from .models import DamageType, Match, Side
 
 DEFAULT_PATH = DATA_DIR / "analytics.db"
@@ -38,6 +39,12 @@ FLAG_TRADE_KILL = 2
 FLAG_FIRST_BLOOD = 4
 FLAG_POST_PLANT = 8
 FLAG_ROUND_WON = 16
+FLAG_SUPPORTED = 32
+FLAG_ISOLATED = 64
+FLAG_CROSSFIRE = 128
+FLAG_ADVANTAGE_DEATH = 256
+FLAG_CLUTCH_KILL = 512
+FLAG_LOW_IMPACT = 1024
 
 SIDE_ID = {Side.NONE: 0, Side.ATTACK: 1, Side.DEFENSE: 2}
 SIDE_NAME = {0: "none", 1: "attack", 2: "defense"}
@@ -122,7 +129,8 @@ CREATE TABLE IF NOT EXISTS kills (
     -- the difference between ~700 MB and ~80 MB. Nullable because the
     -- aggregate data collected before this existed has no attribution.
     killer_pid   INTEGER,
-    victim_pid   INTEGER
+    victim_pid   INTEGER,
+    vw_id        INTEGER                -- victim weapon -> dim.id
 );
 -- One covering index for the hot path: every heatmap query filters on map
 -- first, then narrows. A single composite beats several overlapping ones,
@@ -155,6 +163,16 @@ CREATE INDEX IF NOT EXISTS idx_k_victim ON kills(victim_pid, map_id)
 CREATE INDEX IF NOT EXISTS idx_k_agent   ON kills(ka_id);
 CREATE INDEX IF NOT EXISTS idx_k_weapon  ON kills(weapon_id);
 CREATE INDEX IF NOT EXISTS idx_k_ability ON kills(ability_id, ka_id);
+-- Covering index for filtered heatmaps and insights. The filters beyond
+-- map (weapon, agent, side, ...) are in no map-led index, so every one of
+-- a map's ~1.1M rows was fetched from the table just to test them -- twice,
+-- for the COUNT and again for the sample. With them all in one index the
+-- COUNT and the breakdowns never touch the table, and the sample only
+-- fetches the rows it returns. Measured on 8.8M rows: Haven + Vandal went
+-- from 5.8s to 0.9s, Haven + attack from 4.6s to 0.26s. Costs ~270 MB.
+CREATE INDEX IF NOT EXISTS idx_k_heat ON kills(
+    map_id, side, weapon_id, ka_id, va_id, vw_id, ability_id, dmg_type,
+    avg_tier, act_id, t_ms, round_num, flags, m);
 
 CREATE TABLE IF NOT EXISTS plants (
     m          INTEGER NOT NULL,
@@ -171,6 +189,26 @@ CREATE TABLE IF NOT EXISTS plants (
 );
 CREATE INDEX IF NOT EXISTS idx_p_main ON plants(map_id, avg_tier, act_id);
 CREATE INDEX IF NOT EXISTS idx_p_m    ON plants(m);
+
+CREATE TABLE IF NOT EXISTS rotations (
+    m            INTEGER NOT NULL,
+    map_id       INTEGER NOT NULL,
+    round_num    INTEGER NOT NULL,
+    side         INTEGER NOT NULL,
+    player_pid   INTEGER,
+    agent_id     INTEGER,
+    team         TEXT,
+    from_zone    TEXT NOT NULL,
+    to_zone      TEXT NOT NULL,
+    t_start_ms   INTEGER NOT NULL,
+    t_end_ms     INTEGER NOT NULL,
+    won          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rot_map ON rotations(map_id, side);
+CREATE INDEX IF NOT EXISTS idx_rot_player ON rotations(player_pid, map_id) WHERE player_pid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_rot_agent ON rotations(agent_id, player_pid) WHERE agent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_rot_match ON rotations(m, team);
+CREATE INDEX IF NOT EXISTS idx_rot_m_rd ON rotations(m, round_num);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -224,7 +262,7 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(kills)")}
     if not columns:
         return applied  # fresh database; SCHEMA builds it correctly
-    for column in ("killer_pid", "victim_pid"):
+    for column in ("killer_pid", "victim_pid", "vw_id"):
         if column not in columns:
             # NULL for every existing row: attribution for those comes
             # from the backfill, which re-reads the raw payloads.
@@ -235,6 +273,51 @@ def _migrate(conn: sqlite3.Connection) -> list[str]:
         if idx_name in indexes:
             conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
             applied.append(f"DROP {idx_name}")
+    if "idx_k_heat" not in indexes:
+        # Built here rather than left to SCHEMA, which only runs when some
+        # migration applied. Minutes on a large database: start.sh runs
+        # this once, before the API and crawler come up.
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_k_heat ON kills(
+                map_id, side, weapon_id, ka_id, va_id, vw_id, ability_id, dmg_type,
+                avg_tier, act_id, t_ms, round_num, flags, m)"""
+        )
+        applied.append("CREATE idx_k_heat")
+    tables ={row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "rotations" not in tables:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS rotations (
+                m            INTEGER NOT NULL,
+                map_id       INTEGER NOT NULL,
+                round_num    INTEGER NOT NULL,
+                side         INTEGER NOT NULL,
+                player_pid   INTEGER,
+                agent_id     INTEGER,
+                team         TEXT,
+                from_zone    TEXT NOT NULL,
+                to_zone      TEXT NOT NULL,
+                t_start_ms   INTEGER NOT NULL,
+                t_end_ms     INTEGER NOT NULL,
+                won          INTEGER NOT NULL
+            )"""
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rot_map ON rotations(map_id, side)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rot_player ON rotations(player_pid, map_id) WHERE player_pid IS NOT NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rot_agent ON rotations(agent_id, player_pid) WHERE agent_id IS NOT NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rot_match ON rotations(m, team)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rot_m_rd ON rotations(m, round_num)")
+        applied.append("CREATE TABLE rotations")
+    else:
+        rot_cols = {row[1] for row in conn.execute("PRAGMA table_info(rotations)")}
+        if "agent_id" not in rot_cols:
+            conn.execute("ALTER TABLE rotations ADD COLUMN agent_id INTEGER")
+            applied.append("rotations.agent_id")
+        if "team" not in rot_cols:
+            conn.execute("ALTER TABLE rotations ADD COLUMN team TEXT")
+            applied.append("rotations.team")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rot_agent ON rotations(agent_id, player_pid) WHERE agent_id IS NOT NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rot_match ON rotations(m, team)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rot_m_rd ON rotations(m, round_num)")
     return applied
 
 
@@ -248,6 +331,7 @@ class AnalyticsDB:
         self._dim_cache: dict[str, dict[str, int]] = {}
         self._stats_cache: dict[str, Any] | None = None
         self._stats_cache_time: float = 0.0
+        self._prime_stats_cache()
         if not read_only:
             with self.connect() as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
@@ -263,6 +347,26 @@ class AnalyticsDB:
                 if applied or "matches" not in tables or "kills" not in tables:
                     conn.executescript(SCHEMA)
 
+    def _prime_stats_cache(self) -> None:
+        try:
+            with self.connect() as conn:
+                row = conn.execute(
+                    "SELECT value FROM facet_cache WHERE key = 'facets'"
+                ).fetchone()
+            if row:
+                data = json.loads(row["value"])
+                maps = data.get("maps", [])
+                if maps:
+                    self._stats_cache = {
+                        "matches": sum(m.get("matches", 0) for m in maps),
+                        "kills": sum(m.get("kills", 0) for m in maps),
+                        "plants": 0,
+                        "generated_at": self.get_meta("generated_at"),
+                    }
+                    self._stats_cache_time = time.monotonic()
+        except Exception:
+            pass
+
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
         if conn is None:
@@ -275,8 +379,8 @@ class AnalyticsDB:
             else:
                 conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
                 conn.execute("PRAGMA synchronous=NORMAL")
-            # 16MB page cache per thread (bounded for 512MB VM across 6 threads = ~96MB max)
-            conn.execute("PRAGMA cache_size=-16000")
+            # 4MB page cache per thread (bounded across 6 threads = ~24MB max)
+            conn.execute("PRAGMA cache_size=-4000")
             conn.execute("PRAGMA mmap_size=0")
             conn.execute("PRAGMA busy_timeout=15000")
             conn.row_factory = sqlite3.Row
@@ -404,8 +508,11 @@ class AnalyticsDB:
             ).fetchone()["id"]
 
             # Re-ingesting a match replaces its rows rather than duplicating.
+            del_k = conn.execute("SELECT COUNT(*) n FROM kills WHERE m = ?", (m,)).fetchone()["n"]
+            del_p = conn.execute("SELECT COUNT(*) n FROM plants WHERE m = ?", (m,)).fetchone()["n"]
             conn.execute("DELETE FROM kills WHERE m = ?", (m,))
             conn.execute("DELETE FROM plants WHERE m = ?", (m,))
+            conn.execute("DELETE FROM rotations WHERE m = ?", (m,))
 
             kill_rows = []
             for ek in rows:
@@ -426,6 +533,12 @@ class AnalyticsDB:
                     | (FLAG_FIRST_BLOOD if ek.first_blood else 0)
                     | (FLAG_POST_PLANT if ek.post_plant else 0)
                     | (FLAG_ROUND_WON if ek.round_won else 0)
+                    | (FLAG_SUPPORTED if ek.supported else 0)
+                    | (FLAG_ISOLATED if ek.isolated else 0)
+                    | (FLAG_CROSSFIRE if ek.crossfire else 0)
+                    | (FLAG_ADVANTAGE_DEATH if ek.advantage_death else 0)
+                    | (FLAG_CLUTCH_KILL if ek.clutch_kill else 0)
+                    | (FLAG_LOW_IMPACT if ek.low_impact else 0)
                 )
                 kill_rows.append(
                     (
@@ -445,18 +558,41 @@ class AnalyticsDB:
                         flags,
                         self._dim_id(conn, "player", k.killer_puuid or None),
                         self._dim_id(conn, "player", k.victim_puuid or None),
+                        self._dim_id(conn, "weapon", k.victim_weapon_name or None),
                     )
                 )
 
             plant_rows = []
             for p in match.plants:
                 px, py = map_info.to_minimap(p.location.x, p.location.y)
-                if not (0.0 <= px <= 1.0 and 0.0 <= py <= 1.0):
+                if not (0.0 <= px <= 1.0 and 0.0 <= vy <= 1.0):
                     continue
                 plant_rows.append(
                     (
                         m, map_id, act_id, avg_tier, p.round_num, p.round_time_ms,
                         p.site, to_pos(px), to_pos(py), int(p.won), int(p.defused),
+                    )
+                )
+
+            rotation_rows = []
+            extracted_rotations = extract_rotations(match, map_info)
+            for er in extracted_rotations:
+                pid = self._dim_id(conn, "player", er.player_puuid or None)
+                agent_id = self._dim_id(conn, "agent", er.agent or None)
+                rotation_rows.append(
+                    (
+                        m,
+                        map_id,
+                        er.round_num,
+                        er.side,
+                        pid,
+                        agent_id,
+                        er.team or None,
+                        er.from_zone,
+                        er.to_zone,
+                        er.t_start_ms,
+                        er.t_end_ms,
+                        er.won,
                     )
                 )
 
@@ -467,15 +603,28 @@ class AnalyticsDB:
                     """INSERT INTO kills (
                            m, map_id, act_id, avg_tier, round_num, t_ms, side,
                            ka_id, va_id, weapon_id, ability_id, dmg_type,
-                           vx, vy, kx, ky, flags, killer_pid, victim_pid
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           vx, vy, kx, ky, flags, killer_pid, victim_pid, vw_id
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     kill_rows,
                 )
             if plant_rows:
                 conn.executemany(
                     "INSERT INTO plants VALUES (?,?,?,?,?,?,?,?,?,?,?)", plant_rows
                 )
-        self._stats_cache = None
+            if rotation_rows:
+                conn.executemany(
+                    """INSERT INTO rotations (
+                           m, map_id, round_num, side, player_pid, agent_id, team,
+                           from_zone, to_zone, t_start_ms, t_end_ms, won
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    rotation_rows,
+                )
+        if self._stats_cache is not None:
+            if del_k == 0:
+                self._stats_cache["matches"] = self._stats_cache.get("matches", 0) + 1
+            self._stats_cache["kills"] = self._stats_cache.get("kills", 0) + len(kill_rows) - del_k
+            self._stats_cache["plants"] = self._stats_cache.get("plants", 0) + len(plant_rows) - del_p
+            self._stats_cache_time = time.monotonic()
         return len(kill_rows)
 
     # --- tracked players -----------------------------------------------
@@ -583,18 +732,21 @@ class AnalyticsDB:
         conn.isolation_level = previous
 
     # --- query ---------------------------------------------------------
-    def stats(self, live: bool = False, max_age_s: float = 300.0) -> dict[str, Any]:
-        """Dataset totals. Cached for up to `max_age_s` to protect health checks
-        and frequent polls from repeating multi-million-row COUNT(*) scans.
-        Pass `live=True` to bypass cache.
+    def stats(self, live: bool = False, max_age_s: float | None = None) -> dict[str, Any]:
+        """Dataset totals. Cached in memory from facet_cache / crawler updates
+        so calls return in <1ms without running expensive multi-million-row scans.
+        Pass `live=True` to explicitly force a live table scan.
         """
         now = time.monotonic()
-        if (
-            not live
-            and self._stats_cache is not None
-            and (now - self._stats_cache_time) < max_age_s
-        ):
-            return dict(self._stats_cache)
+        if not live and self._stats_cache is not None:
+            if max_age_s is None or (now - self._stats_cache_time) < max_age_s:
+                return dict(self._stats_cache)
+
+        if not live:
+            self._prime_stats_cache()
+            if self._stats_cache is not None:
+                return dict(self._stats_cache)
+
         with self.connect() as conn:
             m = conn.execute("SELECT COUNT(*) n FROM matches").fetchone()["n"]
             k = conn.execute("SELECT COUNT(*) n FROM kills").fetchone()["n"]
@@ -618,6 +770,15 @@ class AnalyticsDB:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (json.dumps(data),),
             )
+        maps = data.get("maps", [])
+        if maps:
+            self._stats_cache = {
+                "matches": sum(m.get("matches", 0) for m in maps),
+                "kills": sum(m.get("kills", 0) for m in maps),
+                "plants": 0,
+                "generated_at": self.get_meta("generated_at"),
+            }
+            self._stats_cache_time = time.monotonic()
         return data
 
     def facets(self) -> dict[str, Any]:
@@ -626,22 +787,15 @@ class AnalyticsDB:
         Served from the precomputed cache when present; falls back to
         computing on demand so an older database still works.
         """
-        cached_val = None
         try:
             with self.connect() as conn:
                 row = conn.execute(
                     "SELECT value FROM facet_cache WHERE key = 'facets'"
                 ).fetchone()
-            if row:
-                cached = json.loads(row["value"])
-                if not self._facets_are_stale(cached):
-                    return cached
-                cached_val = cached
+            if row and row["value"]:
+                return json.loads(row["value"])
         except (sqlite3.Error, json.JSONDecodeError):
             pass  # missing or corrupt cache: fall through and compute
-
-        if self.read_only and cached_val is not None:
-            return cached_val
 
         if not self.read_only:
             try:

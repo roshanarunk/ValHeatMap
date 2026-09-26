@@ -14,17 +14,22 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import gzip
 import inspect
+import json
 import os
 import threading
 import time
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -64,6 +69,7 @@ load_env()
 # traffic pattern and GC timing.
 POOL_SIZE = 6
 _pool = ThreadPoolExecutor(max_workers=POOL_SIZE, thread_name_prefix="query")
+_health_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="health")
 
 T = TypeVar("T")
 
@@ -90,7 +96,102 @@ def pooled(fn: Callable[..., T]) -> Callable[..., Any]:
     return wrapper
 
 
-app = FastAPI(title="ValHeatMap API", version="2.0.0")
+# On serverless this downloads a published snapshot into the writable temp
+# dir; locally it is just the file on disk.
+_DB_PATH = ensure_local_db()
+_READ_ONLY = os.environ.get("VALHEATMAP_READ_ONLY", "").lower() in {"1", "true", "yes"}
+_db = AnalyticsDB(_DB_PATH, read_only=_READ_ONLY)
+_engine = QueryEngine(_db)
+
+
+def _warm_core_queries() -> dict[str, Any]:
+    """Pre-warm query engine cache for all default map views.
+    Ensures instant map switching across all 11 maps without saturating
+    disk I/O or starving live HTTP requests.
+    """
+    global _engine, _db
+    t0 = time.monotonic()
+    warmed = 0
+
+    # Ensure Warden is registered in dim table so its ID exists
+    try:
+        with _db.connect() as conn:
+            _db._dim_id(conn, "weapon", "Warden")
+    except Exception:
+        pass
+
+    try:
+        known_maps = set(_db.dim_names("map").values())
+    except Exception:
+        known_maps = set()
+
+    core_order = [
+        "Ascent", "Bind", "Haven", "Split", "Lotus",
+        "Sunset", "Breeze", "Icebox", "Abyss", "Pearl", "Fracture"
+    ]
+    map_names = [m for m in core_order if m in known_maps] or core_order
+
+    for m in map_names:
+        try:
+            f = Filters(map_name=m)
+            info = get_map(m)
+            if info is None or not info.has_calibration:
+                continue
+            _cached_body("kills", f, lambda: _kills_payload(f, info))
+            warmed += 1
+        except Exception:
+            pass
+        time.sleep(0.3)  # Cooperative pause for disk I/O and live requests
+
+    elapsed = round(time.monotonic() - t0, 2)
+    print(f"[cache_warmer] Complete: pre-warmed {warmed} default maps in {elapsed}s", flush=True)
+    return {"warmed": warmed, "seconds": elapsed}
+
+
+async def _background_warmer_loop() -> None:
+    # Brief initial pause to let server bind and health checks pass
+    await asyncio.sleep(2.0)
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _warm_core_queries)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"[cache_warmer] warming error: {exc}")
+
+        try:
+            await asyncio.sleep(1200)  # Refresh every 20 minutes
+        except asyncio.CancelledError:
+            break
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    warmer_task = None
+    if (
+        os.environ.get("VALHEATMAP_WARM_CACHE", "1").lower() not in {"0", "false", "no"}
+        and "pytest" not in sys.modules
+        and not os.environ.get("PYTEST_CURRENT_TEST")
+    ):
+        warmer_task = asyncio.create_task(_background_warmer_loop())
+    try:
+        yield
+    finally:
+        if warmer_task is not None:
+            warmer_task.cancel()
+            try:
+                await warmer_task
+            except asyncio.CancelledError:
+                pass
+
+
+app = FastAPI(title="ValHeatMap API", version="2.0.0", lifespan=lifespan)
+
+# A heatmap is 15k points: 4.7 MB of JSON, 0.38 MB gzipped. Neither
+# uvicorn nor Fly's proxy compresses on its own. Responses that arrive
+# already gzipped (the cached ones below) pass through untouched.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,13 +211,6 @@ async def add_cache_headers(request: Request, call_next: Callable[..., Any]) -> 
         elif "cache-control" not in response.headers:
             response.headers["Cache-Control"] = "public, max-age=60"
     return response
-
-# On serverless this downloads a published snapshot into the writable temp
-# dir; locally it is just the file on disk.
-_DB_PATH = ensure_local_db()
-_READ_ONLY = os.environ.get("VALHEATMAP_READ_ONLY", "").lower() in {"1", "true", "yes"}
-_db = AnalyticsDB(_DB_PATH, read_only=_READ_ONLY)
-_engine = QueryEngine(_db)
 
 # How often a warm instance re-checks the published snapshot. A Vercel
 # instance can live for hours, so without this it would serve whatever it
@@ -198,12 +292,12 @@ async def _source_error(_: Request, exc: clients.SourceError) -> JSONResponse:
 # --- meta ---------------------------------------------------------------
 def _health_payload() -> dict[str, Any]:
     _db.ping()
-    stats = _db.stats(max_age_s=300.0)
+    stats = _db.stats()
     return {
         "status": "ok",
-        "matches": stats["matches"],
-        "kills": stats["kills"],
-        "generated_at": stats["generated_at"],
+        "matches": stats.get("matches", 0),
+        "kills": stats.get("kills", 0),
+        "generated_at": stats.get("generated_at"),
         "read_only": _READ_ONLY,
         "live_sources": clients.available_sources(),
     }
@@ -212,17 +306,12 @@ def _health_payload() -> dict[str, Any]:
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     """Fly polls this every 30s and pulls the machine out of rotation on
-    a 5s timeout, so it must never wait behind the same pool as the
-    heavier player/kills queries. Everything else in this file that does
-    sync DB work is a plain `def`, which Starlette runs on its (now
-    6-thread) pool -- deliberately capped, so a burst of those can still
-    fill it and make anything else waiting on that same pool queue. This
-    one instead uses asyncio's own default executor via run_in_executor,
-    which is a second, separate pool that nothing else here touches, so
-    it is never behind whatever the shared one is doing.
+    timeout, so it must never wait behind the same pool as the
+    heavier player/kills queries. It runs on a dedicated _health_pool
+    so it answers instantly regardless of query traffic.
     """
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _health_payload)
+    return await loop.run_in_executor(_health_pool, _health_payload)
 
 
 @app.get("/api/facets")
@@ -282,16 +371,32 @@ def map_detail(map_name: str) -> dict[str, Any]:
 
 
 # --- core analytics -----------------------------------------------------
-@app.get("/api/kills")
-@pooled
-def kills_endpoint(request: Request) -> dict[str, Any]:
-    """Filtered kill points in minimap space, plus headline stats.
+def _cached_body(kind: str, f: Filters, build: Callable[[], dict[str, Any]]) -> bytes:
+    """The gzipped JSON for this response, from the engine's cache or built now.
 
-    Filters arrive as query parameters, e.g.
-    `?map_name=Ascent&agents=Jett&ranks=radiant&acts=e11a5&time_end=30000`.
+    Serialised the way FastAPI's JSONResponse does it, so a cached
+    response is byte-for-byte what the route would have returned.
     """
-    f = _filters(request)
-    info = _require_map(f)
+    def encode() -> bytes:
+        raw = json.dumps(
+            build(), ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        ).encode("utf-8")
+        return gzip.compress(raw, compresslevel=6)
+
+    return _engine.cached(_engine.cache_key(kind, f), encode)
+
+
+def _gzip_response(request: Request, body: bytes) -> Response:
+    if "gzip" in request.headers.get("accept-encoding", ""):
+        return Response(
+            body,
+            media_type="application/json",
+            headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"},
+        )
+    return Response(gzip.decompress(body), media_type="application/json")
+
+
+def _kills_payload(f: Filters, info: Any) -> dict[str, Any]:
     result = _engine.kill_points(f)
     return {
         "map": info.as_dict(),
@@ -303,22 +408,39 @@ def kills_endpoint(request: Request) -> dict[str, Any]:
     }
 
 
+@app.get("/api/kills")
+@pooled
+def kills_endpoint(request: Request) -> Response:
+    """Filtered kill points in minimap space, plus headline stats.
+
+    Filters arrive as query parameters, e.g.
+    `?map_name=Ascent&agents=Jett&ranks=radiant&acts=e11a5&time_end=30000`.
+    """
+    f = _filters(request)
+    info = _require_map(f)
+    return _gzip_response(request, _cached_body("kills", f, lambda: _kills_payload(f, info)))
+
+
 @app.get("/api/utility")
 @pooled
-def utility_endpoint(request: Request) -> dict[str, Any]:
+def utility_endpoint(request: Request) -> Response:
     """Kills finished by damaging abilities."""
     f = _filters(request)
     f.utility_only = True
     info = _require_map(f)
-    result = _engine.kill_points(f)
-    return {
-        "map": info.as_dict(),
-        "points": result["points"],
-        "total": result["total"],
-        "sampled": result["sampled"],
-        "stats": result["stats"],
-        "abilities": _engine.ability_breakdown(f),
-    }
+
+    def build() -> dict[str, Any]:
+        result = _engine.kill_points(f)
+        return {
+            "map": info.as_dict(),
+            "points": result["points"],
+            "total": result["total"],
+            "sampled": result["sampled"],
+            "stats": result["stats"],
+            "abilities": _engine.ability_breakdown(f),
+        }
+
+    return _gzip_response(request, _cached_body("utility", f, build))
 
 
 @app.get("/api/plants")
@@ -369,6 +491,41 @@ def plants_endpoint(
             "spots": len(spots),
         },
     }
+
+
+@app.get("/api/rotations")
+@pooled
+def rotations_endpoint(
+    map_name: str | None = Query(None, description="Map display name or ID"),
+    side: str = Query("defense", description="defense | attack | all"),
+    player: str | None = Query(None, description="PUUID or name#tag"),
+    agent: str | None = Query(None, description="Agent display name"),
+    match_id: str | None = Query(None, description="Match ID to scope rotations to a single match"),
+    team: str | None = Query(None, description="Team side or name (Red / Blue)"),
+    round_num: int | None = Query(None, description="Specific round number"),
+    min_count: int = Query(5, ge=1, le=1000, description="Minimum transition count threshold"),
+    focus_zone: str | None = Query(None, description="Optional zone to filter on"),
+) -> dict[str, Any]:
+    """Macro-rotation transition graph between map zones."""
+    if not map_name and not match_id:
+        raise HTTPException(400, "Either map_name or match_id must be provided.")
+    res = _engine.rotations(
+        map_name=map_name,
+        side=side,
+        player=player,
+        agent=agent,
+        match_id=match_id,
+        team=team,
+        round_num=round_num,
+        min_count=min_count,
+        focus_zone=focus_zone,
+    )
+    resolved_map = res.get("map_name") or map_name
+    if resolved_map:
+        info = get_map(resolved_map)
+        if info is not None and info.has_calibration:
+            res["map"] = info.as_dict()
+    return res
 
 
 @app.get("/api/insights")
@@ -424,7 +581,7 @@ async def register_player(payload: dict[str, Any] = Body(...)) -> dict[str, Any]
         account.get("tag") or tag,
         account.get("region"),
     )
-    _engine.invalidate()  # a new player id was interned
+    _engine.invalidate(players_only=True)  # a new player id was interned
     return {"player": _player_payload(record["puuid"]), "new": True}
 
 
@@ -492,7 +649,7 @@ async def refresh_player(riot_id: str) -> dict[str, Any]:
         raise HTTPException(502, f"Refresh failed: {exc}") from exc
 
     _db.mark_player_crawled(record["puuid"], stored)
-    _engine.invalidate()
+    _engine.invalidate(players_only=True)
     payload = _player_payload(record["puuid"])
     return {
         "player": payload,
@@ -528,6 +685,156 @@ def player_detail(riot_id: str, request: Request) -> dict[str, Any]:
     # Touch it: the crawler uses last_seen_at to keep active players fresh.
     _db.track_player(record["puuid"], record["name"], record["tag"], record.get("region"))
     return _player_payload(record["puuid"], _filters(request))
+
+
+# --- scouting -----------------------------------------------------------
+async def _resolve_and_scout(
+    riot_id: str,
+    map_name: str,
+    agent: str | None = None,
+) -> dict[str, Any]:
+    from .analytics.scout import scout_player
+
+    try:
+        name, tag = _split_riot_id(riot_id)
+    except HTTPException as e:
+        return {
+            "riot_id": riot_id,
+            "found": False,
+            "has_data": False,
+            "error": str(e.detail),
+            "matches_on_map": 0,
+            "map_name": map_name,
+            "agent": agent or "",
+            "top_agents": [],
+            "tactical_tags": [],
+            "counter_tips": ["Invalid Riot ID format (must be Name#TAG)."],
+            "defense_rotations": [],
+            "attack_rotations": [],
+            "first_blood_points": [],
+        }
+
+    # Check if tracked
+    record = _db.tracked_player(name, tag)
+    puuid = record["puuid"] if record else None
+    region = record.get("region") if record else None
+
+    # If not tracked, try resolving via HenrikDev
+    if not record and not _READ_ONLY and clients.henrik_key():
+        try:
+            account = await clients.henrik_account(name, tag)
+            puuid = account.get("puuid")
+            region = account.get("region") or "na"
+            if puuid:
+                record = _db.track_player(
+                    puuid,
+                    account.get("name") or name,
+                    account.get("tag") or tag,
+                    region,
+                )
+                _engine.invalidate(players_only=True)
+        except Exception:
+            pass
+
+    if not puuid:
+        # Check tracked_players table directly
+        with _db.connect() as conn:
+            p_row = conn.execute(
+                "SELECT puuid, region FROM tracked_players WHERE LOWER(name)=LOWER(?) AND LOWER(tag)=LOWER(?)",
+                (name, tag),
+            ).fetchone()
+            if p_row:
+                puuid = p_row["puuid"]
+                region = p_row["region"]
+
+    if not puuid:
+        return {
+            "riot_id": f"{name}#{tag}",
+            "name": name,
+            "tag": tag,
+            "found": False,
+            "has_data": False,
+            "error": f"Player {name}#{tag} not found in database or Riot upstream.",
+            "matches_on_map": 0,
+            "map_name": map_name,
+            "agent": agent or "",
+            "top_agents": [],
+            "tactical_tags": [],
+            "counter_tips": ["Opponent not found. Check spelling of Name#TAG."],
+            "defense_rotations": [],
+            "attack_rotations": [],
+            "first_blood_points": [],
+        }
+
+    loop = asyncio.get_running_loop()
+    summary = await loop.run_in_executor(
+        _pool,
+        functools.partial(_engine.player_summary, puuid, Filters(map_name=map_name)),
+    )
+    if summary.get("matches", 0) == 0 and not _READ_ONLY and clients.henrik_key() and record and not record.get("crawled_at"):
+        from .crawler import Crawler
+        crawler = Crawler(api_key=clients.henrik_key(), analytics=_db, region=region or "na")
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0)) as client:
+                await crawler.crawl_player(client, puuid, size=5, region=region)
+                _db.mark_player_crawled(puuid, 5)
+                _engine.invalidate(players_only=True)
+        except Exception:
+            pass
+
+    report = await loop.run_in_executor(
+        _pool,
+        functools.partial(
+            scout_player,
+            _db,
+            _engine,
+            puuid,
+            name,
+            tag,
+            region,
+            map_name,
+            agent,
+        ),
+    )
+    return report
+
+
+@app.post("/api/scout")
+async def scout_lobby_endpoint(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Scout up to 5 opponents for an upcoming match on a map."""
+    from .analytics.scout import generate_lobby_summary
+
+    map_name = str(payload.get("map_name") or "Ascent")
+    opponents_raw = payload.get("opponents") or []
+    if not isinstance(opponents_raw, list):
+        raise HTTPException(400, "opponents must be a list of player objects.")
+
+    opponents = opponents_raw[:5]
+    reports = []
+    for opp in opponents:
+        rid = str(opp.get("riot_id") or "").strip()
+        if not rid:
+            continue
+        ag = opp.get("agent") or None
+        rep = await _resolve_and_scout(rid, map_name, ag)
+        reports.append(rep)
+
+    summary = generate_lobby_summary(reports)
+    return {
+        "map_name": map_name,
+        "lobby_summary": summary,
+        "reports": reports,
+    }
+
+
+@app.get("/api/scout/player")
+async def scout_player_endpoint(
+    riot_id: str = Query(..., description="Name#TAG"),
+    map_name: str = Query("Ascent", description="Map name"),
+    agent: str | None = Query(None, description="Optional agent name"),
+) -> dict[str, Any]:
+    """Single opponent scouting report."""
+    return await _resolve_and_scout(riot_id, map_name, agent)
 
 
 @app.get("/api/match/{match_id}")
@@ -705,6 +1012,29 @@ async def debug_refresh() -> dict[str, Any]:
     _maybe_refresh()
     after = _db.stats().get("matches", 0)
     return {"before": before, "after": after, "changed": after != before}
+
+
+@app.post("/api/debug/warm")
+async def debug_warm() -> dict[str, Any]:
+    """Manually trigger a cache warm run."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _warm_core_queries)
+
+
+@app.get("/api/debug/cache")
+async def debug_cache() -> dict[str, Any]:
+    """Return status of in-memory query cache."""
+    with _engine._cache_lock:
+        entries = list(_engine._query_cache.items())
+        return {
+            "entries": len(entries),
+            "max_entries": _engine._cache_max_entries,
+            "bytes": sum(len(body) for _, body in entries),
+            "cached_queries": [
+                {"kind": k[0], "where": k[1], "args": list(k[2]), "player": k[4]}
+                for k, _ in entries
+            ],
+        }
 
 
 # --- static frontend ----------------------------------------------------

@@ -29,6 +29,15 @@
    }
   },
   {
+   "uuid": "8db0a1bf-4a50-832a-4566-faaaa6d250ca",
+   "displayName": "Warden",
+   "category": "EEquippableCategory::Rifle",
+   "displayIcon": "https://media.valorant-api.com/weapons/8db0a1bf-4a50-832a-4566-faaaa6d250ca/displayicon.png",
+   "shopData": {
+    "categoryText": "Rifles"
+   }
+  },
+  {
    "uuid": "ae3de142-4d85-2547-dd26-4e90bed35cf7",
    "displayName": "Bulldog",
    "category": "EEquippableCategory::Rifle",

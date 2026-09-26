@@ -29,6 +29,7 @@ export interface KillPoint {
   killer_team: string
   side: 'attack' | 'defense' | 'none'
   weapon: string
+  victim_weapon?: string
   ability: string
   type: 'weapon' | 'ability' | 'bomb' | 'fall' | 'unknown'
   traded: boolean
@@ -326,3 +327,172 @@ export interface InsightsResponseV2 {
   abilities: { ability: string; agent: string; kills: number }[]
   histogram: { t: number; count: number }[]
 }
+
+export interface RotationZone {
+  id: string
+  name: string
+  x: number
+  y: number
+  callout_count: number
+  outgoing_count?: number
+  incoming_count?: number
+  total_traffic?: number
+}
+
+export interface TransitionAgent {
+  agent: string
+  icon: string
+  role?: string
+  count: number
+}
+
+export interface RotationTransition {
+  from_zone: string
+  to_zone: string
+  count: number
+  outgoing_share: number
+  incoming_share: number
+  avg_duration_s: number
+  rounds_won: number
+  win_rate: number
+  agents?: TransitionAgent[]
+}
+
+export interface MatchPlayer {
+  puuid: string
+  name: string
+  agent: string
+  role: string
+  icon: string
+  team: string
+}
+
+export interface RoundSetup {
+  team: string
+  agent: string
+  icon: string
+  role: string
+  from_zone: string
+  to_zone: string
+  start_s: number
+  won: boolean
+}
+
+export interface RotationsResponse {
+  map_name: string
+  side: 'defense' | 'attack' | 'all'
+  player: string | null
+  agent?: string | null
+  match_id?: string | null
+  team?: string | null
+  round_num?: number | null
+  available_agents?: string[]
+  match_players?: MatchPlayer[]
+  round_setups?: RoundSetup[]
+  total_transitions: number
+  zones: RotationZone[]
+  transitions: RotationTransition[]
+  map: MapInfo
+}
+
+export interface TacticalTag {
+  tag: string
+  type: 'threat' | 'weakness' | 'playstyle'
+  desc: string
+}
+
+export interface ScoutAgentStat {
+  agent: string
+  role: string
+  icon: string
+  matches: number
+  kills: number
+  deaths: number
+  kd: number
+  first_bloods: number
+}
+
+export interface ScoutCorridor {
+  from_zone: string
+  to_zone: string
+  count: number
+  win_rate: number
+  avg_duration_s: number
+  side: string
+}
+
+export interface ScoutFirstBloodPoint {
+  round: number
+  t_ms: number
+  side: string
+  is_killer: boolean
+  x: number
+  y: number
+}
+
+export interface ScoutReport {
+  riot_id: string
+  puuid: string
+  name: string
+  tag: string
+  region: string
+  found: boolean
+  has_data: boolean
+  matches_on_map: number
+  map_name: string
+  agent: string
+  agent_icon: string
+  agent_role: string
+  kd: number
+  kills: number
+  deaths: number
+  opening_duels: number
+  first_bloods: number
+  first_deaths: number
+  opening_win_rate: number
+  trade_rate: number
+  clutch_win_rate: number
+  clutches_won: number
+  clutches_faced: number
+  advantage_throw_rate: number
+  advantage_rounds_thrown: number
+  support_rate: number
+  impact_kill_rate: number
+  top_agents: ScoutAgentStat[]
+  tactical_tags: TacticalTag[]
+  counter_tips: string[]
+  defense_rotations: ScoutCorridor[]
+  attack_rotations: ScoutCorridor[]
+  first_blood_points: ScoutFirstBloodPoint[]
+  error?: string
+}
+
+export interface ScoutLobbyThreat {
+  riot_id: string
+  agent: string
+  agent_icon: string
+  kd: number
+  opening_win_rate: number
+  reason: string
+}
+
+export interface ScoutLobbyWeakLink {
+  riot_id: string
+  agent: string
+  agent_icon: string
+  trade_rate: number
+  reason: string
+}
+
+export interface ScoutLobbySummary {
+  top_threat: ScoutLobbyThreat | null
+  weak_link: ScoutLobbyWeakLink | null
+  playstyle_notes: string[]
+}
+
+export interface ScoutResponse {
+  map_name: string
+  lobby_summary: ScoutLobbySummary
+  reports: ScoutReport[]
+}
+

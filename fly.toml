@@ -38,7 +38,9 @@ primary_region = 'iad'
     grace_period = '1m0s'
     method = 'GET'
     path = '/api/health'
+    unhealthy_threshold = 3
+    healthy_threshold = 1
 
 [[vm]]
   size = 'shared-cpu-1x'
-  memory = '512mb'
+  memory = '1024mb'
