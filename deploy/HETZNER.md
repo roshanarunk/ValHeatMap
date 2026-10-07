@@ -1,227 +1,227 @@
-# Running ValHeatMap on Hetzner Cloud (CX23)
+# Running ValHeatMap on Hetzner Cloud
 
-One high-performance cloud VPS runs everything: the FastAPI backend, continuous background crawler, and Caddy reverse proxy for automatic Let's Encrypt HTTPS.
+One VPS runs everything: the FastAPI backend, the background crawler, and
+Caddy as a reverse proxy with automatic Let's Encrypt HTTPS.
 
 ```
-                  Hetzner Cloud CX23 (4 GB RAM, 40 GB NVMe)
+              Hetzner Cloud CPX21, Ashburn (3 vCPU, 4 GB RAM, 80 GB disk)
 ┌────────────────────────────────────────────────────────────────────────┐
-│                                                                        │
-│   docker-compose                                                       │
+│   docker compose                                                       │
 │   ┌────────────────────────────────────────────────────────────────┐   │
-│   │                                                                │   │
-│   │   valheatmap-crawler ──writes──▶ /data/analytics.db            │   │
-│   │                                          ▲                     │   │
-│   │                                        reads                   │   │
-│   │                                          │                     │   │
-│   │   valheatmap-caddy ────proxy────▶ valheatmap-api               │   │
-│   │   (Auto TLS 80/443)                  (:8000)                   │   │
+│   │   app container                                                │   │
+│   │     crawler ──writes──▶ /data/analytics.db ◀──reads── API :8000│   │
+│   │                                                        ▲       │   │
+│   │   caddy (TLS on 80/443) ─────────proxy─────────────────┘       │   │
 │   └────────────────────────────────────────────────────────────────┘   │
 └────────────────────────────────────────────────────────────────────────┘
                         valostats.roshanarun.com
 ```
 
-### Specs & Cost Comparison
+## Sizing
 
-| Provider | Plan | Monthly Cost | RAM | vCPU | NVMe SSD | Transfer |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Hetzner Cloud** | **CX23** | **€5.99 (~$6.50)** | **4 GB** | **2 vCPU** | **40 GB** | **20 TB** |
-| Fly.io (Previous) | Shared-1x + 20GB vol | ~$8.70 | 1 GB | 1 vCPU | 20 GB | 100 GB |
+As of October 2026 the data is about **21 GB**: `analytics.db` ~13.8 GB
+(including the ~1 GB `idx_k_heat` index), `valheatmap.db` ~0.2 GB, and
+`raw/` ~7 GB. It grows as the crawler runs. Nightly backups keep 3
+compressed copies (~20 GB), and the migration briefly needs room for a
+compressed copy alongside the unpacked one.
 
-You get **4x the RAM** and **double the storage** for less money. With 4 GB of RAM, the app will never face OOM kills.
+**That rules out the 40 GB plans.** Choose from:
+
+| Plan | Location | vCPU | RAM | Disk | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **CPX21** (recommended) | Ashburn, VA | 3 | 4 GB | 80 GB | Same region as Fly's `iad`, close to NA players |
+| CX33 | Nuremberg / Helsinki | 4 | 8 GB | 80 GB | More RAM, but further from NA players |
+
+The CX (cost-optimized) line is EU-only; US locations only offer CPX.
+Check the current monthly price in the console when you create the server.
 
 ---
 
-## 1. Create the Server on Hetzner
+## 1. Create the server
 
 1. Log into the [Hetzner Cloud Console](https://console.hetzner.cloud/).
-2. Click **Create Server**:
-   - **Location**: **Ashburn, VA (US East)** *(matches Fly.io's `iad` region for optimal API latency)* or **Falkenstein / Nuremberg (EU)**.
-   - **Image**: **Ubuntu 24.04** (or select the **Docker CE** image under the *Apps* tab).
-   - **Type**: **Shared vCPU (x86)** → **CX23** (€5.99 / mo).
-   - **SSH Keys**: Add your public SSH key (`~/.ssh/id_rsa.pub` or `id_ed25519.pub`).
+2. **Create Server**:
+   - **Location**: Ashburn, VA
+   - **Image**: Ubuntu 24.04
+   - **Type**: Shared vCPU → **CPX21**
+   - **Backups**: enable it (Hetzner's add-on: daily off-server snapshots for
+     a percentage of the server price). The nightly `backup.sh` copies live
+     on the same disk, so they don't protect against losing the server.
+   - **SSH key**: add your public key (`~\.ssh\id_ed25519.pub`). If you
+     don't have one: `ssh-keygen -t ed25519` in PowerShell.
    - **Name**: `valheatmap`
-3. Click **Create & Buy Now**. Note down the server's **IPv4** and **IPv6** addresses.
+3. **Create & Buy Now**. Note the **IPv4** and **IPv6** addresses.
 
-### Configure Hetzner Cloud Firewall
-Under **Security → Firewalls**, create a firewall rule assigned to your server:
-- **Inbound Rules**:
-  - Accept `TCP` port `22` (SSH)
-  - Accept `TCP` port `80` (HTTP)
-  - Accept `TCP` port `443` (HTTPS)
-- **Outbound Rules**:
-  - Accept all traffic (default)
+### Firewall
+**Security → Firewalls**, create one and apply it to the server:
+- Inbound: TCP 22 (SSH), TCP 80 (HTTP), TCP 443 (HTTPS)
+- Outbound: allow all (default)
 
 ---
 
-## 2. Server Initial Setup
+## 2. Set up the server
 
-SSH into your new server:
-
-```bash
+```powershell
 ssh root@<HETZNER_IP>
 ```
 
-### Install Docker & Docker Compose (if using standard Ubuntu 24.04)
+On the server:
+
 ```bash
-# Update packages
 apt-get update && apt-get upgrade -y
-apt-get install -y curl git ufw
-
-# Install Docker using official script
+apt-get install -y git
 curl -fsSL https://get.docker.com | sh
-
-# Enable and start Docker
 systemctl enable --now docker
-```
 
-### Clone Repository & Configure Environment
-```bash
-# Clone the repository
 git clone https://github.com/roshanarunk/ValHeatMap.git /opt/valheatmap
 cd /opt/valheatmap
-
-# Create your .env file
 cp .env.example .env
-nano .env
+nano .env          # set HENRIK_API_KEY; DOMAIN is already valostats.roshanarun.com
+mkdir -p data
 ```
 
-Ensure `.env` contains your Henrik API key and domain:
-```ini
-HENRIK_API_KEY=HDEV-your-actual-key-here
-HENRIK_RATE_LIMIT=90
-RIOT_REGION=na
-DOMAIN=valostats.roshanarun.com
-VALHEATMAP_DATA_DIR=/data
-VALHEATMAP_READ_ONLY=0
-VALHEATMAP_CRAWLER=1
-```
+Do **not** start the app yet: an empty start creates an empty database
+that the migration would then have to replace.
 
 ---
 
-## 3. Migrate Production Data from Fly.io
+## 3. Move the data from Fly.io
 
-ValHeatMap has over 80,000 matches and 11.9M kills on Fly.io. A dedicated migration script moves the database directly without data loss.
+Run everything here from the repo root on your PC, in PowerShell.
 
-### Option A: Run from your local PC (PowerShell)
-From the repo root on your local computer:
+### 3a. Make room on the Fly volume
+
+The Fly volume is full (20 GB of 20 GB), and the database file there has
+not changed since Sep 26. The export needs ~22 GB of working space, so grow
+the volume first. It's billed per GB for the few days until Fly is shut
+down, and goes away with the app.
+
+```powershell
+fly volumes list                                    # note the vol_... id
+fly volumes extend <vol_id> -s 50
+```
+
+If you skip this, the script stops and prints this command with the
+right size.
+
+### 3b. Run the migration script
 
 ```powershell
 .\deploy\migrate-from-fly.ps1 -HetznerHost root@<HETZNER_IP>
 ```
 
-This automatically:
-1. Flushes SQLite WAL logs on Fly.io (`PRAGMA wal_checkpoint(TRUNCATE)`).
-2. Pauses the Fly.io crawler to guarantee write consistency.
-3. Compresses `analytics.db`, `valheatmap.db`, and `raw/`.
-4. Streams the archive to `/opt/valheatmap/data` on Hetzner and uncompresses it.
+What it does, in order:
 
-### Option B: Manual transfer via SCP
-If you ran `.\deploy\migrate-from-fly.ps1` without `-HetznerHost`, copy the downloaded archive manually:
+1. Checks the Fly volume has enough room, and stops if not.
+2. Sets `VALHEATMAP_CRAWLER=0` on Fly, which restarts the machine with the
+   crawler off, then confirms the crawler is gone. **From here on, Fly
+   collects nothing**, so no data lands on Fly after the copy is taken.
+3. On Fly, snapshots both databases with SQLite's backup API (consistent
+   even while the site serves), gzips them, and tars `raw/`. This runs
+   detached on the machine, so a dropped SSH session doesn't kill it.
+4. Downloads everything to `data\migration\` and checks each file's
+   SHA-256 against the one computed on Fly, then removes the export from
+   the Fly volume.
+5. Uploads to `/opt/valheatmap/data` on Hetzner, checks the SHA-256 values
+   again, unpacks, runs `PRAGMA quick_check`, and confirms the row counts
+   match Fly's.
 
-```powershell
-scp .\data\valheatmap-migration.tar.gz root@<HETZNER_IP>:/opt/valheatmap/data/
-```
+Expect an hour or more, mostly transfer time. The Fly site keeps serving
+throughout, apart from a brief restart in step 2. If anything fails, the
+script stops with a message, and you can safely rerun it.
 
-On the Hetzner server:
-```bash
-cd /opt/valheatmap/data
-tar -xzf valheatmap-migration.tar.gz
-rm valheatmap-migration.tar.gz
-```
-
-Verify the files are present:
-```bash
-ls -lah /opt/valheatmap/data
-# You should see: analytics.db (~2.3 GB), valheatmap.db (~70 MB), and raw/
-```
+Useful options:
+- `-SkipRaw`: leave `raw/` behind (7 GB). The site doesn't need it; only
+  the backfill scripts re-read it.
+- Without `-HetznerHost`: only downloads to `data\migration\`. Rerun with
+  it later to upload.
 
 ---
 
-## 4. Start the Application
+## 4. Start the app
 
-On the Hetzner server:
+On the server:
 
 ```bash
 cd /opt/valheatmap
 docker compose up -d --build
-```
-
-### Check Logs & Health
-```bash
-# Follow logs
-docker compose logs -f
-
-# Verify API health
+docker compose logs -f app          # Ctrl+C to stop following
 curl http://localhost:8000/api/health
 ```
 
-Output should show:
-```json
-{"status":"ok","matches":80700+,"kills":11900000+,"read_only":false,"live_sources":{"henrik":true,"riot":false}}
-```
+The health check should report the same match and kill counts the
+migration script printed, with `"read_only": false`.
 
 ---
 
-## 5. Point Your Domain (Cloudflare DNS)
+## 5. Point the domain at Hetzner
 
-1. Go to your Cloudflare dashboard (or DNS provider).
-2. Update the DNS records for `valostats.roshanarun.com`:
-   - **A** record: point to your Hetzner **IPv4**
-   - **AAAA** record: point to your Hetzner **IPv6**
-   - Proxy status: **DNS only (grey cloud)** for the initial Let's Encrypt certificate issuance.
-3. Caddy will immediately obtain the TLS certificate over ports 80/443.
-4. Test in your browser:
-   ```
-   https://valostats.roshanarun.com/api/health
-   ```
-5. Once HTTPS is working, you can switch Cloudflare's proxy status back to **Proxied (orange cloud)** if desired.
+The domain is currently served by Fly (`fly certs list` shows
+`valostats.roshanarun.com`). In your DNS provider (Cloudflare):
+
+1. Replace the existing record for `valostats` (likely a CNAME to
+   `valheatmap.fly.dev`) with:
+   - **A** → the Hetzner IPv4
+   - **AAAA** → the Hetzner IPv6
+   - Proxy status: **DNS only (grey cloud)** while Caddy gets its
+     certificate.
+2. Caddy requests the certificate automatically once DNS resolves.
+   Watch for it with `docker compose logs -f caddy`.
+3. Check `https://valostats.roshanarun.com/api/health` in a browser.
+4. Optional: switch the record back to **Proxied (orange cloud)**. If you
+   do, set Cloudflare's SSL/TLS mode to **Full (strict)**, or requests
+   will loop.
 
 ---
 
-## 6. Setup Automated Nightly Backups
-
-Configure a nightly cron job to take non-blocking atomic backups of `analytics.db`:
+## 6. Nightly backups
 
 ```bash
-# Make the backup script executable
 chmod +x /opt/valheatmap/deploy/backup.sh
-
-# Open crontab
 crontab -e
 ```
 
-Add the following line to run every night at 4:00 AM:
+Add:
 ```cron
 0 4 * * * /opt/valheatmap/deploy/backup.sh >> /var/log/valheatmap-backup.log 2>&1
 ```
 
-Backups will be saved in `/opt/valheatmap/backups/` and automatically pruned after 7 days.
+Backups go to `/opt/valheatmap/backups/`. The newest 3 of each database
+are kept (`KEEP=3`, ~20 GB at today's size). The script skips the backup,
+rather than filling the disk, if there isn't room for the uncompressed
+snapshot.
 
 ---
 
-## 7. Day-to-Day Operations
+## 7. Day-to-day operations
 
 | Task | Command |
 | :--- | :--- |
-| **Deploy latest code** | `cd /opt/valheatmap && git pull && docker compose up -d --build` |
-| **View app & crawler logs** | `docker compose logs -f app` |
-| **View Caddy access logs** | `docker compose logs -f caddy` |
-| **Restart services** | `docker compose restart` |
-| **Stop application** | `docker compose down` |
-| **Pause crawler** | Set `VALHEATMAP_CRAWLER=0` in `.env` then `docker compose up -d` |
-| **Resume crawler** | Set `VALHEATMAP_CRAWLER=1` in `.env` then `docker compose up -d` |
-| **Check disk usage** | `df -h /opt/valheatmap/data` |
-| **Force database reindex** | `docker exec -it valheatmap-app python -m app.build_analytics --rebuild` |
+| Deploy latest code | `cd /opt/valheatmap && git pull && docker compose up -d --build` |
+| App and crawler logs | `docker compose logs -f app` |
+| Caddy logs | `docker compose logs -f caddy` |
+| Restart | `docker compose restart` |
+| Stop | `docker compose down` |
+| Pause the crawler | set `VALHEATMAP_CRAWLER=0` in `.env`, then `docker compose up -d` |
+| Resume the crawler | set `VALHEATMAP_CRAWLER=1` in `.env`, then `docker compose up -d` |
+| Disk usage | `df -h /opt/valheatmap` |
+
+Keep an eye on disk usage: the data grows with every crawled match.
+Hetzner servers can be resized to a bigger disk from the console (the
+server must be powered off briefly).
 
 ---
 
-## 8. Decommissioning Fly.io (Stop Billing)
+## 8. Shut down Fly.io
 
-Once `valostats.roshanarun.com` is smoothly running on Hetzner and the crawler is actively ingesting matches:
+Wait until the site has been served from Hetzner for a day or two, and the
+crawler there is adding matches (the counts in `/api/health` keep
+rising). Then:
 
-1. Verify Fly.io is no longer receiving traffic.
-2. Destroy the Fly machine and volume:
-   ```powershell
-   fly apps destroy valheatmap
-   ```
-3. Your Fly.io monthly billing is now stopped.
+```powershell
+fly certs remove valostats.roshanarun.com --app valheatmap
+fly apps destroy valheatmap
+```
+
+That deletes the machine and the volume and stops Fly billing. Delete the
+local copies in `data\migration\` once you no longer need them.
